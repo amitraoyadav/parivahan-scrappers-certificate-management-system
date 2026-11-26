@@ -1,0 +1,6 @@
+{
+  "name": "Parivahan Scrappers — Certificate Management System",
+  "description": "Independent vehicle scrapping certificate issuance, cryptographic registry, PDF generation, and public QR verification system for Parivahan Scrappers.",
+  "requestFramePermissions": [],
+  "majorCapabilities": []
+}

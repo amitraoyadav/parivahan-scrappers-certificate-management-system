@@ -1,0 +1,13 @@
+rules_version = '2';
+
+// PARIVAHAN SCRAPPERS — STRICT ZERO-TRUST PRODUCTION FIRESTORE RULES
+// All database reads and writes are mediated exclusively through authenticated
+// server-side APIs using Google Service Account credentials.
+// Direct client-side Firestore SDK access is strictly denied across all collections.
+service cloud.firestore {
+  match /databases/{database}/documents {
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
