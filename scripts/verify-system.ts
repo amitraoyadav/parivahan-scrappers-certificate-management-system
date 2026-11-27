@@ -454,7 +454,25 @@ async function runTests(): Promise<void> {
       '✓ 16. FirestoreRestStore Spark queries (:runQuery, :runAggregationQuery COUNT), PEM normalization & multi-chunk gzip backup/restore verified'
     );
 
-    console.log('\nALL 16 ISOLATED STAGING, SPARK-FIRESTORE, BACKUP/RESTORE, PDF & SECURITY CHECKS PASSED.\n');
+    // 17. Rate Limiting (429 Lockout), CSRF Protection (403) & HttpOnly/Secure/SameSite Cookie Flags
+    await runSecurityControlsTests(baseUrl);
+    console.log(
+      '✓ 17. Login rate limiting (429 lockout) and CSRF guard (403) verified'
+    );
+
+    // 18. Env-Var Auth (user-pscrappers + salted scrypt hashes + cookie flags + env password rotation session invalidation)
+    await runEnvManagedAuthTests();
+    console.log(
+      '✓ 18. Env-managed auth (user-pscrappers, salted scrypt env hashes, HttpOnly/Secure/SameSite cookies, bootstrap lock, zero secret leak, instant rotation invalidation) verified'
+    );
+
+    // 19. Vercel Production Firestore Safety Guard (VERCEL=1 refuses ephemeral memory fallback)
+    await runProductionGuardTests();
+    console.log(
+      '✓ 19. Production Vercel guard (VERCEL=1 refuses ephemeral memory when Firestore env vars missing) verified'
+    );
+
+    console.log('\nALL 19 ISOLATED STAGING, AUTH, SPARK-FIRESTORE, BACKUP/RESTORE, PDF & SECURITY CHECKS PASSED.\n');
   } finally {
     await new Promise<void>((resolve) => server.close(() => resolve()));
   }
@@ -789,6 +807,194 @@ async function runMockFirestoreSparkTests(): Promise<void> {
     );
   } finally {
     await new Promise<void>((resolve) => mockServer.close(() => resolve()));
+  }
+}
+
+async function runEnvManagedAuthTests(): Promise<void> {
+  const crypto = await import('node:crypto');
+  const { hashPassword } = await import('../src/server/crypto.js');
+  const { resetStoreForTesting } = await import('../src/server/store.js');
+
+  const savedEnv = {
+    ADMIN_USERNAME: process.env.ADMIN_USERNAME,
+    ADMIN_PASSWORD: process.env.ADMIN_PASSWORD,
+    MAIN_ADMIN_PASSWORD: process.env.MAIN_ADMIN_PASSWORD,
+    ADMIN_PROTECTED_PASSWORD: process.env.ADMIN_PROTECTED_PASSWORD,
+    ADMIN_DELETE_PASSWORD: process.env.ADMIN_DELETE_PASSWORD,
+    ADMIN_SESSION_SECRET: process.env.ADMIN_SESSION_SECRET,
+  };
+
+  // Generate ephemeral runtime-only test credentials (never stored or hardcoded)
+  const makerPass = `Maker_${crypto.randomBytes(8).toString('hex')}`;
+  const adminPass = `Admin_${crypto.randomBytes(8).toString('hex')}`;
+  const protectedPass = `Prot_${crypto.randomBytes(8).toString('hex')}`;
+  const sessionSecret = crypto.randomBytes(32).toString('hex');
+
+  process.env.ADMIN_USERNAME = 'user-pscrappers';
+  process.env.ADMIN_PASSWORD = hashPassword(makerPass);
+  process.env.MAIN_ADMIN_PASSWORD = hashPassword(adminPass);
+  process.env.ADMIN_PROTECTED_PASSWORD = hashPassword(protectedPass);
+  process.env.ADMIN_DELETE_PASSWORD = hashPassword(protectedPass);
+  process.env.ADMIN_SESSION_SECRET = sessionSecret;
+  resetStoreForTesting();
+
+  const envApp = createApiApp();
+  const envServer = http.createServer(envApp);
+  await new Promise<void>((resolve) => envServer.listen(0, '127.0.0.1', resolve));
+  const addr = envServer.address();
+  if (!addr || typeof addr === 'string') throw new Error('Failed to bind env auth test server');
+  const origin = `http://127.0.0.1:${addr.port}`;
+
+  try {
+    // Status reports envConfigured=true, requiresBootstrap=false, and leaks zero secrets
+    const statusRes = await fetch(`${origin}/api/auth/status`);
+    assert.equal(statusRes.status, 200);
+    const statusText = await statusRes.text();
+    assert.equal(statusText.includes(makerPass), false);
+    assert.equal(statusText.includes(adminPass), false);
+    assert.equal(statusText.includes(sessionSecret), false);
+    assert.equal(statusText.includes('scrypt$'), false);
+    const statusJson = JSON.parse(statusText) as Record<string, unknown>;
+    assert.equal(statusJson.envConfigured, true);
+    assert.equal(statusJson.requiresBootstrap, false);
+
+    // Bootstrap is strictly blocked when env passwords are set
+    const bootRes = await fetch(`${origin}/api/auth/bootstrap`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'XMLHttpRequest' },
+      body: JSON.stringify({
+        makerUsername: 'attacker',
+        makerPassword: 'Password1234',
+        mainAdminPassword: 'Password1234',
+        protectedPassword: 'Password1234',
+      }),
+    });
+    assert.equal(bootRes.status, 403);
+
+    // Maker login succeeds with user-pscrappers and salted scrypt env hash
+    const makerRes = await fetch(`${origin}/api/auth/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'XMLHttpRequest' },
+      body: JSON.stringify({ username: 'user-pscrappers', password: makerPass }),
+    });
+    assert.equal(makerRes.status, 200);
+    const setCookieHeader = makerRes.headers.get('set-cookie') || '';
+    assert.ok(setCookieHeader.includes('HttpOnly'), 'Session cookie must set HttpOnly');
+    assert.ok(setCookieHeader.includes('Secure'), 'Session cookie must set Secure');
+    assert.ok(setCookieHeader.includes('SameSite=None'), 'Session cookie must set SameSite=None');
+    const makerJson = (await makerRes.json()) as { token: string; session: { username: string; role: string } };
+    assert.equal(makerJson.session.username, 'user-pscrappers');
+    assert.equal(makerJson.session.role, 'maker');
+
+    // Maker is blocked from Admin routes
+    const forbiddenAdmin = await fetch(`${origin}/api/admin/certificates`, {
+      headers: { Authorization: `Bearer ${makerJson.token}` },
+    });
+    assert.equal(forbiddenAdmin.status, 403);
+
+    // Main Core Admin unlock succeeds with separate env password
+    const adminRes = await fetch(`${origin}/api/auth/admin-unlock`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'XMLHttpRequest' },
+      body: JSON.stringify({ password: adminPass }),
+    });
+    assert.equal(adminRes.status, 200);
+    const adminJson = (await adminRes.json()) as { token: string };
+
+    // Rotating ADMIN_PASSWORD in env immediately invalidates previously issued tokens
+    process.env.ADMIN_PASSWORD = hashPassword(`Rotated_${crypto.randomBytes(8).toString('hex')}`);
+    const invalidatedMaker = await fetch(`${origin}/api/certificates/recent`, {
+      headers: { Authorization: `Bearer ${makerJson.token}` },
+    });
+    assert.equal(invalidatedMaker.status, 401, 'Rotating env password must invalidate prior Maker sessions');
+    const invalidatedAdmin = await fetch(`${origin}/api/admin/stats`, {
+      headers: { Authorization: `Bearer ${adminJson.token}` },
+    });
+    assert.equal(invalidatedAdmin.status, 401, 'Rotating env password must invalidate prior Admin sessions');
+  } finally {
+    await new Promise<void>((resolve) => envServer.close(() => resolve()));
+    for (const [k, v] of Object.entries(savedEnv)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+    resetStoreForTesting();
+  }
+}
+
+async function runSecurityControlsTests(baseUrl: string): Promise<void> {
+  // 1. CSRF rejection when POST lacks X-Requested-With and has mismatched Origin
+  const csrfBlocked = await fetch(`${baseUrl}/api/auth/login`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Origin: 'https://untrusted-site.example',
+    },
+    body: JSON.stringify({ username: 'user-pscrappers', password: 'InvalidPassword1' }),
+  });
+  assert.equal(csrfBlocked.status, 403, 'Cross-site POST without X-Requested-With must be rejected with 403');
+
+  // 2. Login rate limiting triggers HTTP 429 lockout after 5 consecutive failures
+  const rateTestUser = 'ratelimit-probe-user';
+  for (let i = 0; i < 5; i++) {
+    const attempt = await fetch(`${baseUrl}/api/auth/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'XMLHttpRequest' },
+      body: JSON.stringify({ username: rateTestUser, password: `WrongPass_${i}` }),
+    });
+    assert.equal(attempt.status, 401);
+  }
+  const lockedAttempt = await fetch(`${baseUrl}/api/auth/login`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'XMLHttpRequest' },
+    body: JSON.stringify({ username: rateTestUser, password: 'WrongPass_6' }),
+  });
+  assert.equal(lockedAttempt.status, 429, '6th failed login attempt must trigger HTTP 429 rate-limit lockout');
+}
+
+async function runProductionGuardTests(): Promise<void> {
+  const { resetStoreForTesting } = await import('../src/server/store.js');
+  const saved = {
+    VERCEL: process.env.VERCEL,
+    FIREBASE_PROJECT_ID: process.env.FIREBASE_PROJECT_ID,
+    FIREBASE_CLIENT_EMAIL: process.env.FIREBASE_CLIENT_EMAIL,
+    FIREBASE_PRIVATE_KEY: process.env.FIREBASE_PRIVATE_KEY,
+  };
+
+  process.env.VERCEL = '1';
+  delete process.env.FIREBASE_PROJECT_ID;
+  delete process.env.FIREBASE_CLIENT_EMAIL;
+  delete process.env.FIREBASE_PRIVATE_KEY;
+  resetStoreForTesting();
+
+  const prodApp = createApiApp();
+  const prodServer = http.createServer(prodApp);
+  await new Promise<void>((resolve) => prodServer.listen(0, '127.0.0.1', resolve));
+  const addr = prodServer.address();
+  if (!addr || typeof addr === 'string') throw new Error('Failed to bind prod guard server');
+  const origin = `http://127.0.0.1:${addr.port}`;
+
+  try {
+    const health = await fetch(`${origin}/api/health`);
+    assert.equal(health.status, 503);
+    const healthJson = (await health.json()) as {
+      storageMode: string;
+      firestoreConnected: boolean;
+      missingFirestoreEnvVars: string[];
+    };
+    assert.equal(healthJson.storageMode, 'firestore_unconfigured');
+    assert.equal(healthJson.firestoreConnected, false);
+    assert.deepEqual(healthJson.missingFirestoreEnvVars, [
+      'FIREBASE_PROJECT_ID',
+      'FIREBASE_CLIENT_EMAIL',
+      'FIREBASE_PRIVATE_KEY',
+    ]);
+  } finally {
+    await new Promise<void>((resolve) => prodServer.close(() => resolve()));
+    for (const [k, v] of Object.entries(saved)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+    resetStoreForTesting();
   }
 }
 

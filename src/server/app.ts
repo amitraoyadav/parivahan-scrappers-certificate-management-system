@@ -53,10 +53,18 @@ function getClientIp(req: Request): string {
   return req.socket.remoteAddress || 'unknown';
 }
 
+const DEFAULT_MAKER_USERNAME = 'user-pscrappers';
+
 function hasEnvCredentialsConfigured(): boolean {
   return Boolean(
-    process.env.ADMIN_USERNAME?.trim() &&
-      process.env.ADMIN_PASSWORD?.trim() &&
+    process.env.ADMIN_PASSWORD?.trim() &&
+      process.env.MAIN_ADMIN_PASSWORD?.trim()
+  );
+}
+
+function hasAnyEnvPasswordConfigured(): boolean {
+  return Boolean(
+    process.env.ADMIN_PASSWORD?.trim() ||
       process.env.MAIN_ADMIN_PASSWORD?.trim()
   );
 }
@@ -377,6 +385,10 @@ export function createApiApp(): express.Express {
       latencyMs: probe.latencyMs,
       storageMessage: probe.message,
       missingFirestoreEnvVars: store.missingEnvVars ?? [],
+      envCredentialsConfigured: hasEnvCredentialsConfigured(),
+      sessionSecretConfigured: Boolean(
+        process.env.ADMIN_SESSION_SECRET && process.env.ADMIN_SESSION_SECRET.trim().length >= 16
+      ),
       driveConfigured: isDriveConfigured(),
     });
   });
@@ -390,7 +402,7 @@ export function createApiApp(): express.Express {
     ]);
     const envConfigured = hasEnvCredentialsConfigured();
     const requiresBootstrap =
-      store.mode !== 'firestore_unconfigured' && !envConfigured && !creds;
+      store.mode !== 'firestore_unconfigured' && !hasAnyEnvPasswordConfigured() && !creds;
 
     const payload: AuthStatusResponse = {
       requiresBootstrap,
@@ -411,7 +423,7 @@ export function createApiApp(): express.Express {
   // One-time secure first-run credential initialization (locked immediately once claimed or when env vars exist)
   router.post('/auth/bootstrap', async (req, res) => {
     const store = getStore();
-    if (hasEnvCredentialsConfigured()) {
+    if (hasEnvCredentialsConfigured() || hasAnyEnvPasswordConfigured()) {
       res.status(403).json({
         error: 'Credentials are managed via server environment variables. First-run setup is disabled.',
       });
@@ -496,7 +508,11 @@ export function createApiApp(): express.Express {
     }
 
     const creds = await store.getCredentials();
-    const expectedUsername = process.env.ADMIN_USERNAME?.trim() || creds?.makerUsername || '';
+    const expectedUsername =
+      process.env.ADMIN_USERNAME?.trim() ||
+      (process.env.ADMIN_PASSWORD?.trim() ? DEFAULT_MAKER_USERNAME : '') ||
+      creds?.makerUsername ||
+      '';
     if (!expectedUsername) {
       res.status(503).json({
         error: 'System credentials are not initialized yet. Complete first-run setup first.',

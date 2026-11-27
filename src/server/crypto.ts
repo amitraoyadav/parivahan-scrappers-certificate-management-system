@@ -8,9 +8,22 @@ const SCRYPT_PARAMS = { N: 16384, r: 8, p: 1 };
 // Ephemeral fallback only when ADMIN_SESSION_SECRET is not provided in process.env
 const ephemeralFallbackSecret = crypto.randomBytes(32).toString('hex');
 
-function getSessionSecret(): string {
+function getSessionSecret(): Buffer {
   const configured = process.env.ADMIN_SESSION_SECRET?.trim();
-  return configured && configured.length >= 16 ? configured : ephemeralFallbackSecret;
+  const baseSecret = configured && configured.length >= 16 ? configured : ephemeralFallbackSecret;
+  // Bind signing key to env-managed credential values so rotating ADMIN_PASSWORD,
+  // MAIN_ADMIN_PASSWORD, ADMIN_USERNAME, or ADMIN_SESSION_SECRET in Vercel
+  // immediately invalidates all previously issued session tokens.
+  return crypto
+    .createHash('sha256')
+    .update(baseSecret)
+    .update('|')
+    .update(process.env.ADMIN_USERNAME?.trim() || '')
+    .update('|')
+    .update(process.env.ADMIN_PASSWORD?.trim() || '')
+    .update('|')
+    .update(process.env.MAIN_ADMIN_PASSWORD?.trim() || '')
+    .digest();
 }
 
 export function hashPassword(plainPassword: string): string {

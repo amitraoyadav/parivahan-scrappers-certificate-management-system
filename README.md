@@ -1,20 +1,32 @@
-<div align="center">
-<img width="1200" height="475" alt="GHBanner" src="https://ai.google.dev/static/site-assets/images/share-ais-513315318.png" />
-</div>
+# Parivahan Scrappers — Certificate Management System
 
-# Run and deploy your AI Studio app
+Independent vehicle scrapping certificate issuance, cryptographic registry, official A4 PDF generation, and public QR verification platform built for standalone Vercel hosting and a fresh Google Cloud Firestore database.
 
-This contains everything you need to run your app locally.
+## Core Capabilities
 
-View your app in AI Studio: https://ai.studio/apps/d208f34d-18a5-4083-be9a-64a2c22889ab
+- **Two-Tier Access Control**:
+  - **Certificate Maker (`user-pscrappers`)**: Creates new certificates and views only the latest five active certificates. Blocked server-side (`403`) from the full registry, analytics, audit logs, backups, and settings.
+  - **Main Core Admin**: Separate unlock password granting access to the complete searchable certificate registry, dashboard statistics, protected edits/cancellations/restorations/deletions, audit logs, encrypted-checksum backups, and settings.
+- **Official A4 Certificate PDF & QR Verification**: Generates single-page A4 portrait PDFs matching the master Parivahan Scrappers certificate layout with per-certificate SHA-256 canonical hashes, unique QR verification URLs, and privacy-masked public verification (`/verify`).
+- **Fresh Independent Firestore Architecture**: Authoritative server-side Firestore REST persistence with strict default-deny client `firestore.rules` (`allow read, write: if false;`), permanent reservation of issued certificate and scrapping registration numbers, and zero historical records.
 
-## Run Locally
+## Local Development & Verification
 
-**Prerequisites:**  Node.js
+```bash
+npm install
+npm run dev
+```
 
+Verification commands:
 
-1. Install dependencies:
-   `npm install`
-2. Set the `GEMINI_API_KEY` in [.env.local](.env.local) to your Gemini API key
-3. Run the app:
-   `npm run dev`
+```bash
+npm run build
+npx tsc --noEmit
+npm run test:security
+npm run scan:predeploy
+npm run test:firestore
+```
+
+## Production Deployment
+
+See [`DEPLOYMENT_GUIDE.md`](./DEPLOYMENT_GUIDE.md) for the complete Firebase Spark setup, GitHub push workflow, and private Vercel environment variable configuration (`ADMIN_USERNAME=user-pscrappers`, `ADMIN_PASSWORD`, `MAIN_ADMIN_PASSWORD`, `ADMIN_PROTECTED_PASSWORD`, `ADMIN_DELETE_PASSWORD`, `ADMIN_SESSION_SECRET`, `FIREBASE_PROJECT_ID`, `FIREBASE_DATABASE_ID`, `FIREBASE_CLIENT_EMAIL`, `FIREBASE_PRIVATE_KEY`, `CRON_SECRET`, `PUBLIC_APP_URL`).

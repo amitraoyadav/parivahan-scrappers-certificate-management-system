@@ -12,7 +12,7 @@ const FORBIDDEN_FILE_PATTERNS = [
   /credentials.*\.json$/i,
   /\.pem$/i,
   /\.key$/i,
-  /PS_\d{2}_.*\.pdf$/i,
+  /PS[-_]\d{2}[-_].*\.pdf$/i,
 ];
 
 const FORBIDDEN_DIR_SEGMENTS = [

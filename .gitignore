@@ -13,3 +13,5 @@ crm-certificates-*.json
 *.pem
 *.key
 PS_*.pdf
+PS-*.pdf
+public/assets/aistudio/

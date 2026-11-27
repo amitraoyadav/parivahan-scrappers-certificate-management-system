@@ -1318,6 +1318,10 @@ class UnconfiguredProductionStore implements RegistryStore {
 
 let singletonStore: RegistryStore | null = null;
 
+export function resetStoreForTesting(): void {
+  singletonStore = null;
+}
+
 export function getStore(): RegistryStore {
   if (singletonStore) return singletonStore;
 
