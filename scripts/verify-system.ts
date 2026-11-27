@@ -460,10 +460,10 @@ async function runTests(): Promise<void> {
       '✓ 17. Login rate limiting (429 lockout) and CSRF guard (403) verified'
     );
 
-    // 18. Env-Var Auth (user-pscrappers + salted scrypt hashes + cookie flags + env password rotation session invalidation)
+    // 18. Env-Var Auth (pscrappers + quoted salted scrypt hashes + cookie flags + env password rotation session invalidation)
     await runEnvManagedAuthTests();
     console.log(
-      '✓ 18. Env-managed auth (user-pscrappers, salted scrypt env hashes, HttpOnly/Secure/SameSite cookies, bootstrap lock, zero secret leak, instant rotation invalidation) verified'
+      '✓ 18. Env-managed auth (pscrappers, quoted salted scrypt env hashes, HttpOnly/Secure/SameSite cookies, bootstrap lock, zero secret leak, instant rotation invalidation) verified'
     );
 
     // 19. Vercel Production Firestore Safety Guard (VERCEL=1 refuses ephemeral memory fallback)
@@ -472,7 +472,13 @@ async function runTests(): Promise<void> {
       '✓ 19. Production Vercel guard (VERCEL=1 refuses ephemeral memory when Firestore env vars missing) verified'
     );
 
-    console.log('\nALL 19 ISOLATED STAGING, AUTH, SPARK-FIRESTORE, BACKUP/RESTORE, PDF & SECURITY CHECKS PASSED.\n');
+    // 20. Maker-Only Password Rotation (updates only makerPasswordHash; preserves pscrappers username & Main Core Admin password)
+    await runMakerOnlyRotationTests();
+    console.log(
+      '✓ 20. Maker-only password rotation (/api/admin/rotate-maker-password) verified (pscrappers & Main Core Admin preserved, new Maker login succeeds)'
+    );
+
+    console.log('\nALL 20 ISOLATED STAGING, AUTH, SPARK-FIRESTORE, BACKUP/RESTORE, PDF & SECURITY CHECKS PASSED.\n');
   } finally {
     await new Promise<void>((resolve) => server.close(() => resolve()));
   }
@@ -825,13 +831,14 @@ async function runEnvManagedAuthTests(): Promise<void> {
   };
 
   // Generate ephemeral runtime-only test credentials (never stored or hardcoded)
-  const makerPass = `Maker_${crypto.randomBytes(8).toString('hex')}`;
-  const adminPass = `Admin_${crypto.randomBytes(8).toString('hex')}`;
-  const protectedPass = `Prot_${crypto.randomBytes(8).toString('hex')}`;
+  const makerPass = `Maker@${crypto.randomBytes(6).toString('hex')}`;
+  const adminPass = `Admin@${crypto.randomBytes(6).toString('hex')}`;
+  const protectedPass = `Prot@${crypto.randomBytes(6).toString('hex')}`;
   const sessionSecret = crypto.randomBytes(32).toString('hex');
 
-  process.env.ADMIN_USERNAME = 'user-pscrappers';
-  process.env.ADMIN_PASSWORD = hashPassword(makerPass);
+  // Verify quoted salted scrypt env var AND omitted ADMIN_USERNAME fallback to pscrappers
+  delete process.env.ADMIN_USERNAME;
+  process.env.ADMIN_PASSWORD = `"${hashPassword(makerPass)}"`;
   process.env.MAIN_ADMIN_PASSWORD = hashPassword(adminPass);
   process.env.ADMIN_PROTECTED_PASSWORD = hashPassword(protectedPass);
   process.env.ADMIN_DELETE_PASSWORD = hashPassword(protectedPass);
@@ -871,11 +878,11 @@ async function runEnvManagedAuthTests(): Promise<void> {
     });
     assert.equal(bootRes.status, 403);
 
-    // Maker login succeeds with user-pscrappers and salted scrypt env hash
+    // Maker login succeeds with pscrappers and quoted salted scrypt env hash
     const makerRes = await fetch(`${origin}/api/auth/login`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'XMLHttpRequest' },
-      body: JSON.stringify({ username: 'user-pscrappers', password: makerPass }),
+      body: JSON.stringify({ username: 'pscrappers', password: makerPass }),
     });
     assert.equal(makerRes.status, 200);
     const setCookieHeader = makerRes.headers.get('set-cookie') || '';
@@ -883,7 +890,7 @@ async function runEnvManagedAuthTests(): Promise<void> {
     assert.ok(setCookieHeader.includes('Secure'), 'Session cookie must set Secure');
     assert.ok(setCookieHeader.includes('SameSite=None'), 'Session cookie must set SameSite=None');
     const makerJson = (await makerRes.json()) as { token: string; session: { username: string; role: string } };
-    assert.equal(makerJson.session.username, 'user-pscrappers');
+    assert.equal(makerJson.session.username, 'pscrappers');
     assert.equal(makerJson.session.role, 'maker');
 
     // Maker is blocked from Admin routes
@@ -902,7 +909,7 @@ async function runEnvManagedAuthTests(): Promise<void> {
     const adminJson = (await adminRes.json()) as { token: string };
 
     // Rotating ADMIN_PASSWORD in env immediately invalidates previously issued tokens
-    process.env.ADMIN_PASSWORD = hashPassword(`Rotated_${crypto.randomBytes(8).toString('hex')}`);
+    process.env.ADMIN_PASSWORD = hashPassword(`Rotated@${crypto.randomBytes(6).toString('hex')}`);
     const invalidatedMaker = await fetch(`${origin}/api/certificates/recent`, {
       headers: { Authorization: `Bearer ${makerJson.token}` },
     });
@@ -929,7 +936,7 @@ async function runSecurityControlsTests(baseUrl: string): Promise<void> {
       'Content-Type': 'application/json',
       Origin: 'https://untrusted-site.example',
     },
-    body: JSON.stringify({ username: 'user-pscrappers', password: 'InvalidPassword1' }),
+    body: JSON.stringify({ username: 'pscrappers', password: 'InvalidPassword1' }),
   });
   assert.equal(csrfBlocked.status, 403, 'Cross-site POST without X-Requested-With must be rejected with 403');
 
@@ -994,6 +1001,137 @@ async function runProductionGuardTests(): Promise<void> {
       if (v === undefined) delete process.env[k];
       else process.env[k] = v;
     }
+    resetStoreForTesting();
+  }
+}
+
+async function runMakerOnlyRotationTests(): Promise<void> {
+  const crypto = await import('node:crypto');
+  const { getStore, resetStoreForTesting } = await import('../src/server/store.js');
+  resetStoreForTesting();
+
+  const rotApp = createApiApp();
+  const rotServer = http.createServer(rotApp);
+  await new Promise<void>((resolve) => rotServer.listen(0, '127.0.0.1', resolve));
+  const addr = rotServer.address();
+  if (!addr || typeof addr === 'string') throw new Error('Failed to bind rotation test server');
+  const origin = `http://127.0.0.1:${addr.port}`;
+
+  const oldMakerPass = `OldMaker@${crypto.randomBytes(4).toString('hex')}`;
+  const newMakerPass = `NewMaker@${crypto.randomBytes(4).toString('hex')}`;
+  const mainAdminPass = `MainAdmin@${crypto.randomBytes(6).toString('hex')}`;
+  const protectedPass = `Protected@${crypto.randomBytes(6).toString('hex')}`;
+
+  try {
+    // 1. Bootstrap primary_credentials with makerUsername = pscrappers
+    const bootRes = await fetch(`${origin}/api/auth/bootstrap`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'XMLHttpRequest' },
+      body: JSON.stringify({
+        makerUsername: 'pscrappers',
+        makerPassword: oldMakerPass,
+        mainAdminPassword: mainAdminPass,
+        protectedPassword: protectedPass,
+      }),
+    });
+    assert.equal(bootRes.status, 201);
+
+    const beforeCreds = await getStore().getCredentials();
+    assert.ok(beforeCreds);
+    assert.equal(beforeCreds.makerUsername, 'pscrappers');
+
+    // 2. Old Maker login succeeds before rotation; new password fails before rotation
+    const preLoginOk = await fetch(`${origin}/api/auth/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'XMLHttpRequest' },
+      body: JSON.stringify({ username: 'pscrappers', password: oldMakerPass }),
+    });
+    assert.equal(preLoginOk.status, 200);
+    const oldMakerToken = ((await preLoginOk.json()) as { token: string }).token;
+
+    const preLoginMismatch = await fetch(`${origin}/api/auth/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'XMLHttpRequest' },
+      body: JSON.stringify({ username: 'pscrappers', password: newMakerPass }),
+    });
+    assert.equal(preLoginMismatch.status, 401);
+
+    // 3. Unlock Main Core Admin and verify wrong admin password is rejected on rotation
+    const adminUnlock = await fetch(`${origin}/api/auth/admin-unlock`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'XMLHttpRequest' },
+      body: JSON.stringify({ password: mainAdminPass }),
+    });
+    assert.equal(adminUnlock.status, 200);
+    const adminToken = ((await adminUnlock.json()) as { token: string }).token;
+
+    const deniedRot = await fetch(`${origin}/api/admin/rotate-maker-password`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Requested-With': 'XMLHttpRequest',
+        Authorization: `Bearer ${adminToken}`,
+      },
+      body: JSON.stringify({ currentMainPassword: 'WrongMainPassword', newMakerPassword: newMakerPass }),
+    });
+    assert.equal(deniedRot.status, 403);
+
+    // 4. Rotate ONLY Maker password via dedicated endpoint
+    const okRot = await fetch(`${origin}/api/admin/rotate-maker-password`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Requested-With': 'XMLHttpRequest',
+        Authorization: `Bearer ${adminToken}`,
+      },
+      body: JSON.stringify({ currentMainPassword: mainAdminPass, newMakerPassword: newMakerPass }),
+    });
+    assert.equal(okRot.status, 200);
+    const rotBody = (await okRot.json()) as { makerUsername: string; token: string };
+    assert.equal(rotBody.makerUsername, 'pscrappers');
+
+    // 5. Confirm ONLY makerPasswordHash, sessionVersion, and updatedAt changed
+    const afterCreds = await getStore().getCredentials();
+    assert.ok(afterCreds);
+    assert.equal(afterCreds.makerUsername, 'pscrappers');
+    assert.equal(afterCreds.mainAdminPasswordHash, beforeCreds.mainAdminPasswordHash);
+    assert.equal(afterCreds.protectedPasswordHash, beforeCreds.protectedPasswordHash);
+    assert.equal(afterCreds.deletePasswordHash, beforeCreds.deletePasswordHash);
+    assert.equal(afterCreds.bootstrappedAt, beforeCreds.bootstrappedAt);
+    assert.notEqual(afterCreds.makerPasswordHash, beforeCreds.makerPasswordHash);
+    assert.equal(afterCreds.sessionVersion, beforeCreds.sessionVersion + 1);
+
+    // 6. Old Maker session invalidated, old password rejected, new Maker login succeeds, Main Core Admin unchanged
+    const oldSessionCheck = await fetch(`${origin}/api/certificates/recent`, {
+      headers: { Authorization: `Bearer ${oldMakerToken}` },
+    });
+    assert.equal(oldSessionCheck.status, 401);
+
+    const oldPassLogin = await fetch(`${origin}/api/auth/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'XMLHttpRequest' },
+      body: JSON.stringify({ username: 'pscrappers', password: oldMakerPass }),
+    });
+    assert.equal(oldPassLogin.status, 401);
+
+    const newPassLogin = await fetch(`${origin}/api/auth/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'XMLHttpRequest' },
+      body: JSON.stringify({ username: 'pscrappers', password: newMakerPass }),
+    });
+    assert.equal(newPassLogin.status, 200);
+    const newMakerJson = (await newPassLogin.json()) as { session: { username: string; role: string } };
+    assert.equal(newMakerJson.session.username, 'pscrappers');
+    assert.equal(newMakerJson.session.role, 'maker');
+
+    const adminStillWorks = await fetch(`${origin}/api/auth/admin-unlock`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'XMLHttpRequest' },
+      body: JSON.stringify({ password: mainAdminPass }),
+    });
+    assert.equal(adminStillWorks.status, 200);
+  } finally {
+    await new Promise<void>((resolve) => rotServer.close(() => resolve()));
     resetStoreForTesting();
   }
 }

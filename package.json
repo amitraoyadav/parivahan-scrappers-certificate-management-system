@@ -13,7 +13,8 @@
     "scan:predeploy": "tsx scripts/predeploy-scan.ts",
     "test:security": "tsx scripts/verify-system.ts",
     "test:firestore": "tsx scripts/test-firestore.ts",
-    "hash:password": "tsx scripts/hash-password.ts"
+    "hash:password": "tsx scripts/hash-password.ts",
+    "rotate:maker-password": "tsx scripts/rotate-maker-password.ts"
   },
   "dependencies": {
     "@tailwindcss/vite": "^4.3.3",

@@ -76,7 +76,7 @@ Create a **new Vercel project** connected to `parivahan-certificate-fresh`, then
 | `FIREBASE_DATABASE_ID` | `(default)` (required on Firebase Spark Free plan) |
 | `FIREBASE_CLIENT_EMAIL` | Service account email (`...@crm-certificates.iam.gserviceaccount.com`) |
 | `FIREBASE_PRIVATE_KEY` | Service account PEM private key (keep `\n` newlines intact) |
-| `ADMIN_USERNAME` | Certificate Maker login username (set to `user-pscrappers`) |
+| `ADMIN_USERNAME` | Certificate Maker login username (set to `pscrappers`) |
 | `ADMIN_PASSWORD` | Private Maker password (plain or salted `scrypt$...` hash via `npm run hash:password`) |
 | `MAIN_ADMIN_PASSWORD` | Separate Main Core Admin unlock password (plain or salted `scrypt$...` hash) |
 | `ADMIN_PROTECTED_PASSWORD` | Separate password for protected edits, cancellations, and restores (or `scrypt$...` hash) |
@@ -88,7 +88,7 @@ Create a **new Vercel project** connected to `parivahan-certificate-fresh`, then
 | `GOOGLE_DRIVE_CLIENT_EMAIL` | *(Optional)* Service account email with access to the new Drive folder |
 | `GOOGLE_DRIVE_PRIVATE_KEY` | *(Optional)* Service account private key for Drive sync |
 
-> **Security Tip**: Run `npm run hash:password` locally to pre-hash `ADMIN_PASSWORD`, `MAIN_ADMIN_PASSWORD`, `ADMIN_PROTECTED_PASSWORD`, and `ADMIN_DELETE_PASSWORD` with salted `scrypt` before pasting them into Vercel. The server automatically recognizes `scrypt$...` hashes. Rotating any password environment variable or `ADMIN_SESSION_SECRET` in Vercel and redeploying immediately invalidates all previously issued Maker and Main Core Admin sessions.
+> **Security Tip**: Run `npm run hash:password` locally to pre-hash `ADMIN_PASSWORD`, `MAIN_ADMIN_PASSWORD`, `ADMIN_PROTECTED_PASSWORD`, and `ADMIN_DELETE_PASSWORD` with salted `scrypt` before pasting them into Vercel. Note that `ADMIN_PASSWORD` in Vercel always takes precedence over Firestore `admins/primary_credentials.makerPasswordHash`. If Maker credentials are stored in Firestore instead of Vercel env vars, rotate ONLY the Maker password hash via **Main Core Admin -> Settings -> Password Rotation** (`POST /api/admin/rotate-maker-password`) or locally via `npm run rotate:maker-password` without touching `makerUsername` or the Main Core Admin password.
 
 ---
 

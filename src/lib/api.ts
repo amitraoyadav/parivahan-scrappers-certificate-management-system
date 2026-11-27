@@ -278,6 +278,8 @@ export const api = {
   getSettings(): Promise<{
     settings: SystemSettings;
     envManagedCredentials: boolean;
+    makerPasswordEnvManaged: boolean;
+    makerUsername: string;
     driveEnvConfigured: boolean;
     storageMode: 'firestore' | 'staging_memory' | 'firestore_unconfigured';
     firestoreProjectId: string | null;
@@ -311,6 +313,29 @@ export const api = {
     });
     setMemoryToken(data.token);
     return { success: data.success, session: data.session, message: data.message };
+  },
+
+  async rotateMakerPassword(payload: {
+    currentMainPassword: string;
+    newMakerPassword: string;
+  }): Promise<{ success: boolean; session: SessionInfo; makerUsername: string; message: string }> {
+    const data = await apiRequest<{
+      success: boolean;
+      session: SessionInfo;
+      token: string;
+      makerUsername: string;
+      message: string;
+    }>('/api/admin/rotate-maker-password', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
+    setMemoryToken(data.token);
+    return {
+      success: data.success,
+      session: data.session,
+      makerUsername: data.makerUsername,
+      message: data.message,
+    };
   },
 
   getAdminHealth(): Promise<{

@@ -53,29 +53,41 @@ function getClientIp(req: Request): string {
   return req.socket.remoteAddress || 'unknown';
 }
 
-const DEFAULT_MAKER_USERNAME = 'user-pscrappers';
+const DEFAULT_MAKER_USERNAME = 'pscrappers';
+
+function normalizeEnvCredentialValue(value: string | undefined): string {
+  if (!value) return '';
+  let trimmed = value.trim();
+  if (
+    (trimmed.startsWith('"') && trimmed.endsWith('"') && trimmed.length >= 2) ||
+    (trimmed.startsWith("'") && trimmed.endsWith("'") && trimmed.length >= 2)
+  ) {
+    trimmed = trimmed.slice(1, -1).trim();
+  }
+  return trimmed;
+}
 
 function hasEnvCredentialsConfigured(): boolean {
   return Boolean(
-    process.env.ADMIN_PASSWORD?.trim() &&
-      process.env.MAIN_ADMIN_PASSWORD?.trim()
+    normalizeEnvCredentialValue(process.env.ADMIN_PASSWORD) &&
+      normalizeEnvCredentialValue(process.env.MAIN_ADMIN_PASSWORD)
   );
 }
 
 function hasAnyEnvPasswordConfigured(): boolean {
   return Boolean(
-    process.env.ADMIN_PASSWORD?.trim() ||
-      process.env.MAIN_ADMIN_PASSWORD?.trim()
+    normalizeEnvCredentialValue(process.env.ADMIN_PASSWORD) ||
+      normalizeEnvCredentialValue(process.env.MAIN_ADMIN_PASSWORD)
   );
 }
 
 function verifyEnvOrHash(plain: string, envValue: string | undefined, storedHash: string | undefined): boolean {
-  if (envValue && envValue.trim().length > 0) {
-    const trimmedEnv = envValue.trim();
-    if (trimmedEnv.startsWith('scrypt$')) {
-      return verifyPassword(plain, trimmedEnv);
+  const normalizedEnv = normalizeEnvCredentialValue(envValue);
+  if (normalizedEnv.length > 0) {
+    if (normalizedEnv.startsWith('scrypt$')) {
+      return verifyPassword(plain, normalizedEnv);
     }
-    return timingSafeStringEqual(plain, trimmedEnv);
+    return timingSafeStringEqual(plain, normalizedEnv);
   }
   if (storedHash) {
     return verifyPassword(plain, storedHash);
@@ -508,11 +520,12 @@ export function createApiApp(): express.Express {
     }
 
     const creds = await store.getCredentials();
+    const envUsername = normalizeEnvCredentialValue(process.env.ADMIN_USERNAME);
+    const hasEnvMakerPassword = Boolean(normalizeEnvCredentialValue(process.env.ADMIN_PASSWORD));
     const expectedUsername =
-      process.env.ADMIN_USERNAME?.trim() ||
-      (process.env.ADMIN_PASSWORD?.trim() ? DEFAULT_MAKER_USERNAME : '') ||
+      envUsername ||
       creds?.makerUsername ||
-      '';
+      (hasEnvMakerPassword ? DEFAULT_MAKER_USERNAME : '');
     if (!expectedUsername) {
       res.status(503).json({
         error: 'System credentials are not initialized yet. Complete first-run setup first.',
@@ -1398,10 +1411,20 @@ export function createApiApp(): express.Express {
   // Settings & Password Rotation
   router.get('/admin/settings', requireMainAdmin, async (_req, res) => {
     const store = getStore();
-    const settings = await store.getSettings();
+    const [settings, creds] = await Promise.all([
+      store.getSettings(),
+      store.getCredentials(),
+    ]);
+    const envUsername = normalizeEnvCredentialValue(process.env.ADMIN_USERNAME);
+    const makerPasswordEnvManaged = Boolean(normalizeEnvCredentialValue(process.env.ADMIN_PASSWORD));
     res.json({
       settings,
       envManagedCredentials: hasEnvCredentialsConfigured(),
+      makerPasswordEnvManaged,
+      makerUsername:
+        envUsername ||
+        creds?.makerUsername ||
+        (makerPasswordEnvManaged ? DEFAULT_MAKER_USERNAME : ''),
       driveEnvConfigured: Boolean(
         process.env.GOOGLE_DRIVE_CLIENT_EMAIL?.trim() &&
           process.env.GOOGLE_DRIVE_PRIVATE_KEY?.trim()
@@ -1466,7 +1489,7 @@ export function createApiApp(): express.Express {
 
     const body = (req.body ?? {}) as Record<string, unknown>;
     const currentMainPassword = typeof body.currentMainPassword === 'string' ? body.currentMainPassword : '';
-    if (!verifyPassword(currentMainPassword, creds.mainAdminPasswordHash)) {
+    if (!verifyEnvOrHash(currentMainPassword, process.env.MAIN_ADMIN_PASSWORD, creds.mainAdminPasswordHash)) {
       res.status(403).json({ error: 'Current Main Core Admin password is incorrect.' });
       return;
     }
@@ -1475,6 +1498,13 @@ export function createApiApp(): express.Express {
     const newMakerPassword = typeof body.newMakerPassword === 'string' ? body.newMakerPassword : '';
     const newMainAdminPassword = typeof body.newMainAdminPassword === 'string' ? body.newMainAdminPassword : '';
     const newProtectedPassword = typeof body.newProtectedPassword === 'string' ? body.newProtectedPassword : '';
+
+    if (newMakerPassword && normalizeEnvCredentialValue(process.env.ADMIN_PASSWORD)) {
+      res.status(400).json({
+        error: 'ADMIN_PASSWORD is set in Vercel Environment Variables and overrides Firestore. Update ADMIN_PASSWORD in Vercel Project Settings and redeploy.',
+      });
+      return;
+    }
 
     if (
       (newMakerPassword && newMakerPassword.length < 8) ||
@@ -1524,6 +1554,75 @@ export function createApiApp(): express.Express {
       session,
       token,
       message: 'Credentials rotated. All previous Maker and Admin sessions have been invalidated.',
+    });
+  });
+
+  // Dedicated Maker-Only Password Rotation (preserves makerUsername & Main Core Admin password untouched)
+  router.post('/admin/rotate-maker-password', requireMainAdmin, async (req: AuthedRequest, res) => {
+    const store = getStore();
+    if (normalizeEnvCredentialValue(process.env.ADMIN_PASSWORD)) {
+      res.status(400).json({
+        error: 'Maker password is controlled by the ADMIN_PASSWORD Vercel Environment Variable (which overrides Firestore). Update ADMIN_PASSWORD in Vercel Project Settings with a salted scrypt hash and redeploy.',
+      });
+      return;
+    }
+
+    const creds = await store.getCredentials();
+    if (!creds) {
+      res.status(404).json({ error: 'Stored primary_credentials document not found.' });
+      return;
+    }
+
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const currentMainPassword = typeof body.currentMainPassword === 'string' ? body.currentMainPassword : '';
+    const newMakerPassword = typeof body.newMakerPassword === 'string' ? body.newMakerPassword : '';
+
+    if (!verifyEnvOrHash(currentMainPassword, process.env.MAIN_ADMIN_PASSWORD, creds.mainAdminPasswordHash)) {
+      res.status(403).json({ error: 'Current Main Core Admin password is incorrect.' });
+      return;
+    }
+
+    if (newMakerPassword.length < 8) {
+      res.status(400).json({ error: 'New Maker password must be at least 8 characters long.' });
+      return;
+    }
+
+    const now = new Date().toISOString();
+    const nextVersion = creds.sessionVersion + 1;
+    const updatedCreds: StoredCredentials = {
+      ...creds,
+      // Explicitly update ONLY makerPasswordHash, sessionVersion, and updatedAt
+      makerPasswordHash: hashPassword(newMakerPassword),
+      sessionVersion: nextVersion,
+      updatedAt: now,
+    };
+
+    await store.saveCredentials(updatedCreds);
+
+    const { token, session } = signSessionToken({
+      username: 'Main Core Admin',
+      role: 'main_admin',
+      sessionVersion: nextVersion,
+    });
+    setSessionCookie(res, token, session.expiresAt - session.issuedAt);
+
+    await store.addAuditLog({
+      id: generateRecordId('aud'),
+      timestamp: now,
+      actor: req.session!.username,
+      actorRole: req.session!.role,
+      action: 'PASSWORD_ROTATED',
+      ipAddress: getClientIp(req),
+      reason: 'Rotated Maker password hash only (username and Main Core Admin password unchanged)',
+      metadata: { scope: 'maker_only', newSessionVersion: nextVersion },
+    });
+
+    res.json({
+      success: true,
+      session,
+      token,
+      makerUsername: updatedCreds.makerUsername,
+      message: 'Maker password updated with a new salted scrypt hash. Previous sessions have been invalidated.',
     });
   });
 

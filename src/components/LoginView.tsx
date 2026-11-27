@@ -36,7 +36,7 @@ export const LoginView: React.FC<LoginViewProps> = ({
   const [adminPassword, setAdminPassword] = useState('');
 
   // First-Run Security Setup state
-  const [setupUsername, setSetupUsername] = useState('user-pscrappers');
+  const [setupUsername, setSetupUsername] = useState('pscrappers');
   const [setupMakerPassword, setSetupMakerPassword] = useState('');
   const [setupMainAdminPassword, setSetupMainAdminPassword] = useState('');
   const [setupProtectedPassword, setSetupProtectedPassword] = useState('');
@@ -251,7 +251,7 @@ export const LoginView: React.FC<LoginViewProps> = ({
                       minLength={3}
                       value={setupUsername}
                       onChange={(e) => setSetupUsername(e.target.value)}
-                      placeholder="user-pscrappers"
+                      placeholder="pscrappers"
                       className="w-full px-3.5 py-2.5 rounded-lg border border-slate-300 text-sm focus:outline-none focus:ring-2 focus:ring-[#059669] focus:border-[#059669]"
                     />
                   </div>

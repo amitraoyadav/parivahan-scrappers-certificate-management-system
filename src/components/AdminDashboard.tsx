@@ -78,6 +78,8 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
   // Settings, Security & Health
   const [settings, setSettings] = useState<SystemSettings | null>(null);
   const [envManagedCreds, setEnvManagedCreds] = useState(false);
+  const [makerPasswordEnvManaged, setMakerPasswordEnvManaged] = useState(false);
+  const [activeMakerUsername, setActiveMakerUsername] = useState('');
   const [driveEnvConfigured, setDriveEnvConfigured] = useState(false);
   const [healthInfo, setHealthInfo] = useState<{
     status: string;
@@ -150,6 +152,8 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
       ]);
       setSettings(settingsRes.settings);
       setEnvManagedCreds(settingsRes.envManagedCredentials);
+      setMakerPasswordEnvManaged(settingsRes.makerPasswordEnvManaged);
+      setActiveMakerUsername(settingsRes.makerUsername);
       setDriveEnvConfigured(settingsRes.driveEnvConfigured);
       setHealthInfo(healthRes);
     } catch {
@@ -253,12 +257,19 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
     e.preventDefault();
     setBanner(null);
     try {
-      const res = await api.rotatePasswords({
-        currentMainPassword,
-        newMakerPassword: newMakerPassword || undefined,
-        newMainAdminPassword: newMainAdminPassword || undefined,
-        newProtectedPassword: newProtectedPassword || undefined,
-      });
+      const makerOnly =
+        Boolean(newMakerPassword) && !newMainAdminPassword && !newProtectedPassword;
+      const res = makerOnly
+        ? await api.rotateMakerPassword({
+            currentMainPassword,
+            newMakerPassword,
+          })
+        : await api.rotatePasswords({
+            currentMainPassword,
+            newMakerPassword: newMakerPassword || undefined,
+            newMainAdminPassword: newMainAdminPassword || undefined,
+            newProtectedPassword: newProtectedPassword || undefined,
+          });
       onSessionUpdated(res.session);
       setCurrentMainPassword('');
       setNewMakerPassword('');
@@ -1026,6 +1037,23 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                 </h2>
               </div>
 
+              <div className="mb-3 rounded-lg bg-slate-50 border border-slate-200 px-3.5 py-2.5 text-xs text-slate-600 flex flex-wrap items-center justify-between gap-2">
+                <span>
+                  Active Maker Username:{' '}
+                  <strong className="font-mono text-[#0B1F3A]">
+                    {activeMakerUsername || 'Not configured'}
+                  </strong>
+                </span>
+                <span>
+                  Maker Password Source:{' '}
+                  <strong className="font-mono text-[#0B1F3A]">
+                    {makerPasswordEnvManaged
+                      ? 'Vercel ADMIN_PASSWORD (overrides Firestore)'
+                      : 'Firestore admins/primary_credentials'}
+                  </strong>
+                </span>
+              </div>
+
               {envManagedCreds ? (
                 <p className="text-xs text-slate-600 leading-relaxed">
                   Authentication passwords are managed via Vercel Environment Variables (
@@ -1033,15 +1061,14 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                   <code className="font-mono">MAIN_ADMIN_PASSWORD</code>,{' '}
                   <code className="font-mono">ADMIN_PROTECTED_PASSWORD</code>,{' '}
                   <code className="font-mono">ADMIN_DELETE_PASSWORD</code>). Rotate secrets in
-                  Vercel Project Settings and update{' '}
-                  <code className="font-mono">ADMIN_SESSION_SECRET</code> to invalidate all active
-                  sessions globally.
+                  Vercel Project Settings and redeploy to invalidate all active sessions globally.
                 </p>
               ) : (
                 <form onSubmit={handleRotatePasswords} className="mt-4 space-y-3.5">
                   <p className="text-xs text-slate-600">
-                    Rotating any password re-hashes with salted scrypt and increments the server
-                    session version, immediately invalidating all previous Maker and Admin tokens.
+                    Enter only a New Maker Password to rotate the Maker hash alone while keeping
+                    the username and Main Core Admin password completely unchanged. All prior
+                    sessions are invalidated immediately.
                   </p>
                   <div>
                     <label className="block text-xs font-medium text-slate-700 mb-1">
