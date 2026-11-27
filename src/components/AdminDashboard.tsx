@@ -1059,29 +1059,31 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                   </strong>
                 </span>
                 <span>
-                  Maker Auth Source:{' '}
+                  Authoritative Auth Source:{' '}
                   <strong className="font-mono text-[#059669]">
-                    Firestore admins/primary_credentials (Authoritative)
+                    Firestore admins/primary_credentials (All Accounts)
                   </strong>
                 </span>
               </div>
 
               {staleMakerEnvIgnored && (
                 <div className="mb-3 rounded-lg bg-amber-50 border border-amber-200 px-3.5 py-2.5 text-xs text-amber-900">
-                  Note: Legacy <code className="font-mono">ADMIN_PASSWORD</code> or{' '}
-                  <code className="font-mono">ADMIN_USERNAME</code> environment variables were
-                  detected and are automatically ignored because Firestore{' '}
-                  <code className="font-mono">admins/primary_credentials</code> is authoritative for
-                  Maker login.
+                  Note: Legacy password or username environment variables (
+                  <code className="font-mono">ADMIN_PASSWORD</code>,{' '}
+                  <code className="font-mono">ADMIN_USERNAME</code>, or{' '}
+                  <code className="font-mono">MAIN_ADMIN_PASSWORD</code>) are automatically ignored
+                  because Firestore <code className="font-mono">admins/primary_credentials</code> is
+                  the single authoritative source of truth for authentication.
                 </div>
               )}
 
               <form onSubmit={handleRotatePasswords} className="mt-4 space-y-3.5">
                 <p className="text-xs text-slate-600 leading-relaxed">
-                  Rotate the Certificate Maker password directly in Firestore{' '}
+                  Rotate credentials directly in Firestore{' '}
                   <code className="font-mono">admins/primary_credentials</code> using salted scrypt.
                   Entering only the Maker password updates ONLY the Maker hash while keeping the
-                  username (<strong className="font-mono">{activeMakerUsername || 'pscrappers'}</strong>)
+                  username (
+                  <strong className="font-mono">{activeMakerUsername || 'user-pscrappers'}</strong>)
                   and Main Core Admin credentials untouched.
                 </p>
                 <div>

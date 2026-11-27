@@ -11,14 +11,9 @@ const ephemeralFallbackSecret = crypto.randomBytes(32).toString('hex');
 function getSessionSecret(): Buffer {
   const configured = process.env.ADMIN_SESSION_SECRET?.trim();
   const baseSecret = configured && configured.length >= 16 ? configured : ephemeralFallbackSecret;
-  // Bind signing key to ADMIN_SESSION_SECRET and MAIN_ADMIN_PASSWORD (when env-managed).
-  // Maker password rotations invalidate all prior sessions globally via Firestore sessionVersion.
-  return crypto
-    .createHash('sha256')
-    .update(baseSecret)
-    .update('|')
-    .update(process.env.MAIN_ADMIN_PASSWORD?.trim() || '')
-    .digest();
+  // Session revocation on password rotation or recovery is enforced globally across
+  // all serverless instances via Firestore admins/primary_credentials.sessionVersion.
+  return crypto.createHash('sha256').update(baseSecret).digest();
 }
 
 export type PasswordHashValidationResult =

@@ -28,7 +28,12 @@ import {
   verifySessionToken,
 } from './crypto.js';
 import { isDriveConfigured, syncCertificateToDriveInBackground } from './driveSync.js';
-import { checkRateLimit, clearAuthFailures, recordAuthFailure } from './rateLimit.js';
+import {
+  checkRateLimit,
+  clearAllAuthFailures,
+  clearAuthFailures,
+  recordAuthFailure,
+} from './rateLimit.js';
 import { getStore, type RegistryStore, type StoredCredentials } from './store.js';
 
 const SESSION_COOKIE_NAME = 'ps_session';
@@ -54,7 +59,7 @@ function getClientIp(req: Request): string {
   return req.socket.remoteAddress || 'unknown';
 }
 
-const DEFAULT_MAKER_USERNAME = 'pscrappers';
+const DEFAULT_MAKER_USERNAME = 'user-pscrappers';
 
 function normalizeEnvCredentialValue(value: string | undefined): string {
   if (!value) return '';
@@ -234,34 +239,11 @@ async function resolveAuthoritativeCredentials(
   }
 }
 
-function verifyEnvOrHashDetailed(
-  plain: string,
-  envValue: string | undefined,
-  storedHash: string | undefined
-): { matched: boolean; source: 'env' | 'firestore' | 'none'; invalidHashDetail?: string } {
-  const normalizedEnv = normalizeEnvCredentialValue(envValue);
-  if (normalizedEnv.length > 0) {
-    if (normalizedEnv.startsWith('scrypt$')) {
-      const fmt = validateScryptHashFormat(normalizedEnv);
-      if (!fmt.valid) {
-        return { matched: false, source: 'env', invalidHashDetail: fmt.reason };
-      }
-      return { matched: verifyPassword(plain, normalizedEnv), source: 'env' };
-    }
-    return { matched: timingSafeStringEqual(plain, normalizedEnv), source: 'env' };
+function formatCooldownText(retryAfterSeconds: number): string {
+  if (retryAfterSeconds < 90) {
+    return `${Math.max(1, retryAfterSeconds)} second(s)`;
   }
-  if (storedHash) {
-    const fmt = validateScryptHashFormat(storedHash);
-    if (!fmt.valid) {
-      return { matched: false, source: 'firestore', invalidHashDetail: fmt.reason };
-    }
-    return { matched: verifyPassword(plain, storedHash), source: 'firestore' };
-  }
-  return { matched: false, source: 'none' };
-}
-
-function verifyEnvOrHash(plain: string, envValue: string | undefined, storedHash: string | undefined): boolean {
-  return verifyEnvOrHashDetailed(plain, envValue, storedHash).matched;
+  return `${Math.ceil(retryAfterSeconds / 60)} minute(s)`;
 }
 
 async function getSessionVersion(): Promise<number> {
@@ -490,13 +472,15 @@ async function generateAvailableCandidateNumbers(issueDate?: string): Promise<{
 
 async function verifyProtectedPassword(password: string, mode: 'edit' | 'delete'): Promise<boolean> {
   const store = getStore();
-  const creds = await store.getCredentials();
-  if (mode === 'delete') {
-    const envDel = process.env.ADMIN_DELETE_PASSWORD?.trim() || process.env.ADMIN_PROTECTED_PASSWORD?.trim();
-    return verifyEnvOrHash(password, envDel, creds?.deletePasswordHash ?? creds?.protectedPasswordHash);
-  }
-  const envProt = process.env.ADMIN_PROTECTED_PASSWORD?.trim() || process.env.ADMIN_DELETE_PASSWORD?.trim();
-  return verifyEnvOrHash(password, envProt, creds?.protectedPasswordHash ?? creds?.deletePasswordHash);
+  const credRes = await resolveAuthoritativeCredentials(store);
+  if (!credRes.ok || !credRes.creds) return false;
+  const creds = credRes.creds;
+  const targetHash =
+    mode === 'delete'
+      ? creds.deletePasswordHash || creds.protectedPasswordHash
+      : creds.protectedPasswordHash || creds.deletePasswordHash;
+  if (!targetHash) return false;
+  return verifyPassword(password, targetHash);
 }
 
 export function createApiApp(): express.Express {
@@ -684,7 +668,7 @@ export function createApiApp(): express.Express {
     const limit = checkRateLimit(rateKey);
     if (!limit.allowed) {
       res.status(429).json({
-        error: `Too many failed login attempts. Please wait ${Math.ceil(limit.retryAfterSeconds / 60)} minute(s) before trying again.`,
+        error: `Too many failed login attempts. Please wait ${formatCooldownText(limit.retryAfterSeconds)} before trying again.`,
         retryAfterSeconds: limit.retryAfterSeconds,
       });
       return;
@@ -837,7 +821,7 @@ export function createApiApp(): express.Express {
     res.json({ session, token });
   });
 
-  // Main Core Admin Separate Unlock (Preserves existing Main Core Admin auth behavior unchanged)
+  // Main Core Admin Separate Unlock (Authoritative Source: Firestore admins/primary_credentials)
   router.post('/auth/admin-unlock', async (req, res) => {
     const store = getStore();
     const ip = getClientIp(req);
@@ -845,7 +829,7 @@ export function createApiApp(): express.Express {
     const limit = checkRateLimit(rateKey);
     if (!limit.allowed) {
       res.status(429).json({
-        error: `Main Core Admin unlock throttled. Try again in ${Math.ceil(limit.retryAfterSeconds / 60)} minute(s).`,
+        error: `Main Core Admin unlock throttled. Try again in ${formatCooldownText(limit.retryAfterSeconds)}.`,
         retryAfterSeconds: limit.retryAfterSeconds,
       });
       return;
@@ -873,47 +857,45 @@ export function createApiApp(): express.Express {
     }
 
     const creds = credResult.creds;
-    if (!normalizeEnvCredentialValue(process.env.MAIN_ADMIN_PASSWORD) && !creds?.mainAdminPasswordHash) {
+    if (!creds || !creds.mainAdminPasswordHash) {
       logAuthDiagnostic({
         role: 'main_admin',
         code: 'MISSING_FIRESTORE_CREDENTIALS',
-        source: 'none',
+        source: 'firestore',
         ip,
-        detail: 'main_admin_credential_not_configured',
+        detail: !creds ? 'admins/primary_credentials_not_found' : 'mainAdminPasswordHash_missing',
       });
       res.status(503).json({
-        error: 'Main Core Admin password is not configured yet. Complete first-run setup or set MAIN_ADMIN_PASSWORD.',
+        error: 'Main Core Admin password is not configured yet. Complete first-run setup or run local auth recovery.',
       });
       return;
     }
 
-    const check = verifyEnvOrHashDetailed(
-      password,
-      process.env.MAIN_ADMIN_PASSWORD,
-      creds?.mainAdminPasswordHash
-    );
-
-    if (check.invalidHashDetail) {
+    const hashCheck = validateScryptHashFormat(creds.mainAdminPasswordHash);
+    if (!hashCheck.valid) {
       logAuthDiagnostic({
         role: 'main_admin',
         code: 'INVALID_PASSWORD_HASH_FORMAT',
-        source: check.source,
+        source: 'firestore',
         ip,
-        detail: check.invalidHashDetail,
+        detail: `firestore_mainAdminPasswordHash_${hashCheck.reason}`,
       });
       res.status(500).json({
-        error: 'Main Core Admin credential format error. Please contact your administrator.',
+        error: 'Main Core Admin credential format error. Please run secure local recovery.',
       });
       return;
     }
 
-    if (!check.matched) {
+    // Authoritative check strictly against Firestore admins/primary_credentials.mainAdminPasswordHash
+    // (never silently overridden by stale MAIN_ADMIN_PASSWORD or ADMIN_PROTECTED_PASSWORD env vars)
+    const passwordMatches = verifyPassword(password, creds.mainAdminPasswordHash);
+    if (!passwordMatches) {
       logAuthDiagnostic({
         role: 'main_admin',
         code: 'INCORRECT_PASSWORD',
-        source: check.source,
+        source: 'firestore',
         ip,
-        detail: 'main_admin_password_mismatch',
+        detail: 'main_admin_scrypt_digest_mismatch',
       });
       const failState = recordAuthFailure(rateKey);
       try {
@@ -925,14 +907,14 @@ export function createApiApp(): express.Express {
           action: 'ADMIN_UNLOCK_FAILED',
           ipAddress: ip,
           reason: 'Invalid Main Core Admin unlock password',
-          metadata: { diagnosticCode: 'INCORRECT_PASSWORD', authSource: check.source },
+          metadata: { diagnosticCode: 'INCORRECT_PASSWORD', authSource: 'firestore' },
         });
       } catch {
         // non-fatal
       }
       res.status(401).json({
         error: failState.locked
-          ? 'Main Core Admin unlock temporarily locked due to repeated failed attempts.'
+          ? `Main Core Admin unlock paused for ${formatCooldownText(failState.retryAfterSeconds)} due to repeated failed attempts.`
           : `Invalid Main Core Admin password. (${failState.remainingAttempts} attempt(s) remaining)`,
       });
       return;
@@ -941,7 +923,7 @@ export function createApiApp(): express.Express {
     let token: string;
     let session: SessionInfo;
     try {
-      const sessionVersion = creds?.sessionVersion ?? 1;
+      const sessionVersion = creds.sessionVersion ?? 1;
       const signed = signSessionToken({
         username: 'Main Core Admin',
         role: 'main_admin',
@@ -954,7 +936,7 @@ export function createApiApp(): express.Express {
       logAuthDiagnostic({
         role: 'main_admin',
         code: 'SESSION_CREATION_FAILURE',
-        source: check.source,
+        source: 'firestore',
         ip,
         detail: err instanceof Error ? err.message : 'Unable to create admin session token',
       });
@@ -973,7 +955,7 @@ export function createApiApp(): express.Express {
         actorRole: 'main_admin',
         action: 'ADMIN_UNLOCK_SUCCESS',
         ipAddress: ip,
-        metadata: { authSource: check.source },
+        metadata: { authSource: 'firestore' },
       });
     } catch {
       // non-fatal
@@ -1933,11 +1915,12 @@ export function createApiApp(): express.Express {
     const staleMakerEnvIgnored = Boolean(
       creds &&
         (normalizeEnvCredentialValue(process.env.ADMIN_PASSWORD) ||
+          normalizeEnvCredentialValue(process.env.MAIN_ADMIN_PASSWORD) ||
           (envUsername && envUsername.toLowerCase() !== creds.makerUsername.toLowerCase()))
     );
     res.json({
       settings,
-      envManagedCredentials: Boolean(normalizeEnvCredentialValue(process.env.MAIN_ADMIN_PASSWORD)),
+      envManagedCredentials: false,
       makerPasswordEnvManaged: false,
       makerAuthSource: creds ? 'firestore' : hasEnvCredentialsConfigured() ? 'env_bootstrap_pending' : 'unconfigured',
       staleMakerEnvIgnored,
@@ -1991,7 +1974,7 @@ export function createApiApp(): express.Express {
     res.json({ settings: updated });
   });
 
-  // Password rotation + immediate global session invalidation
+  // Password rotation + immediate global session invalidation (Firestore authoritative for all roles)
   router.post('/admin/rotate-passwords', requireMainAdmin, async (req: AuthedRequest, res) => {
     const store = getStore();
     const credRes = await resolveAuthoritativeCredentials(store);
@@ -2003,7 +1986,7 @@ export function createApiApp(): express.Express {
 
     const body = (req.body ?? {}) as Record<string, unknown>;
     const currentMainPassword = typeof body.currentMainPassword === 'string' ? body.currentMainPassword : '';
-    if (!verifyEnvOrHash(currentMainPassword, process.env.MAIN_ADMIN_PASSWORD, creds.mainAdminPasswordHash)) {
+    if (!verifyPassword(currentMainPassword, creds.mainAdminPasswordHash)) {
       res.status(403).json({ error: 'Current Main Core Admin password is incorrect.' });
       return;
     }
@@ -2012,13 +1995,6 @@ export function createApiApp(): express.Express {
     const newMakerPassword = typeof body.newMakerPassword === 'string' ? body.newMakerPassword : '';
     const newMainAdminPassword = typeof body.newMainAdminPassword === 'string' ? body.newMainAdminPassword : '';
     const newProtectedPassword = typeof body.newProtectedPassword === 'string' ? body.newProtectedPassword : '';
-
-    if (newMainAdminPassword && normalizeEnvCredentialValue(process.env.MAIN_ADMIN_PASSWORD)) {
-      res.status(400).json({
-        error: 'MAIN_ADMIN_PASSWORD is managed via Vercel Environment Variables. Update MAIN_ADMIN_PASSWORD in Vercel Project Settings, or use Maker-Only Password Rotation to rotate the Maker password in Firestore.',
-      });
-      return;
-    }
 
     if (
       (newMakerPassword && newMakerPassword.length < 8) ||
@@ -2029,20 +2005,34 @@ export function createApiApp(): express.Express {
       return;
     }
 
+    const nextMakerHash = newMakerPassword ? hashPassword(newMakerPassword) : creds.makerPasswordHash;
+    const nextMainHash = newMainAdminPassword ? hashPassword(newMainAdminPassword) : creds.mainAdminPasswordHash;
+    const nextProtectedHash = newProtectedPassword ? hashPassword(newProtectedPassword) : creds.protectedPasswordHash;
+
+    if (
+      (newMakerPassword && !verifyPassword(newMakerPassword, nextMakerHash)) ||
+      (newMainAdminPassword && !verifyPassword(newMainAdminPassword, nextMainHash)) ||
+      (newProtectedPassword && !verifyPassword(newProtectedPassword, nextProtectedHash))
+    ) {
+      res.status(500).json({ error: 'Internal password hash self-check failed. No changes were written.' });
+      return;
+    }
+
     const now = new Date().toISOString();
     const nextVersion = creds.sessionVersion + 1;
     const updatedCreds: StoredCredentials = {
       ...creds,
       makerUsername: nextMakerUsername,
-      makerPasswordHash: newMakerPassword ? hashPassword(newMakerPassword) : creds.makerPasswordHash,
-      mainAdminPasswordHash: newMainAdminPassword ? hashPassword(newMainAdminPassword) : creds.mainAdminPasswordHash,
-      protectedPasswordHash: newProtectedPassword ? hashPassword(newProtectedPassword) : creds.protectedPasswordHash,
-      deletePasswordHash: newProtectedPassword ? hashPassword(newProtectedPassword) : creds.deletePasswordHash,
+      makerPasswordHash: nextMakerHash,
+      mainAdminPasswordHash: nextMainHash,
+      protectedPasswordHash: nextProtectedHash,
+      deletePasswordHash: newProtectedPassword ? nextProtectedHash : creds.deletePasswordHash,
       sessionVersion: nextVersion,
       updatedAt: now,
     };
 
     await store.saveCredentials(updatedCreds);
+    clearAllAuthFailures();
 
     // Issue fresh token on new sessionVersion so current admin stays signed in while all prior sessions terminate
     const { token, session } = signSessionToken({
@@ -2059,15 +2049,15 @@ export function createApiApp(): express.Express {
       actorRole: req.session!.role,
       action: 'PASSWORD_ROTATED',
       ipAddress: getClientIp(req),
-      reason: 'Rotated server-side scrypt credentials and incremented sessionVersion',
-      metadata: { newSessionVersion: nextVersion },
+      reason: 'Rotated server-side scrypt credentials in Firestore and incremented sessionVersion',
+      metadata: { newSessionVersion: nextVersion, authSource: 'firestore' },
     });
 
     res.json({
       success: true,
       session,
       token,
-      message: 'Credentials rotated. All previous Maker and Admin sessions have been invalidated.',
+      message: 'Credentials rotated in Firestore. All previous Maker and Admin sessions have been invalidated.',
     });
   });
 
@@ -2099,7 +2089,7 @@ export function createApiApp(): express.Express {
     const currentMainPassword = typeof body.currentMainPassword === 'string' ? body.currentMainPassword : '';
     const newMakerPassword = typeof body.newMakerPassword === 'string' ? body.newMakerPassword : '';
 
-    if (!verifyEnvOrHash(currentMainPassword, process.env.MAIN_ADMIN_PASSWORD, creds.mainAdminPasswordHash)) {
+    if (!verifyPassword(currentMainPassword, creds.mainAdminPasswordHash)) {
       res.status(403).json({ error: 'Current Main Core Admin password is incorrect.' });
       return;
     }
@@ -2134,6 +2124,8 @@ export function createApiApp(): express.Express {
       res.status(500).json({ error: 'Post-write credential verification failed. Please retry.' });
       return;
     }
+
+    clearAllAuthFailures();
 
     const { token, session } = signSessionToken({
       username: 'Main Core Admin',

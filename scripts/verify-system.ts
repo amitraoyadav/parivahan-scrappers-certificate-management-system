@@ -885,7 +885,7 @@ async function runEnvManagedAuthTests(): Promise<void> {
   const protectedPass = `Prot@${crypto.randomBytes(6).toString('hex')}`;
   const sessionSecret = crypto.randomBytes(32).toString('hex');
 
-  // Verify quoted salted scrypt env var AND omitted ADMIN_USERNAME fallback to pscrappers
+  // Verify quoted salted scrypt env var AND omitted ADMIN_USERNAME fallback to user-pscrappers
   delete process.env.ADMIN_USERNAME;
   process.env.ADMIN_PASSWORD = `"${hashPassword(makerPass)}"`;
   process.env.MAIN_ADMIN_PASSWORD = hashPassword(adminPass);
@@ -927,11 +927,11 @@ async function runEnvManagedAuthTests(): Promise<void> {
     });
     assert.equal(bootRes.status, 403);
 
-    // Maker login succeeds with pscrappers and quoted salted scrypt env hash (one-time bootstrap into Firestore)
+    // Maker login succeeds with user-pscrappers and quoted salted scrypt env hash (one-time bootstrap into Firestore)
     const makerRes = await fetch(`${origin}/api/auth/login`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'XMLHttpRequest' },
-      body: JSON.stringify({ username: 'pscrappers', password: makerPass }),
+      body: JSON.stringify({ username: 'user-pscrappers', password: makerPass }),
     });
     assert.equal(makerRes.status, 200);
     const setCookieHeader = makerRes.headers.get('set-cookie') || '';
@@ -939,7 +939,7 @@ async function runEnvManagedAuthTests(): Promise<void> {
     assert.ok(setCookieHeader.includes('Secure'), 'Session cookie must set Secure');
     assert.ok(setCookieHeader.includes('SameSite=None'), 'Session cookie must set SameSite=None');
     const makerJson = (await makerRes.json()) as { token: string; session: { username: string; role: string } };
-    assert.equal(makerJson.session.username, 'pscrappers');
+    assert.equal(makerJson.session.username, 'user-pscrappers');
     assert.equal(makerJson.session.role, 'maker');
 
     // Maker is blocked from Admin routes
@@ -948,7 +948,7 @@ async function runEnvManagedAuthTests(): Promise<void> {
     });
     assert.equal(forbiddenAdmin.status, 403);
 
-    // Main Core Admin unlock succeeds with separate env password
+    // Main Core Admin unlock succeeds with separate env password (bootstrapped into Firestore)
     const adminRes = await fetch(`${origin}/api/auth/admin-unlock`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'XMLHttpRequest' },
@@ -957,17 +957,19 @@ async function runEnvManagedAuthTests(): Promise<void> {
     assert.equal(adminRes.status, 200);
     const adminJson = (await adminRes.json()) as { token: string };
 
-    // CRITICAL PRECEDENCE CHECK: Changing ADMIN_PASSWORD / ADMIN_USERNAME in env AFTER Firestore
-    // credentials exist MUST NOT overwrite or override Firestore Maker credentials!
+    // CRITICAL PRECEDENCE CHECK: Changing ADMIN_PASSWORD, ADMIN_USERNAME, AND MAIN_ADMIN_PASSWORD in env
+    // AFTER Firestore credentials exist MUST NOT overwrite or override Firestore credentials for EITHER account!
     const staleEnvPassword = `StaleEnv@${crypto.randomBytes(6).toString('hex')}`;
+    const staleAdminEnvPassword = `StaleAdmin@${crypto.randomBytes(6).toString('hex')}`;
     process.env.ADMIN_USERNAME = 'stale_wrong_username';
     process.env.ADMIN_PASSWORD = hashPassword(staleEnvPassword);
+    process.env.MAIN_ADMIN_PASSWORD = hashPassword(staleAdminEnvPassword);
 
-    // Existing Firestore Maker credentials (pscrappers + makerPass) STILL succeed!
+    // Existing Firestore Maker credentials (user-pscrappers + makerPass) STILL succeed!
     const stillValidMaker = await fetch(`${origin}/api/auth/login`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'XMLHttpRequest' },
-      body: JSON.stringify({ username: 'pscrappers', password: makerPass }),
+      body: JSON.stringify({ username: 'user-pscrappers', password: makerPass }),
     });
     assert.equal(
       stillValidMaker.status,
@@ -975,16 +977,38 @@ async function runEnvManagedAuthTests(): Promise<void> {
       'Firestore Maker credentials must remain authoritative even when stale ADMIN_PASSWORD/ADMIN_USERNAME env vars exist'
     );
 
-    // Stale env password MUST be rejected
+    // Stale env Maker password MUST be rejected
     const staleRejected = await fetch(`${origin}/api/auth/login`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'XMLHttpRequest' },
-      body: JSON.stringify({ username: 'pscrappers', password: staleEnvPassword }),
+      body: JSON.stringify({ username: 'user-pscrappers', password: staleEnvPassword }),
     });
     assert.equal(staleRejected.status, 401, 'Stale env ADMIN_PASSWORD must not authenticate once Firestore credentials exist');
 
-    // Rotating Maker password via /api/admin/rotate-maker-password succeeds EVEN WITH stale ADMIN_PASSWORD in env,
-    // updates ONLY Firestore makerPasswordHash, and invalidates prior sessions via sessionVersion
+    // Existing Firestore Main Core Admin credentials STILL succeed and stale MAIN_ADMIN_PASSWORD is rejected!
+    const stillValidAdmin = await fetch(`${origin}/api/auth/admin-unlock`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'XMLHttpRequest' },
+      body: JSON.stringify({ password: adminPass }),
+    });
+    assert.equal(
+      stillValidAdmin.status,
+      200,
+      'Firestore Main Core Admin credentials must remain authoritative even when stale MAIN_ADMIN_PASSWORD env var exists'
+    );
+
+    const staleAdminRejected = await fetch(`${origin}/api/auth/admin-unlock`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'XMLHttpRequest' },
+      body: JSON.stringify({ password: staleAdminEnvPassword }),
+    });
+    assert.equal(
+      staleAdminRejected.status,
+      401,
+      'Stale env MAIN_ADMIN_PASSWORD must not authenticate once Firestore credentials exist'
+    );
+
+    // Rotating Maker password via /api/admin/rotate-maker-password succeeds EVEN WITH stale env vars
     const rotatedMakerPass = `FreshMaker@${crypto.randomBytes(6).toString('hex')}`;
     const rotMaker = await fetch(`${origin}/api/admin/rotate-maker-password`, {
       method: 'POST',
@@ -996,18 +1020,86 @@ async function runEnvManagedAuthTests(): Promise<void> {
       body: JSON.stringify({ currentMainPassword: adminPass, newMakerPassword: rotatedMakerPass }),
     });
     assert.equal(rotMaker.status, 200);
+    const rotMakerJson = (await rotMaker.json()) as { token: string };
 
     const invalidatedMaker = await fetch(`${origin}/api/certificates/recent`, {
       headers: { Authorization: `Bearer ${makerJson.token}` },
     });
     assert.equal(invalidatedMaker.status, 401, 'Rotating Maker password in Firestore must invalidate prior Maker sessions');
 
+    // Rotating Main Core Admin password via /api/admin/rotate-passwords succeeds EVEN WITH stale MAIN_ADMIN_PASSWORD in env
+    const rotatedAdminPass = `FreshAdmin@${crypto.randomBytes(6).toString('hex')}`;
+    const rotAdmin = await fetch(`${origin}/api/admin/rotate-passwords`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Requested-With': 'XMLHttpRequest',
+        Authorization: `Bearer ${rotMakerJson.token}`,
+      },
+      body: JSON.stringify({ currentMainPassword: adminPass, newMainAdminPassword: rotatedAdminPass }),
+    });
+    assert.equal(rotAdmin.status, 200, 'Main Core Admin password rotation must update Firestore even if stale env vars exist');
+
+    // Old Main Core Admin password fails; new Main Core Admin password succeeds + accesses settings + logout + re-login
+    const oldAdminFails = await fetch(`${origin}/api/auth/admin-unlock`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'XMLHttpRequest' },
+      body: JSON.stringify({ password: adminPass }),
+    });
+    assert.equal(oldAdminFails.status, 401);
+
+    const newAdminLogin = await fetch(`${origin}/api/auth/admin-unlock`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'XMLHttpRequest' },
+      body: JSON.stringify({ password: rotatedAdminPass }),
+    });
+    assert.equal(newAdminLogin.status, 200);
+    const newAdminToken = ((await newAdminLogin.json()) as { token: string }).token;
+
+    const settingsRes = await fetch(`${origin}/api/admin/settings`, {
+      headers: { Authorization: `Bearer ${newAdminToken}` },
+    });
+    assert.equal(settingsRes.status, 200);
+
+    const adminLogout = await fetch(`${origin}/api/auth/logout`, {
+      method: 'POST',
+      headers: { 'X-Requested-With': 'XMLHttpRequest', Authorization: `Bearer ${newAdminToken}` },
+    });
+    assert.equal(adminLogout.status, 200);
+
+    const adminRelogin = await fetch(`${origin}/api/auth/admin-unlock`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'XMLHttpRequest' },
+      body: JSON.stringify({ password: rotatedAdminPass }),
+    });
+    assert.equal(adminRelogin.status, 200, 'Main Core Admin re-login after logout must succeed');
+
+    // Maker login with user-pscrappers + newly rotated password -> dashboard -> logout -> re-login
     const newMakerLogin = await fetch(`${origin}/api/auth/login`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'XMLHttpRequest' },
-      body: JSON.stringify({ username: 'pscrappers', password: rotatedMakerPass }),
+      body: JSON.stringify({ username: 'user-pscrappers', password: rotatedMakerPass }),
     });
     assert.equal(newMakerLogin.status, 200, 'Login with newly rotated Firestore Maker password must succeed');
+    const freshMakerToken = ((await newMakerLogin.json()) as { token: string }).token;
+
+    const makerDash = await fetch(`${origin}/api/certificates/recent`, {
+      headers: { Authorization: `Bearer ${freshMakerToken}` },
+    });
+    assert.equal(makerDash.status, 200);
+
+    const makerLogout = await fetch(`${origin}/api/auth/logout`, {
+      method: 'POST',
+      headers: { 'X-Requested-With': 'XMLHttpRequest', Authorization: `Bearer ${freshMakerToken}` },
+    });
+    assert.equal(makerLogout.status, 200);
+
+    const makerRelogin = await fetch(`${origin}/api/auth/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'XMLHttpRequest' },
+      body: JSON.stringify({ username: 'user-pscrappers', password: rotatedMakerPass }),
+    });
+    assert.equal(makerRelogin.status, 200, 'Maker re-login after logout must succeed');
   } finally {
     await new Promise<void>((resolve) => envServer.close(() => resolve()));
     for (const [k, v] of Object.entries(savedEnv)) {
@@ -1546,11 +1638,72 @@ async function runAuthDiagnosticsTests(): Promise<void> {
       'Expected INCORRECT_PASSWORD diagnostic'
     );
 
-    // 4. Logout + Login again succeeds cleanly
+    // 4. Main Core Admin diagnostics: INVALID_PASSWORD_HASH_FORMAT and INCORRECT_PASSWORD
+    await store.saveCredentials({
+      makerUsername: 'user-pscrappers',
+      makerPasswordHash: validHash,
+      mainAdminPasswordHash: 'corrupted_non_scrypt_hash',
+      protectedPasswordHash: hashPassword(secretAdminPass),
+      deletePasswordHash: hashPassword(secretAdminPass),
+      sessionVersion: 2,
+      bootstrappedAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    });
+    const invalidAdminFmt = await fetch(`${origin}/api/auth/admin-unlock`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'XMLHttpRequest' },
+      body: JSON.stringify({ password: secretAdminPass }),
+    });
+    assert.equal(invalidAdminFmt.status, 500);
+
+    // 5. Simulate local recovery aligning makerUsername -> user-pscrappers & repairing both hashes
+    const recoveredAdminPass = `RecovAdmin@${crypto.randomBytes(4).toString('hex')}`;
+    const recoveredMakerPass = `RecovMaker@${crypto.randomBytes(4).toString('hex')}`;
+    const recoveredAdminHash = hashPassword(recoveredAdminPass);
+    const recoveredMakerHash = hashPassword(recoveredMakerPass);
+    const currentCreds = await store.getCredentials();
+    assert.ok(currentCreds);
+    await store.saveCredentials({
+      ...currentCreds,
+      makerUsername: 'user-pscrappers',
+      makerPasswordHash: recoveredMakerHash,
+      mainAdminPasswordHash: recoveredAdminHash,
+      sessionVersion: currentCreds.sessionVersion + 1,
+      updatedAt: new Date().toISOString(),
+    });
+
+    // Wrong Main Core Admin password logs INCORRECT_PASSWORD
+    const wrongAdminRes = await fetch(`${origin}/api/auth/admin-unlock`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'XMLHttpRequest' },
+      body: JSON.stringify({ password: 'WrongAdminPass#99' }),
+    });
+    assert.equal(wrongAdminRes.status, 401);
+
+    // 6. Both Main Core Admin and Maker (user-pscrappers) login + logout + re-login succeed cleanly
+    const adminOk1 = await fetch(`${origin}/api/auth/admin-unlock`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'XMLHttpRequest' },
+      body: JSON.stringify({ password: recoveredAdminPass }),
+    });
+    assert.equal(adminOk1.status, 200);
+    const { token: adminTok1 } = (await adminOk1.json()) as { token: string };
+    const adminLogout = await fetch(`${origin}/api/auth/logout`, {
+      method: 'POST',
+      headers: { 'X-Requested-With': 'XMLHttpRequest', Authorization: `Bearer ${adminTok1}` },
+    });
+    assert.equal(adminLogout.status, 200);
+    const adminOk2 = await fetch(`${origin}/api/auth/admin-unlock`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'XMLHttpRequest' },
+      body: JSON.stringify({ password: recoveredAdminPass }),
+    });
+    assert.equal(adminOk2.status, 200);
+
     const okLogin1 = await fetch(`${origin}/api/auth/login`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'XMLHttpRequest' },
-      body: JSON.stringify({ username: 'pscrappers', password: secretMakerPass }),
+      body: JSON.stringify({ username: 'user-pscrappers', password: recoveredMakerPass }),
     });
     assert.equal(okLogin1.status, 200);
     const { token: tok1 } = (await okLogin1.json()) as { token: string };
@@ -1564,16 +1717,20 @@ async function runAuthDiagnosticsTests(): Promise<void> {
     const okLogin2 = await fetch(`${origin}/api/auth/login`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'XMLHttpRequest' },
-      body: JSON.stringify({ username: 'pscrappers', password: secretMakerPass }),
+      body: JSON.stringify({ username: 'user-pscrappers', password: recoveredMakerPass }),
     });
     assert.equal(okLogin2.status, 200);
 
-    // 5. Verify ZERO secrets, plaintext passwords, or scrypt hashes leaked into diagnostic logs
+    // 7. Verify ZERO secrets, plaintext passwords, or scrypt hashes leaked into diagnostic logs
     const joinedLogs = capturedLogs.join('\n');
     assert.equal(joinedLogs.includes(secretMakerPass), false, 'Logs must never contain plaintext Maker password');
     assert.equal(joinedLogs.includes(secretAdminPass), false, 'Logs must never contain plaintext Admin password');
+    assert.equal(joinedLogs.includes(recoveredAdminPass), false, 'Logs must never contain recovered Admin password');
+    assert.equal(joinedLogs.includes(recoveredMakerPass), false, 'Logs must never contain recovered Maker password');
     assert.equal(joinedLogs.includes(validHash), false, 'Logs must never contain scrypt hashes');
+    assert.equal(joinedLogs.includes(recoveredAdminHash), false, 'Logs must never contain recovered hashes');
     assert.equal(joinedLogs.includes('WrongPassword#99'), false, 'Logs must never contain attempted passwords');
+    assert.equal(joinedLogs.includes('WrongAdminPass#99'), false, 'Logs must never contain attempted admin passwords');
   } finally {
     console.warn = origWarn;
     await new Promise<void>((resolve) => diagServer.close(() => resolve()));

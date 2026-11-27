@@ -14,7 +14,8 @@
     "test:security": "tsx scripts/verify-system.ts",
     "test:firestore": "tsx scripts/test-firestore.ts",
     "hash:password": "tsx scripts/hash-password.ts",
-    "rotate:maker-password": "tsx scripts/rotate-maker-password.ts"
+    "rotate:maker-password": "tsx scripts/rotate-maker-password.ts",
+    "recover:auth": "tsx scripts/recover-auth.ts"
   },
   "dependencies": {
     "@tailwindcss/vite": "^4.3.3",

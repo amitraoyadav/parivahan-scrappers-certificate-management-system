@@ -60,12 +60,6 @@ function normalizeEnvValue(val: string | undefined): string {
 }
 
 function verifyMainAdmin(plain: string, storedHash: string): boolean {
-  const envMain = normalizeEnvValue(process.env.MAIN_ADMIN_PASSWORD);
-  if (envMain) {
-    return envMain.startsWith('scrypt$')
-      ? verifyPassword(plain, envMain)
-      : timingSafeStringEqual(plain, envMain);
-  }
   return verifyPassword(plain, storedHash);
 }
 
@@ -201,7 +195,10 @@ async function main(): Promise<void> {
 
   const currentMainPassword = await promptHidden('Enter current Main Core Admin password to authorize: ');
   if (!verifyMainAdmin(currentMainPassword, existing.mainAdminPasswordHash)) {
-    console.error('\n[DENIED] Main Core Admin password verification failed. No changes were written.\n');
+    console.error(
+      '\n[DENIED] Main Core Admin password verification failed. No changes were written.\n' +
+        'If you need to recover the Main Core Admin password as well, run: npm run recover:auth\n'
+    );
     process.exit(1);
   }
 

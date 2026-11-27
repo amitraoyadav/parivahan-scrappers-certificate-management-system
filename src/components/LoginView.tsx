@@ -36,7 +36,7 @@ export const LoginView: React.FC<LoginViewProps> = ({
   const [adminPassword, setAdminPassword] = useState('');
 
   // First-Run Security Setup state
-  const [setupUsername, setSetupUsername] = useState('pscrappers');
+  const [setupUsername, setSetupUsername] = useState('user-pscrappers');
   const [setupMakerPassword, setSetupMakerPassword] = useState('');
   const [setupMainAdminPassword, setSetupMainAdminPassword] = useState('');
   const [setupProtectedPassword, setSetupProtectedPassword] = useState('');
