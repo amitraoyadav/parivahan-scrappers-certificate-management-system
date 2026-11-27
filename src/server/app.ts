@@ -25,7 +25,7 @@ import {
   timingSafeStringEqual,
   validateScryptHashFormat,
   verifyPassword,
-  verifySessionToken,
+  verifySessionTokenDetailed,
 } from './crypto.js';
 import { isDriveConfigured, syncCertificateToDriveInBackground } from './driveSync.js';
 import {
@@ -34,7 +34,12 @@ import {
   clearAuthFailures,
   recordAuthFailure,
 } from './rateLimit.js';
-import { getStore, type RegistryStore, type StoredCredentials } from './store.js';
+import {
+  getStore,
+  type RegistryStore,
+  type StoredCredentials,
+  type StoredSession,
+} from './store.js';
 
 const SESSION_COOKIE_NAME = 'ps_session';
 
@@ -95,11 +100,24 @@ type AuthDiagnosticCode =
   | 'INVALID_PASSWORD_HASH_FORMAT'
   | 'SESSION_CREATION_FAILURE';
 
+type SystemDiagnosticCode =
+  | 'SESSION_COOKIE_MISSING'
+  | 'SESSION_VALIDATION_FAILED'
+  | 'SESSION_VERSION_MISMATCH'
+  | 'NEXT_NUMBER_API_FAILURE'
+  | 'FIRESTORE_READ_FAILURE'
+  | 'CERTIFICATE_RESERVATION_FAILURE'
+  | 'CERTIFICATE_SAVE_FAILURE'
+  | 'PDF_GENERATION_FAILURE';
+
 function sanitizeDiagnosticDetail(detail: string | undefined): string | undefined {
   if (!detail) return undefined;
-  // Strip any accidental key/hash-like fragments before logging
+  // Strip any accidental key/hash/token/cookie-like fragments before logging
   return detail
     .replace(/scrypt\$[^\s"'`]+/gi, '[REDACTED_HASH]')
+    .replace(/Bearer\s+[A-Za-z0-9._-]+/gi, 'Bearer [REDACTED]')
+    .replace(/ps_session=[^;\s]+/gi, 'ps_session=[REDACTED]')
+    .replace(/sess_[0-9a-f]{12,}/gi, 'sess_[REDACTED]')
     .replace(/-----BEGIN [A-Z ]+-----[\s\S]*?-----END [A-Z ]+-----/g, '[REDACTED_KEY]')
     .slice(0, 220);
 }
@@ -121,6 +139,25 @@ function logAuthDiagnostic(params: {
     ...(params.detail ? { detail: sanitizeDiagnosticDetail(params.detail) } : {}),
   };
   console.warn(`[AUTH_DIAGNOSTIC] ${JSON.stringify(payload)}`);
+}
+
+function logSystemDiagnostic(params: {
+  code: SystemDiagnosticCode;
+  route: string;
+  ip: string;
+  role?: UserRole;
+  detail?: string;
+}): void {
+  const payload = {
+    event: 'SYSTEM_DIAGNOSTIC',
+    timestamp: new Date().toISOString(),
+    code: params.code,
+    route: params.route,
+    ip: params.ip,
+    ...(params.role ? { role: params.role } : {}),
+    ...(params.detail ? { detail: sanitizeDiagnosticDetail(params.detail) } : {}),
+  };
+  console.warn(`[SYSTEM_DIAGNOSTIC] ${JSON.stringify(payload)}`);
 }
 
 function convertEnvSecretToScryptHash(rawEnv: string, varName: string): { ok: true; hash: string } | { ok: false; detail: string } {
@@ -246,12 +283,6 @@ function formatCooldownText(retryAfterSeconds: number): string {
   return `${Math.ceil(retryAfterSeconds / 60)} minute(s)`;
 }
 
-async function getSessionVersion(): Promise<number> {
-  const store = getStore();
-  const creds = await store.getCredentials();
-  return creds?.sessionVersion ?? 1;
-}
-
 function setSessionCookie(res: Response, token: string, maxAgeMs: number): void {
   res.cookie(SESSION_COOKIE_NAME, token, {
     httpOnly: true,
@@ -273,24 +304,187 @@ function clearSessionCookie(res: Response): void {
   });
 }
 
-function extractSessionToken(req: Request): string | null {
+async function issueServerSession(
+  store: RegistryStore,
+  res: Response,
+  params: { username: string; role: UserRole; sessionVersion: number }
+): Promise<{ token: string; session: SessionInfo }> {
+  const { token, session } = signSessionToken({
+    username: params.username,
+    role: params.role,
+    sessionVersion: params.sessionVersion,
+  });
+
+  if (session.sid) {
+    const record: StoredSession = {
+      id: session.sid,
+      username: session.username,
+      role: session.role,
+      sessionVersion: session.sessionVersion,
+      issuedAt: session.issuedAt,
+      expiresAt: session.expiresAt,
+      revoked: false,
+    };
+    await store.createSession(record);
+  }
+
+  setSessionCookie(res, token, session.expiresAt - session.issuedAt);
+  return { token, session };
+}
+
+function extractSessionCandidates(req: Request): Array<{ source: 'bearer' | 'cookie'; token: string }> {
+  const out: Array<{ source: 'bearer' | 'cookie'; token: string }> = [];
   const authHeader = req.headers.authorization;
   if (typeof authHeader === 'string' && authHeader.startsWith('Bearer ')) {
-    const token = authHeader.slice(7).trim();
-    if (token) return token;
+    const bearer = authHeader.slice(7).trim();
+    if (bearer) out.push({ source: 'bearer', token: bearer });
   }
   const cookieToken = req.cookies?.[SESSION_COOKIE_NAME];
   if (typeof cookieToken === 'string' && cookieToken.trim()) {
-    return cookieToken.trim();
+    const trimmed = cookieToken.trim();
+    if (!out.some((c) => c.token === trimmed)) {
+      out.push({ source: 'cookie', token: trimmed });
+    }
   }
-  return null;
+  return out;
+}
+
+type SessionResolutionResult =
+  | { ok: true; session: SessionInfo }
+  | {
+      ok: false;
+      code:
+        | 'SESSION_COOKIE_MISSING'
+        | 'SESSION_VALIDATION_FAILED'
+        | 'SESSION_VERSION_MISMATCH'
+        | 'FIRESTORE_READ_FAILURE';
+      httpStatus: 401 | 503;
+      detail: string;
+    };
+
+async function resolveSessionDetailed(req: Request): Promise<SessionResolutionResult> {
+  const candidates = extractSessionCandidates(req);
+  if (candidates.length === 0) {
+    return {
+      ok: false,
+      code: 'SESSION_COOKIE_MISSING',
+      httpStatus: 401,
+      detail: 'missing_session_cookie_and_bearer_header',
+    };
+  }
+
+  const store = getStore();
+  let expectedVersion = 1;
+  try {
+    const creds = await store.getCredentials();
+    expectedVersion = creds?.sessionVersion ?? 1;
+  } catch (err) {
+    return {
+      ok: false,
+      code: 'FIRESTORE_READ_FAILURE',
+      httpStatus: 503,
+      detail: err instanceof Error ? err.message : 'Unable to read sessionVersion from Firestore',
+    };
+  }
+
+  let lastFailure: SessionResolutionResult = {
+    ok: false,
+    code: 'SESSION_VALIDATION_FAILED',
+    httpStatus: 401,
+    detail: 'invalid_session_token',
+  };
+
+  for (const candidate of candidates) {
+    const verified = verifySessionTokenDetailed(candidate.token, expectedVersion);
+    if (!verified.ok) {
+      if (verified.reason === 'VERSION_MISMATCH') {
+        lastFailure = {
+          ok: false,
+          code: 'SESSION_VERSION_MISMATCH',
+          httpStatus: 401,
+          detail: `${candidate.source}_session_version_mismatch`,
+        };
+      } else {
+        lastFailure = {
+          ok: false,
+          code: 'SESSION_VALIDATION_FAILED',
+          httpStatus: 401,
+          detail: `${candidate.source}_${verified.reason.toLowerCase()}`,
+        };
+      }
+      continue;
+    }
+
+    const session = verified.session;
+    if (session.sid) {
+      let stored: StoredSession | null = null;
+      try {
+        stored = await store.getSession(session.sid);
+      } catch (err) {
+        return {
+          ok: false,
+          code: 'FIRESTORE_READ_FAILURE',
+          httpStatus: 503,
+          detail: err instanceof Error ? err.message : 'Unable to verify session record in Firestore',
+        };
+      }
+
+      if (!stored) {
+        lastFailure = {
+          ok: false,
+          code: 'SESSION_VALIDATION_FAILED',
+          httpStatus: 401,
+          detail: `${candidate.source}_server_session_not_found`,
+        };
+        continue;
+      }
+      if (stored.revoked) {
+        lastFailure = {
+          ok: false,
+          code: 'SESSION_VALIDATION_FAILED',
+          httpStatus: 401,
+          detail: `${candidate.source}_server_session_revoked`,
+        };
+        continue;
+      }
+      if (Date.now() >= stored.expiresAt) {
+        lastFailure = {
+          ok: false,
+          code: 'SESSION_VALIDATION_FAILED',
+          httpStatus: 401,
+          detail: `${candidate.source}_server_session_expired`,
+        };
+        continue;
+      }
+      if (stored.sessionVersion !== expectedVersion) {
+        lastFailure = {
+          ok: false,
+          code: 'SESSION_VERSION_MISMATCH',
+          httpStatus: 401,
+          detail: `${candidate.source}_stored_session_version_mismatch`,
+        };
+        continue;
+      }
+      if (stored.role !== session.role || stored.username !== session.username) {
+        lastFailure = {
+          ok: false,
+          code: 'SESSION_VALIDATION_FAILED',
+          httpStatus: 401,
+          detail: `${candidate.source}_server_session_principal_mismatch`,
+        };
+        continue;
+      }
+    }
+
+    return { ok: true, session };
+  }
+
+  return lastFailure;
 }
 
 async function resolveSession(req: Request): Promise<SessionInfo | null> {
-  const token = extractSessionToken(req);
-  if (!token) return null;
-  const version = await getSessionVersion();
-  return verifySessionToken(token, version);
+  const res = await resolveSessionDetailed(req);
+  return res.ok ? res.session : null;
 }
 
 function csrfGuard(req: Request, res: Response, next: NextFunction): void {
@@ -328,28 +522,52 @@ function csrfGuard(req: Request, res: Response, next: NextFunction): void {
 }
 
 async function requireAuth(req: AuthedRequest, res: Response, next: NextFunction): Promise<void> {
-  const session = await resolveSession(req);
-  if (!session) {
-    res.status(401).json({ error: 'Authentication required. Please sign in.' });
+  const resolved = await resolveSessionDetailed(req);
+  if (!resolved.ok) {
+    logSystemDiagnostic({
+      code: resolved.code,
+      route: req.originalUrl,
+      ip: getClientIp(req),
+      detail: resolved.detail,
+    });
+    res.status(resolved.httpStatus).json({
+      error:
+        resolved.httpStatus === 503
+          ? 'Unable to verify session with the database. Please retry.'
+          : 'Authentication required. Please sign in.',
+      code: resolved.code,
+    });
     return;
   }
-  req.session = session;
+  req.session = resolved.session;
   next();
 }
 
 async function requireMainAdmin(req: AuthedRequest, res: Response, next: NextFunction): Promise<void> {
-  const session = await resolveSession(req);
-  if (!session) {
-    res.status(401).json({ error: 'Authentication required.' });
+  const resolved = await resolveSessionDetailed(req);
+  if (!resolved.ok) {
+    logSystemDiagnostic({
+      code: resolved.code,
+      route: req.originalUrl,
+      ip: getClientIp(req),
+      detail: resolved.detail,
+    });
+    res.status(resolved.httpStatus).json({
+      error:
+        resolved.httpStatus === 503
+          ? 'Unable to verify session with the database. Please retry.'
+          : 'Authentication required.',
+      code: resolved.code,
+    });
     return;
   }
-  if (session.role !== 'main_admin') {
+  if (resolved.session.role !== 'main_admin') {
     res.status(403).json({
       error: 'Forbidden: Main Core Admin authorization is required for this resource.',
     });
     return;
   }
-  req.session = session;
+  req.session = resolved.session;
   next();
 }
 
@@ -775,14 +993,13 @@ export function createApiApp(): express.Express {
     let session: SessionInfo;
     try {
       const sessionVersion = creds.sessionVersion ?? 1;
-      const signed = signSessionToken({
+      const issued = await issueServerSession(store, res, {
         username: expectedUsername,
         role: 'maker',
         sessionVersion,
       });
-      token = signed.token;
-      session = signed.session;
-      setSessionCookie(res, token, session.expiresAt - session.issuedAt);
+      token = issued.token;
+      session = issued.session;
     } catch (err) {
       logAuthDiagnostic({
         role: 'maker',
@@ -924,14 +1141,13 @@ export function createApiApp(): express.Express {
     let session: SessionInfo;
     try {
       const sessionVersion = creds.sessionVersion ?? 1;
-      const signed = signSessionToken({
+      const issued = await issueServerSession(store, res, {
         username: 'Main Core Admin',
         role: 'main_admin',
         sessionVersion,
       });
-      token = signed.token;
-      session = signed.session;
-      setSessionCookie(res, token, session.expiresAt - session.issuedAt);
+      token = issued.token;
+      session = issued.session;
     } catch (err) {
       logAuthDiagnostic({
         role: 'main_admin',
@@ -965,17 +1181,36 @@ export function createApiApp(): express.Express {
   });
 
   router.post('/auth/logout', async (req, res) => {
-    const session = await resolveSession(req);
+    const store = getStore();
+    const resolved = await resolveSessionDetailed(req);
     clearSessionCookie(res);
-    if (session) {
-      await getStore().addAuditLog({
-        id: generateRecordId('aud'),
-        timestamp: new Date().toISOString(),
-        actor: session.username,
-        actorRole: session.role,
-        action: 'LOGOUT',
-        ipAddress: getClientIp(req),
-      });
+    if (resolved.ok) {
+      const session = resolved.session;
+      if (session.sid) {
+        try {
+          await store.revokeSession(session.sid);
+        } catch (err) {
+          logSystemDiagnostic({
+            code: 'FIRESTORE_READ_FAILURE',
+            route: req.originalUrl,
+            ip: getClientIp(req),
+            role: session.role,
+            detail: `logout_revoke_failed:${err instanceof Error ? err.message : 'unknown'}`,
+          });
+        }
+      }
+      try {
+        await store.addAuditLog({
+          id: generateRecordId('aud'),
+          timestamp: new Date().toISOString(),
+          actor: session.username,
+          actorRole: session.role,
+          action: 'LOGOUT',
+          ipAddress: getClientIp(req),
+        });
+      } catch {
+        // non-fatal
+      }
     }
     res.json({ success: true });
   });
@@ -1058,10 +1293,53 @@ export function createApiApp(): express.Express {
   // ==========================================================================
   // MAKER & MAIN ADMIN CERTIFICATE ISSUANCE ROUTES
   // ==========================================================================
-  router.get('/certificates/candidate-numbers', requireAuth, async (req, res) => {
+  const handleNextAvailableNumbers = async (req: AuthedRequest, res: Response) => {
     const issueDate = sanitizeText(req.query.issueDate, 20);
-    const candidate = await generateAvailableCandidateNumbers(issueDate || undefined);
-    res.json(candidate);
+    const ip = getClientIp(req);
+    try {
+      const candidate = await generateAvailableCandidateNumbers(issueDate || undefined);
+      res.json(candidate);
+    } catch (err) {
+      const detail = err instanceof Error ? err.message : 'next_number_generation_failed';
+      if (detail.toLowerCase().includes('firestore') || detail.toLowerCase().includes('fetch')) {
+        logSystemDiagnostic({
+          code: 'FIRESTORE_READ_FAILURE',
+          route: req.originalUrl,
+          ip,
+          role: req.session?.role,
+          detail,
+        });
+      }
+      logSystemDiagnostic({
+        code: 'NEXT_NUMBER_API_FAILURE',
+        route: req.originalUrl,
+        ip,
+        role: req.session?.role,
+        detail,
+      });
+      res.status(503).json({
+        error: 'Unable to load next available certificate numbers from the registry. Please retry.',
+        code: 'NEXT_NUMBER_API_FAILURE',
+      });
+    }
+  };
+
+  router.get('/certificates/next-numbers', requireAuth, handleNextAvailableNumbers);
+  router.get('/certificates/candidate-numbers', requireAuth, handleNextAvailableNumbers);
+
+  // Authenticated secret-free diagnostic endpoint for client-side PDF generation failures
+  router.post('/diagnostics/pdf-failure', requireAuth, (req: AuthedRequest, res: Response) => {
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const certId = sanitizeText(body.certificateId, 80);
+    const reason = sanitizeText(body.reason, 180) || 'client_pdf_generation_error';
+    logSystemDiagnostic({
+      code: 'PDF_GENERATION_FAILURE',
+      route: req.originalUrl,
+      ip: getClientIp(req),
+      role: req.session?.role,
+      detail: `certId=${certId || 'unknown'}:${reason}`,
+    });
+    res.json({ logged: true });
   });
 
   // Maker Latest Five Only (Server-Side Hard Limit = 5)
@@ -1287,6 +1565,7 @@ export function createApiApp(): express.Express {
   router.post('/certificates', requireAuth, async (req: AuthedRequest, res) => {
     const startMs = Date.now();
     const store = getStore();
+    const ip = getClientIp(req);
     const validated = validateCertificatePayload(req.body);
     if (!validated.ok) {
       res.status(400).json({ error: validated.error });
@@ -1298,20 +1577,36 @@ export function createApiApp(): express.Express {
     const idempotencyKey = headerKey || bodyKey || generateRecordId('idemp');
 
     // Fast path: return existing certificate if this exact submission was already committed
-    const existingIdemp = await store.getIdempotencyRecord(idempotencyKey);
-    if (existingIdemp) {
-      const existingCert = await store.getCertificateById(existingIdemp.certificateId);
-      if (existingCert) {
-        res.status(200).json({
-          certificate: existingCert,
-          idempotentReplay: true,
-          persistenceMs: Date.now() - startMs,
-        });
-        return;
+    let settings: SystemSettings;
+    try {
+      const existingIdemp = await store.getIdempotencyRecord(idempotencyKey);
+      if (existingIdemp) {
+        const existingCert = await store.getCertificateById(existingIdemp.certificateId);
+        if (existingCert) {
+          res.status(200).json({
+            certificate: existingCert,
+            idempotentReplay: true,
+            persistenceMs: Date.now() - startMs,
+          });
+          return;
+        }
       }
+      settings = await store.getSettings();
+    } catch (err) {
+      logSystemDiagnostic({
+        code: 'FIRESTORE_READ_FAILURE',
+        route: req.originalUrl,
+        ip,
+        role: req.session?.role,
+        detail: err instanceof Error ? err.message : 'Unable to read idempotency/settings',
+      });
+      res.status(503).json({
+        error: 'Unable to communicate with the certificate database. Please retry.',
+        code: 'FIRESTORE_READ_FAILURE',
+      });
+      return;
     }
 
-    const settings = await store.getSettings();
     const input = validated.data;
     const now = new Date().toISOString();
     const driveReady = settings.driveSyncEnabled && isDriveConfigured(settings.driveFolderId);
@@ -1322,9 +1617,24 @@ export function createApiApp(): express.Express {
 
     for (let attempt = 0; attempt < 8; attempt++) {
       if (!candidateCertNo || !candidateRegNo || attempt > 0) {
-        const fresh = await generateAvailableCandidateNumbers(input.issueDate);
-        candidateCertNo = fresh.certificateNumber;
-        candidateRegNo = fresh.scrappingRegNumber;
+        try {
+          const fresh = await generateAvailableCandidateNumbers(input.issueDate);
+          candidateCertNo = fresh.certificateNumber;
+          candidateRegNo = fresh.scrappingRegNumber;
+        } catch (err) {
+          logSystemDiagnostic({
+            code: 'CERTIFICATE_RESERVATION_FAILURE',
+            route: req.originalUrl,
+            ip,
+            role: req.session?.role,
+            detail: err instanceof Error ? err.message : 'Candidate number allocation failed',
+          });
+          res.status(503).json({
+            error: 'Unable to reserve a unique certificate number. Please retry.',
+            code: 'CERTIFICATE_RESERVATION_FAILURE',
+          });
+          return;
+        }
       }
 
       const certId = generateRecordId('cert');
@@ -1379,7 +1689,7 @@ export function createApiApp(): express.Express {
             action: 'CERTIFICATE_CREATED',
             certificateId: certificate.id,
             certificateNumber: certificate.certificateNumber,
-            ipAddress: getClientIp(req),
+            ipAddress: ip,
             metadata: {
               scrappingRegNumber: certificate.scrappingRegNumber,
               vehicleRegNumber: certificate.vehicleRegNumber,
@@ -1400,16 +1710,42 @@ export function createApiApp(): express.Express {
         return;
       } catch (err) {
         if ((err as NodeJS.ErrnoException)?.code === 'NUMBER_COLLISION') {
+          logSystemDiagnostic({
+            code: 'CERTIFICATE_RESERVATION_FAILURE',
+            route: req.originalUrl,
+            ip,
+            role: req.session?.role,
+            detail: `number_collision_retry_attempt_${attempt + 1}`,
+          });
           candidateCertNo = undefined;
           candidateRegNo = undefined;
           continue;
         }
-        throw err;
+        logSystemDiagnostic({
+          code: 'CERTIFICATE_SAVE_FAILURE',
+          route: req.originalUrl,
+          ip,
+          role: req.session?.role,
+          detail: err instanceof Error ? err.message : 'Atomic Firestore certificate save failed',
+        });
+        res.status(503).json({
+          error: 'Failed to save certificate to Firestore. Please retry — idempotency prevents duplicates.',
+          code: 'CERTIFICATE_SAVE_FAILURE',
+        });
+        return;
       }
     }
 
+    logSystemDiagnostic({
+      code: 'CERTIFICATE_RESERVATION_FAILURE',
+      route: req.originalUrl,
+      ip,
+      role: req.session?.role,
+      detail: 'exhausted_8_collision_retries',
+    });
     res.status(503).json({
       error: 'Unable to reserve unique certificate numbers due to high concurrency. Please try again.',
+      code: 'CERTIFICATE_RESERVATION_FAILURE',
     });
   });
 
@@ -2034,13 +2370,12 @@ export function createApiApp(): express.Express {
     await store.saveCredentials(updatedCreds);
     clearAllAuthFailures();
 
-    // Issue fresh token on new sessionVersion so current admin stays signed in while all prior sessions terminate
-    const { token, session } = signSessionToken({
+    // Issue fresh server-side session on new sessionVersion so current admin stays signed in while all prior sessions terminate
+    const { token, session } = await issueServerSession(store, res, {
       username: 'Main Core Admin',
       role: 'main_admin',
       sessionVersion: nextVersion,
     });
-    setSessionCookie(res, token, session.expiresAt - session.issuedAt);
 
     await store.addAuditLog({
       id: generateRecordId('aud'),
@@ -2127,12 +2462,11 @@ export function createApiApp(): express.Express {
 
     clearAllAuthFailures();
 
-    const { token, session } = signSessionToken({
+    const { token, session } = await issueServerSession(store, res, {
       username: 'Main Core Admin',
       role: 'main_admin',
       sessionVersion: nextVersion,
     });
-    setSessionCookie(res, token, session.expiresAt - session.issuedAt);
 
     await store.addAuditLog({
       id: generateRecordId('aud'),

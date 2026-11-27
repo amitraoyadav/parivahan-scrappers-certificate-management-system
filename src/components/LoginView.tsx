@@ -13,6 +13,7 @@ import { api, ApiError } from '../lib/api';
 
 interface LoginViewProps {
   authStatus: AuthStatusResponse;
+  initialNotice?: string | null;
   onAuthenticated: (session: SessionInfo) => void;
   onBootstrapComplete: () => Promise<void>;
   onOpenPublicVerify: () => void;
@@ -22,6 +23,7 @@ type AuthTab = 'maker' | 'admin';
 
 export const LoginView: React.FC<LoginViewProps> = ({
   authStatus,
+  initialNotice,
   onAuthenticated,
   onBootstrapComplete,
   onOpenPublicVerify,
@@ -43,7 +45,7 @@ export const LoginView: React.FC<LoginViewProps> = ({
 
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [notice, setNotice] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(initialNotice ?? null);
 
   const handleMakerLogin = async (e: React.FormEvent) => {
     e.preventDefault();

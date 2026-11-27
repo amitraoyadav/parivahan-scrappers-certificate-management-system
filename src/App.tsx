@@ -10,7 +10,7 @@ import {
   X,
 } from 'lucide-react';
 import type { AuthStatusResponse, CertificateRecord, SessionInfo } from './shared/types';
-import { api, ApiError } from './lib/api';
+import { api, ApiError, setMemoryToken } from './lib/api';
 import { AdminDashboard } from './components/AdminDashboard';
 import { CertificatePreviewModal } from './components/CertificatePreviewModal';
 import { CreateCertificateForm } from './components/CreateCertificateForm';
@@ -44,6 +44,7 @@ export default function App() {
   const [recentCertificates, setRecentCertificates] = useState<CertificateRecord[]>([]);
   const [loadingRecent, setLoadingRecent] = useState(false);
   const [makerNotice, setMakerNotice] = useState<string | null>(null);
+  const [sessionExpiredNotice, setSessionExpiredNotice] = useState<string | null>(null);
 
   // Modals
   const [previewCert, setPreviewCert] = useState<CertificateRecord | null>(null);
@@ -106,10 +107,19 @@ export default function App() {
     setRoute({ isVerifyRoute: false, certNumber: '', token: '' });
   };
 
+  const handleSessionExpired = useCallback(() => {
+    setMemoryToken(null);
+    setSession(null);
+    setRecentCertificates([]);
+    setSessionExpiredNotice('Your session expired or was invalidated. Please sign in again.');
+    void loadAuthStatus();
+  }, [loadAuthStatus]);
+
   const handleLogout = async () => {
     await api.logout();
     setSession(null);
     setRecentCertificates([]);
+    setSessionExpiredNotice(null);
     await loadAuthStatus();
   };
 
@@ -172,7 +182,11 @@ export default function App() {
     return (
       <LoginView
         authStatus={authStatus}
-        onAuthenticated={(newSession) => setSession(newSession)}
+        initialNotice={sessionExpiredNotice}
+        onAuthenticated={(newSession) => {
+          setSessionExpiredNotice(null);
+          setSession(newSession);
+        }}
         onBootstrapComplete={loadAuthStatus}
         onOpenPublicVerify={() => navigateToVerify()}
       />
@@ -283,6 +297,7 @@ export default function App() {
                 void loadRecentForMaker();
               }}
               onPreviewCertificate={(cert) => setPreviewCert(cert)}
+              onSessionExpired={handleSessionExpired}
               pdfBranding={{
                 customDomain: authStatus.publicDomain,
                 authorizedSignatory: authStatus.authorizedSignatory,

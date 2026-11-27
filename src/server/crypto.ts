@@ -5,15 +5,54 @@ import { maskVehicleIdNumber } from '../shared/vehicleData.js';
 const SCRYPT_KEYLEN = 64;
 const SCRYPT_PARAMS = { N: 16384, r: 8, p: 1 };
 
-// Ephemeral fallback only when ADMIN_SESSION_SECRET is not provided in process.env
+// Ephemeral fallback ONLY for local staging without ADMIN_SESSION_SECRET or FIREBASE_PRIVATE_KEY
 const ephemeralFallbackSecret = crypto.randomBytes(32).toString('hex');
 
+function stripWrappingQuotes(value: string | undefined): string {
+  if (!value) return '';
+  let trimmed = value.trim();
+  if (
+    (trimmed.startsWith('"') && trimmed.endsWith('"') && trimmed.length >= 2) ||
+    (trimmed.startsWith("'") && trimmed.endsWith("'") && trimmed.length >= 2)
+  ) {
+    trimmed = trimmed.slice(1, -1).trim();
+  }
+  return trimmed;
+}
+
+/**
+ * Derives a consistent 256-bit HMAC session signing key across ALL Vercel serverless instances:
+ * 1. Primary: `ADMIN_SESSION_SECRET` (>= 16 chars).
+ * 2. Production serverless fallback: deterministic HMAC derived from private server-side
+ *    Firebase service-account env vars (`FIREBASE_PROJECT_ID`, `FIREBASE_CLIENT_EMAIL`,
+ *    `FIREBASE_PRIVATE_KEY`), which are identical across every serverless instance and never
+ *    exposed to clients. This prevents cross-instance signature mismatches on Vercel when
+ *    `ADMIN_SESSION_SECRET` is omitted.
+ * 3. Local dev/staging fallback: process-local random secret.
+ */
 function getSessionSecret(): Buffer {
-  const configured = process.env.ADMIN_SESSION_SECRET?.trim();
-  const baseSecret = configured && configured.length >= 16 ? configured : ephemeralFallbackSecret;
-  // Session revocation on password rotation or recovery is enforced globally across
-  // all serverless instances via Firestore admins/primary_credentials.sessionVersion.
-  return crypto.createHash('sha256').update(baseSecret).digest();
+  const configured = stripWrappingQuotes(process.env.ADMIN_SESSION_SECRET);
+  if (configured.length >= 16) {
+    return crypto.createHash('sha256').update(configured).digest();
+  }
+
+  const fbProject = stripWrappingQuotes(process.env.FIREBASE_PROJECT_ID);
+  const fbEmail = stripWrappingQuotes(process.env.FIREBASE_CLIENT_EMAIL);
+  const fbKey = stripWrappingQuotes(process.env.FIREBASE_PRIVATE_KEY).replace(/\\n/g, '\n');
+  if (fbProject && fbEmail && fbKey.length >= 64) {
+    return crypto
+      .createHmac('sha256', 'parivahan-scrappers-session-signing-v1')
+      .update(`${fbProject}|${fbEmail}|${fbKey}`)
+      .digest();
+  }
+
+  // Session revocation on password rotation, logout, or recovery is enforced globally across
+  // all serverless instances via Firestore admins/primary_credentials.sessionVersion & auth_sessions.
+  return crypto.createHash('sha256').update(ephemeralFallbackSecret).digest();
+}
+
+export function generateSessionId(): string {
+  return `sess_${crypto.randomBytes(24).toString('hex')}`;
 }
 
 export type PasswordHashValidationResult =
@@ -77,6 +116,7 @@ export function timingSafeStringEqual(a: string, b: string): boolean {
 }
 
 export function signSessionToken(payload: {
+  sid?: string;
   username: string;
   role: UserRole;
   sessionVersion: number;
@@ -85,6 +125,7 @@ export function signSessionToken(payload: {
   const nowSec = Math.floor(Date.now() / 1000);
   const defaultTtl = payload.role === 'main_admin' ? 2 * 60 * 60 : 4 * 60 * 60;
   const session: SessionInfo = {
+    sid: payload.sid ?? generateSessionId(),
     username: payload.username,
     role: payload.role,
     sessionVersion: payload.sessionVersion,
@@ -101,13 +142,24 @@ export function signSessionToken(payload: {
   return { token: `${bodyB64}.${sig}`, session };
 }
 
-export function verifySessionToken(
+export type SessionTokenVerificationResult =
+  | { ok: true; session: SessionInfo }
+  | {
+      ok: false;
+      reason: 'TOKEN_MALFORMED' | 'SIGNATURE_INVALID' | 'EXPIRED' | 'VERSION_MISMATCH';
+    };
+
+export function verifySessionTokenDetailed(
   token: string,
   expectedSessionVersion: number
-): SessionInfo | null {
-  if (!token || typeof token !== 'string') return null;
+): SessionTokenVerificationResult {
+  if (!token || typeof token !== 'string') {
+    return { ok: false, reason: 'TOKEN_MALFORMED' };
+  }
   const dotIdx = token.indexOf('.');
-  if (dotIdx <= 0 || dotIdx === token.length - 1) return null;
+  if (dotIdx <= 0 || dotIdx === token.length - 1) {
+    return { ok: false, reason: 'TOKEN_MALFORMED' };
+  }
 
   const bodyB64 = token.slice(0, dotIdx);
   const sig = token.slice(dotIdx + 1);
@@ -116,19 +168,39 @@ export function verifySessionToken(
     .update(bodyB64)
     .digest('base64url');
 
-  if (!timingSafeStringEqual(sig, expectedSig)) return null;
+  if (!timingSafeStringEqual(sig, expectedSig)) {
+    return { ok: false, reason: 'SIGNATURE_INVALID' };
+  }
 
   try {
     const parsed = JSON.parse(Buffer.from(bodyB64, 'base64url').toString('utf8')) as SessionInfo;
-    if (!parsed || typeof parsed.expiresAt !== 'number') return null;
-    if (Date.now() >= parsed.expiresAt) return null;
-    if (parsed.sessionVersion !== expectedSessionVersion) return null;
-    if (parsed.role !== 'maker' && parsed.role !== 'main_admin') return null;
-    if (!parsed.username || typeof parsed.username !== 'string') return null;
-    return parsed;
+    if (!parsed || typeof parsed.expiresAt !== 'number') {
+      return { ok: false, reason: 'TOKEN_MALFORMED' };
+    }
+    if (Date.now() >= parsed.expiresAt) {
+      return { ok: false, reason: 'EXPIRED' };
+    }
+    if (parsed.sessionVersion !== expectedSessionVersion) {
+      return { ok: false, reason: 'VERSION_MISMATCH' };
+    }
+    if (parsed.role !== 'maker' && parsed.role !== 'main_admin') {
+      return { ok: false, reason: 'TOKEN_MALFORMED' };
+    }
+    if (!parsed.username || typeof parsed.username !== 'string') {
+      return { ok: false, reason: 'TOKEN_MALFORMED' };
+    }
+    return { ok: true, session: parsed };
   } catch {
-    return null;
+    return { ok: false, reason: 'TOKEN_MALFORMED' };
   }
+}
+
+export function verifySessionToken(
+  token: string,
+  expectedSessionVersion: number
+): SessionInfo | null {
+  const res = verifySessionTokenDetailed(token, expectedSessionVersion);
+  return res.ok ? res.session : null;
 }
 
 export function generateRandomCertificateNumber(issueDate?: string): {

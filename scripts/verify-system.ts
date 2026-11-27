@@ -500,7 +500,13 @@ async function runTests(): Promise<void> {
       '✓ 22. Safe server-side auth diagnostics (INCORRECT_USERNAME, INCORRECT_PASSWORD, MISSING_FIRESTORE_CREDENTIALS, INVALID_PASSWORD_HASH_FORMAT, FIREBASE_CONNECTION_FAILURE; zero secret leak) verified'
     );
 
-    console.log('\nALL 22 ISOLATED STAGING, AUTH PRECEDENCE, DIAGNOSTICS, SPARK-FIRESTORE, BACKUP/RESTORE, PDF, MAKER EDIT/DELETE & SECURITY CHECKS PASSED.\n');
+    // 23. Maker Session Cookie, Cross-Instance Signing, Next-Numbers Non-Consumption, Issuance, Logout Revocation & System Diagnostics
+    await runMakerSessionAndNextNumbersTests();
+    console.log(
+      '✓ 23. Maker cookie session, serverless cross-instance signing, /api/certificates/next-numbers non-consumption, certificate issuance, PDF filename, logout revocation & secret-free diagnostics verified'
+    );
+
+    console.log('\nALL 23 ISOLATED STAGING, SESSION, AUTH PRECEDENCE, DIAGNOSTICS, SPARK-FIRESTORE, BACKUP/RESTORE, PDF, MAKER EDIT/DELETE & SECURITY CHECKS PASSED.\n');
   } finally {
     await new Promise<void>((resolve) => server.close(() => resolve()));
   }
@@ -1734,6 +1740,263 @@ async function runAuthDiagnosticsTests(): Promise<void> {
   } finally {
     console.warn = origWarn;
     await new Promise<void>((resolve) => diagServer.close(() => resolve()));
+    resetStoreForTesting();
+  }
+}
+
+async function runMakerSessionAndNextNumbersTests(): Promise<void> {
+  const crypto = await import('node:crypto');
+  const { getStore, resetStoreForTesting } = await import('../src/server/store.js');
+  const { buildCertificatePdfDoc, getCertificatePdfFilename } = await import('../src/lib/pdfGenerator.js');
+  const { hashPassword } = await import('../src/server/crypto.js');
+
+  const savedEnv = {
+    ADMIN_SESSION_SECRET: process.env.ADMIN_SESSION_SECRET,
+    FIREBASE_PROJECT_ID: process.env.FIREBASE_PROJECT_ID,
+    FIREBASE_CLIENT_EMAIL: process.env.FIREBASE_CLIENT_EMAIL,
+    FIREBASE_PRIVATE_KEY: process.env.FIREBASE_PRIVATE_KEY,
+  };
+
+  // Simulate Vercel production where ADMIN_SESSION_SECRET is omitted so getSessionSecret()
+  // must derive a consistent key from private Firebase env vars across serverless instances
+  delete process.env.ADMIN_SESSION_SECRET;
+  const { privateKey } = crypto.generateKeyPairSync('rsa', {
+    modulusLength: 2048,
+    privateKeyEncoding: { type: 'pkcs8', format: 'pem' },
+    publicKeyEncoding: { type: 'spki', format: 'pem' },
+  });
+  // Keep StagingMemoryStore active first by initializing store BEFORE setting fake Firebase env vars for signing derivation
+  resetStoreForTesting();
+  const sharedStore = getStore();
+  process.env.FIREBASE_PROJECT_ID = 'crm-certificates';
+  process.env.FIREBASE_CLIENT_EMAIL = 'sa@crm-certificates.iam.gserviceaccount.com';
+  process.env.FIREBASE_PRIVATE_KEY = privateKey;
+
+  const capturedLogs: string[] = [];
+  const origWarn = console.warn;
+  console.warn = (...args: unknown[]) => {
+    capturedLogs.push(args.map(String).join(' '));
+  };
+
+  // Start TWO separate Express instances simulating two Vercel serverless containers
+  const appA = createApiApp();
+  const appB = createApiApp();
+  const serverA = http.createServer(appA);
+  const serverB = http.createServer(appB);
+  await new Promise<void>((resolve) => serverA.listen(0, '127.0.0.1', resolve));
+  await new Promise<void>((resolve) => serverB.listen(0, '127.0.0.1', resolve));
+  const addrA = serverA.address();
+  const addrB = serverB.address();
+  if (!addrA || typeof addrA === 'string' || !addrB || typeof addrB === 'string') {
+    throw new Error('Failed to start dual-instance session test servers');
+  }
+  const originA = `http://127.0.0.1:${addrA.port}`;
+  const originB = `http://127.0.0.1:${addrB.port}`;
+
+  const makerPass = `SessMaker@${crypto.randomBytes(5).toString('hex')}`;
+  const adminPass = `SessAdmin@${crypto.randomBytes(5).toString('hex')}`;
+
+  try {
+    await sharedStore.saveCredentials({
+      makerUsername: 'user-pscrappers',
+      makerPasswordHash: hashPassword(makerPass),
+      mainAdminPasswordHash: hashPassword(adminPass),
+      protectedPasswordHash: hashPassword(adminPass),
+      deletePasswordHash: hashPassword(adminPass),
+      sessionVersion: 2,
+      bootstrappedAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    });
+
+    // 1. Unauthenticated request to /api/certificates/next-numbers & POST /api/certificates fails (401 + SESSION_COOKIE_MISSING)
+    const unauthNext = await fetch(`${originA}/api/certificates/next-numbers`, {
+      headers: { 'X-Requested-With': 'XMLHttpRequest' },
+    });
+    assert.equal(unauthNext.status, 401);
+    const unauthNextJson = (await unauthNext.json()) as { code?: string };
+    assert.equal(unauthNextJson.code, 'SESSION_COOKIE_MISSING');
+
+    const unauthCreate = await fetch(`${originA}/api/certificates`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'XMLHttpRequest' },
+      body: JSON.stringify({ ownerName: 'Unauthorized' }),
+    });
+    assert.equal(unauthCreate.status, 401);
+
+    // 2. Maker logs in on Instance A -> receives HttpOnly Secure SameSite=None Partitioned Path=/ cookie
+    const loginRes = await fetch(`${originA}/api/auth/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'XMLHttpRequest' },
+      body: JSON.stringify({ username: 'user-pscrappers', password: makerPass }),
+    });
+    assert.equal(loginRes.status, 200);
+    const setCookie = loginRes.headers.get('set-cookie') || '';
+    assert.ok(setCookie.includes('ps_session='), 'Expected ps_session cookie');
+    assert.ok(setCookie.includes('HttpOnly'), 'Expected HttpOnly attribute');
+    assert.ok(setCookie.includes('Secure'), 'Expected Secure attribute');
+    assert.ok(setCookie.includes('SameSite=None'), 'Expected SameSite=None attribute');
+    assert.ok(setCookie.includes('Path=/'), 'Expected Path=/ attribute');
+    const cookiePair = setCookie.split(';')[0];
+    const loginJson = (await loginRes.json()) as { token: string; session: { sid?: string; username: string } };
+    assert.ok(loginJson.session.sid, 'Server-side session ID (sid) must be issued');
+
+    // 3. Using ONLY Cookie (NO Authorization header!) on Instance B -> session remains valid!
+    const statusB = await fetch(`${originB}/api/auth/status`, {
+      headers: { Cookie: cookiePair, 'X-Requested-With': 'XMLHttpRequest' },
+    });
+    assert.equal(statusB.status, 200);
+    const statusBJson = (await statusB.json()) as { session: { username: string; role: string } | null };
+    assert.equal(statusBJson.session?.username, 'user-pscrappers');
+    assert.equal(statusBJson.session?.role, 'maker');
+
+    // 4. Refreshing GET /api/certificates/next-numbers 3 times on Instance B succeeds and reserves ZERO numbers!
+    const reservedBefore = await sharedStore.getReservedCounts();
+    assert.equal(reservedBefore.certCount, 0);
+    let lastCandidate: { certificateNumber: string; scrappingRegNumber: string } | null = null;
+    for (let i = 0; i < 3; i++) {
+      const nextRes = await fetch(`${originB}/api/certificates/next-numbers?issueDate=2026-11-27`, {
+        headers: { Cookie: cookiePair, 'X-Requested-With': 'XMLHttpRequest' },
+      });
+      assert.equal(nextRes.status, 200);
+      lastCandidate = (await nextRes.json()) as { certificateNumber: string; scrappingRegNumber: string };
+      assert.match(lastCandidate.certificateNumber, /^PS\/26\/R\d{7}$/);
+      assert.match(lastCandidate.scrappingRegNumber, /^REG-C\d{6}$/);
+    }
+    const reservedAfterRefresh = await sharedStore.getReservedCounts();
+    assert.equal(reservedAfterRefresh.certCount, 0, 'Refreshing next-numbers must NOT create reservations');
+    assert.equal(reservedAfterRefresh.regCount, 0, 'Refreshing next-numbers must NOT create reg reservations');
+
+    // 5. Generate certificate on Instance B using ONLY Cookie + displayed candidate number
+    const idempKey = `sess_idemp_${crypto.randomBytes(6).toString('hex')}`;
+    const createRes = await fetch(`${originB}/api/certificates`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Requested-With': 'XMLHttpRequest',
+        'Idempotency-Key': idempKey,
+        Cookie: cookiePair,
+      },
+      body: JSON.stringify({
+        certificateNumber: lastCandidate!.certificateNumber,
+        scrappingRegNumber: lastCandidate!.scrappingRegNumber,
+        issueDate: '2026-11-27',
+        handoverDate: '2026-11-26',
+        ownerName: 'Session Test Owner',
+        ownerAddress: 'Dwarka, New Delhi',
+        vehicleRegNumber: 'DL01AB7788',
+        make: 'Honda',
+        model: 'Activa 6G',
+        manufactureYear: 2014,
+        chassisNumber: 'ME4JF505AG7123456',
+        engineNumber: 'JF50E7123456',
+        unhideChassisEngine: false,
+        remarks: 'Verified session issuance test',
+      }),
+    });
+    assert.equal(createRes.status, 201);
+    const createdJson = (await createRes.json()) as {
+      certificate: { id: string; certificateNumber: string; scrappingRegNumber: string };
+      idempotentReplay: boolean;
+    };
+    assert.equal(createdJson.idempotentReplay, false);
+    assert.equal(
+      createdJson.certificate.certificateNumber,
+      lastCandidate!.certificateNumber,
+      'Issued certificate number must match displayed Next Available Number'
+    );
+    assert.equal(
+      createdJson.certificate.scrappingRegNumber,
+      lastCandidate!.scrappingRegNumber,
+      'Issued scrapping reg number must match displayed Next Available Number'
+    );
+
+    // 6. Duplicate submission with same Idempotency-Key replays cleanly without creating a second certificate
+    const dupRes = await fetch(`${originB}/api/certificates`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Requested-With': 'XMLHttpRequest',
+        'Idempotency-Key': idempKey,
+        Cookie: cookiePair,
+      },
+      body: JSON.stringify({
+        certificateNumber: lastCandidate!.certificateNumber,
+        scrappingRegNumber: lastCandidate!.scrappingRegNumber,
+        issueDate: '2026-11-27',
+        handoverDate: '2026-11-26',
+        ownerName: 'Session Test Owner',
+        vehicleRegNumber: 'DL01AB7788',
+        make: 'Honda',
+        model: 'Activa 6G',
+        manufactureYear: 2014,
+        chassisNumber: 'ME4JF505AG7123456',
+        engineNumber: 'JF50E7123456',
+      }),
+    });
+    assert.equal(dupRes.status, 200);
+    const dupJson = (await dupRes.json()) as {
+      certificate: { id: string };
+      idempotentReplay: boolean;
+    };
+    assert.equal(dupJson.idempotentReplay, true);
+    assert.equal(dupJson.certificate.id, createdJson.certificate.id);
+    assert.equal((await sharedStore.getAllCertificates()).length, 1, 'Duplicate submission must not create 2nd cert');
+
+    // 7. PDF generation succeeds and filename strictly matches certificate number
+    const pdfOut = await buildCertificatePdfDoc(createdJson.certificate as never, {
+      customDomain: 'https://parivahan.example.test',
+    });
+    const expectedFileName = getCertificatePdfFilename(createdJson.certificate.certificateNumber);
+    assert.equal(pdfOut.fileName, expectedFileName, 'PDF filename must match certificate number');
+    const pdfBytes = Buffer.from(pdfOut.doc.output('arraybuffer'));
+    assert.ok(pdfBytes.subarray(0, 5).toString('utf8') === '%PDF-');
+    assert.ok(pdfBytes.length > 10_000);
+
+    // 8. Authenticated PDF failure diagnostic endpoint logs PDF_GENERATION_FAILURE cleanly
+    const pdfDiag = await fetch(`${originB}/api/diagnostics/pdf-failure`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Requested-With': 'XMLHttpRequest',
+        Cookie: cookiePair,
+      },
+      body: JSON.stringify({ certificateId: createdJson.certificate.id, reason: 'simulated_test_error' }),
+    });
+    assert.equal(pdfDiag.status, 200);
+
+    // 9. Logout on Instance A revokes server-side session -> BOTH Cookie AND Bearer token rejected on Instance B!
+    const logoutRes = await fetch(`${originA}/api/auth/logout`, {
+      method: 'POST',
+      headers: { 'X-Requested-With': 'XMLHttpRequest', Cookie: cookiePair },
+    });
+    assert.equal(logoutRes.status, 200);
+
+    const cookieAfterLogout = await fetch(`${originB}/api/certificates/next-numbers`, {
+      headers: { Cookie: cookiePair, 'X-Requested-With': 'XMLHttpRequest' },
+    });
+    assert.equal(cookieAfterLogout.status, 401, 'Logged-out session cookie must be rejected across instances');
+
+    const bearerAfterLogout = await fetch(`${originB}/api/certificates/next-numbers`, {
+      headers: { Authorization: `Bearer ${loginJson.token}`, 'X-Requested-With': 'XMLHttpRequest' },
+    });
+    assert.equal(bearerAfterLogout.status, 401, 'Logged-out Bearer token must be rejected across instances');
+
+    // 10. Verify secret-free diagnostics captured expected codes without leaking cookies, tokens, or passwords
+    const joined = capturedLogs.join('\n');
+    assert.ok(joined.includes('SESSION_COOKIE_MISSING'), 'Expected SESSION_COOKIE_MISSING diagnostic');
+    assert.ok(joined.includes('SESSION_VALIDATION_FAILED'), 'Expected SESSION_VALIDATION_FAILED diagnostic');
+    assert.ok(joined.includes('PDF_GENERATION_FAILURE'), 'Expected PDF_GENERATION_FAILURE diagnostic');
+    assert.equal(joined.includes(loginJson.token), false, 'Logs must never expose session token');
+    assert.equal(joined.includes(cookiePair), false, 'Logs must never expose session cookie');
+    assert.equal(joined.includes(makerPass), false, 'Logs must never expose Maker password');
+  } finally {
+    console.warn = origWarn;
+    await new Promise<void>((resolve) => serverA.close(() => resolve()));
+    await new Promise<void>((resolve) => serverB.close(() => resolve()));
+    for (const [k, v] of Object.entries(savedEnv)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
     resetStoreForTesting();
   }
 }

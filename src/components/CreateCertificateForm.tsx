@@ -30,6 +30,7 @@ import {
 interface CreateCertificateFormProps {
   onCertificateCreated: (cert: CertificateRecord) => void;
   onPreviewCertificate: (cert: CertificateRecord) => void;
+  onSessionExpired?: () => void;
   pdfBranding?: PdfBrandingOptions;
 }
 
@@ -76,6 +77,7 @@ function createIdempotencyKey(): string {
 export const CreateCertificateForm: React.FC<CreateCertificateFormProps> = ({
   onCertificateCreated,
   onPreviewCertificate,
+  onSessionExpired,
   pdfBranding,
 }) => {
   const [form, setForm] = useState<CreateCertificateInput>(createInitialForm);
@@ -83,6 +85,8 @@ export const CreateCertificateForm: React.FC<CreateCertificateFormProps> = ({
   const [customMake, setCustomMake] = useState<string>('');
   const [candidates, setCandidates] = useState<CandidateNumbers | null>(null);
   const [loadingCandidates, setLoadingCandidates] = useState(false);
+  const [candidateError, setCandidateError] = useState<string | null>(null);
+  const [sessionExpired, setSessionExpired] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [lastIssued, setLastIssued] = useState<{
@@ -92,6 +96,7 @@ export const CreateCertificateForm: React.FC<CreateCertificateFormProps> = ({
     pdfFileName?: string;
     pdfBlobUrl?: string;
     popupBlocked?: boolean;
+    pdfFailed?: boolean;
   } | null>(null);
 
   // Persistent idempotency key for the active form submission so retries/double-clicks never duplicate
@@ -109,11 +114,22 @@ export const CreateCertificateForm: React.FC<CreateCertificateFormProps> = ({
 
   const loadCandidates = useCallback(async (issueDate?: string) => {
     setLoadingCandidates(true);
+    setCandidateError(null);
     try {
       const next = await api.getCandidateNumbers(issueDate);
       setCandidates(next);
-    } catch {
-      // Non-fatal; backend will generate guaranteed unique numbers at issuance time
+      setSessionExpired(false);
+    } catch (err) {
+      if (err instanceof ApiError && err.status === 401) {
+        setSessionExpired(true);
+        setCandidateError('Session expired. Please sign in again.');
+      } else {
+        setCandidateError(
+          err instanceof ApiError
+            ? err.message
+            : 'Unable to load next available numbers. Click Retry.'
+        );
+      }
     } finally {
       setLoadingCandidates(false);
     }
@@ -166,7 +182,12 @@ export const CreateCertificateForm: React.FC<CreateCertificateFormProps> = ({
       onCertificateCreated(result.certificate);
 
       // Automatically generate, open in a new tab, and download the official PDF
-      let pdfMeta: { pdfFileName?: string; pdfBlobUrl?: string; popupBlocked?: boolean } = {};
+      let pdfMeta: {
+        pdfFileName?: string;
+        pdfBlobUrl?: string;
+        popupBlocked?: boolean;
+        pdfFailed?: boolean;
+      } = {};
       try {
         if (lastBlobUrlRef.current) {
           URL.revokeObjectURL(lastBlobUrlRef.current);
@@ -178,9 +199,12 @@ export const CreateCertificateForm: React.FC<CreateCertificateFormProps> = ({
           pdfFileName: generated.fileName,
           pdfBlobUrl: generated.blobUrl,
           popupBlocked: !generated.openedInNewTab,
+          pdfFailed: false,
         };
-      } catch {
-        pdfMeta = { popupBlocked: true };
+      } catch (pdfErr) {
+        const reason = pdfErr instanceof Error ? pdfErr.message : 'pdf_generation_failed';
+        void api.reportPdfFailure(result.certificate.id, reason).catch(() => undefined);
+        pdfMeta = { popupBlocked: true, pdfFailed: true };
       }
 
       setLastIssued({
@@ -196,11 +220,16 @@ export const CreateCertificateForm: React.FC<CreateCertificateFormProps> = ({
       setCustomMake('');
       void loadCandidates(resetForm.issueDate);
     } catch (err) {
-      setError(
-        err instanceof ApiError
-          ? err.message
-          : 'Certificate issuance failed. Retrying will safely reuse the same idempotency key.'
-      );
+      if (err instanceof ApiError && err.status === 401) {
+        setSessionExpired(true);
+        setError('Your session has expired or is no longer valid. Please sign in again to issue certificates.');
+      } else {
+        setError(
+          err instanceof ApiError
+            ? err.message
+            : 'Certificate issuance failed. Retrying will safely reuse the same idempotency key.'
+        );
+      }
     } finally {
       inFlightRef.current = false;
       setSubmitting(false);
@@ -226,26 +255,45 @@ export const CreateCertificateForm: React.FC<CreateCertificateFormProps> = ({
           <div className="text-xs">
             <div className="text-slate-500">Next Available Numbers</div>
             <div className="font-mono font-semibold text-[#0B1F3A] mt-0.5 tabular-nums">
-              {candidates ? (
+              {loadingCandidates && !candidates ? (
+                <span>Generating...</span>
+              ) : candidateError && !candidates ? (
+                <span className="font-sans font-medium text-red-700">{candidateError}</span>
+              ) : candidates ? (
                 <>
                   <span>{candidates.certificateNumber}</span>
                   <span className="mx-2 text-slate-300">/</span>
                   <span className="text-[#059669]">{candidates.scrappingRegNumber}</span>
                 </>
               ) : (
-                'Generating...'
+                <span className="font-sans font-medium text-amber-800">Numbers unavailable</span>
               )}
             </div>
+            {candidateError && candidates && (
+              <p className="text-[11px] font-sans text-red-700 mt-0.5">{candidateError}</p>
+            )}
           </div>
-          <button
-            type="button"
-            onClick={() => void loadCandidates(form.issueDate)}
-            disabled={loadingCandidates || submitting}
-            title="Generate new available random candidates without consuming them"
-            className="p-2 rounded-md border border-slate-300 bg-white hover:bg-slate-100 text-slate-700 transition-colors disabled:opacity-50 cursor-pointer"
-          >
-            <RefreshCw className={`w-4 h-4 ${loadingCandidates ? 'animate-spin' : ''}`} />
-          </button>
+          {candidateError ? (
+            <button
+              type="button"
+              onClick={() => void loadCandidates(form.issueDate)}
+              disabled={loadingCandidates || submitting}
+              className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-md border border-red-300 bg-white hover:bg-red-50 text-xs font-semibold text-red-700 transition-colors disabled:opacity-50 cursor-pointer whitespace-nowrap"
+            >
+              <RefreshCw className={`w-3.5 h-3.5 ${loadingCandidates ? 'animate-spin' : ''}`} />
+              Retry
+            </button>
+          ) : (
+            <button
+              type="button"
+              onClick={() => void loadCandidates(form.issueDate)}
+              disabled={loadingCandidates || submitting}
+              title="Generate new available random candidates without consuming them"
+              className="p-2 rounded-md border border-slate-300 bg-white hover:bg-slate-100 text-slate-700 transition-colors disabled:opacity-50 cursor-pointer"
+            >
+              <RefreshCw className={`w-4 h-4 ${loadingCandidates ? 'animate-spin' : ''}`} />
+            </button>
+          )}
         </div>
       </div>
 
@@ -256,19 +304,26 @@ export const CreateCertificateForm: React.FC<CreateCertificateFormProps> = ({
             <CheckCircle2 className="w-5 h-5 text-[#059669] shrink-0 mt-0.5" />
             <div className="text-sm">
               <p className="font-semibold text-emerald-950">
-                Certificate Issued &amp; PDF Generated ({lastIssued.pdfFileName ?? 'Official PDF'})
+                {lastIssued.pdfFailed
+                  ? 'Certificate Saved — Click Download PDF to Retry PDF Export'
+                  : `Certificate Issued & PDF Generated (${lastIssued.pdfFileName ?? 'Official PDF'})`}
               </p>
               <p className="text-emerald-900 mt-0.5 font-mono text-xs tabular-nums">
                 {lastIssued.certificate.certificateNumber} · {lastIssued.certificate.scrappingRegNumber} ·{' '}
                 {lastIssued.certificate.ownerName} ({lastIssued.certificate.vehicleRegNumber}) · Committed in{' '}
                 {lastIssued.persistenceMs}ms
               </p>
-              {lastIssued.popupBlocked && (
+              {lastIssued.pdfFailed ? (
+                <p className="text-xs text-amber-800 mt-1">
+                  The certificate is safely stored in Firestore, but automatic PDF export encountered an error. Use{' '}
+                  <strong>Download PDF</strong> or <strong>Preview &amp; QR</strong> below.
+                </p>
+              ) : lastIssued.popupBlocked ? (
                 <p className="text-xs text-amber-800 mt-1">
                   Your browser blocked automatic new-tab opening. Use <strong>Open PDF</strong> or{' '}
                   <strong>Download PDF</strong> below.
                 </p>
-              )}
+              ) : null}
             </div>
           </div>
           <div className="flex flex-wrap items-center gap-2 shrink-0">
@@ -303,13 +358,27 @@ export const CreateCertificateForm: React.FC<CreateCertificateFormProps> = ({
         </div>
       )}
 
-      {error && (
+      {(error || sessionExpired) && (
         <div
           role="alert"
-          className="mt-6 p-4 rounded-lg bg-red-50 border border-red-200 text-red-800 text-sm flex items-start gap-2.5"
+          className="mt-6 p-4 rounded-lg bg-red-50 border border-red-200 text-red-800 text-sm flex flex-col sm:flex-row sm:items-center justify-between gap-3"
         >
-          <AlertCircle className="w-4 h-4 shrink-0 mt-0.5 text-red-600" />
-          <span>{error}</span>
+          <div className="flex items-start gap-2.5">
+            <AlertCircle className="w-4 h-4 shrink-0 mt-0.5 text-red-600" />
+            <span>
+              {error ??
+                'Your Maker session has expired or is invalid. Please sign in again to continue.'}
+            </span>
+          </div>
+          {sessionExpired && onSessionExpired && (
+            <button
+              type="button"
+              onClick={onSessionExpired}
+              className="inline-flex items-center justify-center px-3.5 py-1.5 rounded-lg bg-red-700 hover:bg-red-800 text-white text-xs font-semibold transition-colors cursor-pointer whitespace-nowrap shrink-0"
+            >
+              Sign In Again
+            </button>
+          )}
         </div>
       )}
 

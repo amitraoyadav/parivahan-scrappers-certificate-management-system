@@ -23,15 +23,19 @@ export function setMemoryToken(token: string | null): void {
 
 export class ApiError extends Error {
   status: number;
-  constructor(message: string, status: number) {
+  code?: string;
+  constructor(message: string, status: number, code?: string) {
     super(message);
     this.status = status;
+    this.code = code;
   }
 }
 
+const DEFAULT_API_TIMEOUT_MS = 20_000;
+
 async function apiRequest<T>(
   path: string,
-  options: RequestInit & { idempotencyKey?: string } = {}
+  options: RequestInit & { idempotencyKey?: string; timeoutMs?: number } = {}
 ): Promise<T> {
   const headers = new Headers(options.headers);
   headers.set('X-Requested-With', 'XMLHttpRequest');
@@ -45,11 +49,26 @@ async function apiRequest<T>(
     headers.set('Idempotency-Key', options.idempotencyKey);
   }
 
-  const res = await fetch(path, {
-    ...options,
-    credentials: 'include',
-    headers,
-  });
+  const controller = new AbortController();
+  const timeoutMs = options.timeoutMs ?? DEFAULT_API_TIMEOUT_MS;
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+  let res: Response;
+  try {
+    res = await fetch(path, {
+      ...options,
+      signal: options.signal ?? controller.signal,
+      credentials: 'include',
+      headers,
+    });
+  } catch (err) {
+    if (err instanceof Error && err.name === 'AbortError') {
+      throw new ApiError('Request timed out while contacting the server. Please retry.', 408, 'REQUEST_TIMEOUT');
+    }
+    throw new ApiError('Network error while contacting the server. Please check your connection and retry.', 0, 'NETWORK_ERROR');
+  } finally {
+    clearTimeout(timer);
+  }
 
   const text = await res.text();
   let parsed: Record<string, unknown> = {};
@@ -66,7 +85,8 @@ async function apiRequest<T>(
       typeof parsed.error === 'string'
         ? parsed.error
         : `Request failed with status ${res.status}`;
-    throw new ApiError(msg, res.status);
+    const code = typeof parsed.code === 'string' ? parsed.code : undefined;
+    throw new ApiError(msg, res.status, code);
   }
 
   return parsed as T;
@@ -132,7 +152,14 @@ export const api = {
   // Maker & Issuance
   getCandidateNumbers(issueDate?: string): Promise<CandidateNumbers> {
     const qs = issueDate ? `?issueDate=${encodeURIComponent(issueDate)}` : '';
-    return apiRequest<CandidateNumbers>(`/api/certificates/candidate-numbers${qs}`);
+    return apiRequest<CandidateNumbers>(`/api/certificates/next-numbers${qs}`);
+  },
+
+  reportPdfFailure(certificateId: string, reason: string): Promise<{ logged: boolean }> {
+    return apiRequest('/api/diagnostics/pdf-failure', {
+      method: 'POST',
+      body: JSON.stringify({ certificateId, reason }),
+    });
   },
 
   getRecentCertificates(): Promise<{ certificates: CertificateRecord[]; maxAllowed: number }> {

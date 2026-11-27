@@ -272,6 +272,7 @@ export interface AuthStatusResponse {
 }
 
 export interface SessionInfo {
+  sid?: string;
   username: string;
   role: UserRole;
   issuedAt: number;

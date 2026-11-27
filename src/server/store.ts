@@ -8,6 +8,7 @@ import type {
   DriveSyncLog,
   SystemErrorLog,
   SystemSettings,
+  UserRole,
 } from '../shared/types.js';
 import { computeSha256, generateRecordId } from './crypto.js';
 
@@ -20,6 +21,17 @@ export interface StoredCredentials {
   sessionVersion: number;
   bootstrappedAt: string;
   updatedAt: string;
+}
+
+export interface StoredSession {
+  id: string;
+  username: string;
+  role: UserRole;
+  sessionVersion: number;
+  issuedAt: number;
+  expiresAt: number;
+  revoked: boolean;
+  revokedAt?: string;
 }
 
 export interface IdempotencyRecord {
@@ -58,10 +70,13 @@ export interface RegistryStore {
   // Connectivity probe
   ping(): Promise<{ ok: boolean; latencyMs: number; message: string }>;
 
-  // Credentials & Settings
+  // Credentials, Sessions & Settings
   getCredentials(): Promise<StoredCredentials | null>;
   saveCredentials(creds: StoredCredentials): Promise<void>;
   createCredentialsIfAbsent(creds: StoredCredentials): Promise<boolean>;
+  createSession(session: StoredSession): Promise<void>;
+  getSession(sessionId: string): Promise<StoredSession | null>;
+  revokeSession(sessionId: string): Promise<void>;
   getSettings(): Promise<SystemSettings>;
   saveSettings(settings: SystemSettings): Promise<void>;
 
@@ -121,6 +136,7 @@ class StagingMemoryStore implements RegistryStore {
   readonly databaseId = null;
 
   private credentials: StoredCredentials | null = null;
+  private sessions = new Map<string, StoredSession>();
   private settings: SystemSettings = { ...DEFAULT_SETTINGS };
   private certificates = new Map<string, CertificateRecord>();
   private reservedCertNumbers = new Map<string, { certificateNumber: string; reservedAt: string; certificateId: string }>();
@@ -162,6 +178,26 @@ class StagingMemoryStore implements RegistryStore {
       this.credentials = { ...creds };
       return true;
     });
+  }
+
+  async createSession(session: StoredSession): Promise<void> {
+    this.sessions.set(session.id, { ...session });
+  }
+
+  async getSession(sessionId: string): Promise<StoredSession | null> {
+    const found = this.sessions.get(sessionId);
+    return found ? { ...found } : null;
+  }
+
+  async revokeSession(sessionId: string): Promise<void> {
+    const existing = this.sessions.get(sessionId);
+    if (existing) {
+      this.sessions.set(sessionId, {
+        ...existing,
+        revoked: true,
+        revokedAt: new Date().toISOString(),
+      });
+    }
   }
 
   async getSettings(): Promise<SystemSettings> {
@@ -872,6 +908,24 @@ export class FirestoreRestStore implements RegistryStore {
     throw new Error(`Firestore atomic createCredentialsIfAbsent failed (${res.status}): ${text}`);
   }
 
+  async createSession(session: StoredSession): Promise<void> {
+    await this.setDoc('auth_sessions', encodeDocKey(session.id), session);
+  }
+
+  async getSession(sessionId: string): Promise<StoredSession | null> {
+    return this.getDoc<StoredSession>('auth_sessions', encodeDocKey(sessionId));
+  }
+
+  async revokeSession(sessionId: string): Promise<void> {
+    const existing = await this.getSession(sessionId);
+    if (!existing) return;
+    await this.setDoc('auth_sessions', encodeDocKey(sessionId), {
+      ...existing,
+      revoked: true,
+      revokedAt: new Date().toISOString(),
+    });
+  }
+
   async getSettings(): Promise<SystemSettings> {
     const existing = await this.getDoc<SystemSettings>('settings', 'global');
     const merged = existing ? { ...DEFAULT_SETTINGS, ...existing } : { ...DEFAULT_SETTINGS };
@@ -1318,6 +1372,9 @@ class UnconfiguredProductionStore implements RegistryStore {
   async getCredentials() { return null; }
   async saveCredentials() { this.fail(); }
   async createCredentialsIfAbsent(): Promise<boolean> { this.fail(); }
+  async createSession() { this.fail(); }
+  async getSession() { return null; }
+  async revokeSession() { /* no-op while unconfigured */ }
   async getSettings() {
     return {
       ...DEFAULT_SETTINGS,
