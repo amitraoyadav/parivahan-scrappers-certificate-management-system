@@ -46,7 +46,6 @@ export const ProtectedActionModal: React.FC<ProtectedActionModalProps> = ({
   const [unhideChassisEngine, setUnhideChassisEngine] = useState(
     certificate?.unhideChassisEngine === true
   );
-  const [rtoAuthority, setRtoAuthority] = useState(certificate?.rtoAuthority ?? '');
   const [remarks, setRemarks] = useState(certificate?.remarks ?? '');
 
   if (!certificate || !mode) return null;
@@ -77,7 +76,6 @@ export const ProtectedActionModal: React.FC<ProtectedActionModalProps> = ({
           chassisNumber,
           engineNumber,
           unhideChassisEngine,
-          rtoAuthority,
           remarks,
         };
         await api.editCertificateProtected(certificate.id, {
@@ -267,16 +265,6 @@ export const ProtectedActionModal: React.FC<ProtectedActionModalProps> = ({
                   />
                   <span>Unhide full Chassis &amp; Engine Number on Certificate &amp; PDF</span>
                 </label>
-              </div>
-              <div className="sm:col-span-2">
-                <label className="block text-xs font-medium text-slate-700 mb-1">RTO Authority</label>
-                <input
-                  type="text"
-                  required
-                  value={rtoAuthority}
-                  onChange={(e) => setRtoAuthority(e.target.value)}
-                  className="w-full px-3 py-2 rounded-lg border border-slate-300 text-sm"
-                />
               </div>
               <div className="sm:col-span-2">
                 <label className="block text-xs font-medium text-slate-700 mb-1">Remarks</label>

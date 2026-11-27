@@ -3,6 +3,7 @@ import {
   AlertCircle,
   CheckCircle2,
   Download,
+  ExternalLink,
   Eye,
   EyeOff,
   FilePlus2,
@@ -20,7 +21,11 @@ import {
   formatChassisOrEngine,
 } from '../shared/vehicleData';
 import { api, ApiError } from '../lib/api';
-import { downloadCertificatePdf, type PdfBrandingOptions } from '../lib/pdfGenerator';
+import {
+  downloadCertificatePdf,
+  openAndDownloadCertificatePdf,
+  type PdfBrandingOptions,
+} from '../lib/pdfGenerator';
 
 interface CreateCertificateFormProps {
   onCertificateCreated: (cert: CertificateRecord) => void;
@@ -57,7 +62,6 @@ function createInitialForm(): CreateCertificateInput {
     chassisNumber: '',
     engineNumber: '',
     unhideChassisEngine: false,
-    rtoAuthority: '',
     remarks: '',
   };
 }
@@ -85,11 +89,23 @@ export const CreateCertificateForm: React.FC<CreateCertificateFormProps> = ({
     certificate: CertificateRecord;
     persistenceMs: number;
     idempotentReplay: boolean;
+    pdfFileName?: string;
+    pdfBlobUrl?: string;
+    popupBlocked?: boolean;
   } | null>(null);
 
   // Persistent idempotency key for the active form submission so retries/double-clicks never duplicate
   const idempotencyKeyRef = useRef<string>(createIdempotencyKey());
   const inFlightRef = useRef<boolean>(false);
+  const lastBlobUrlRef = useRef<string | null>(null);
+
+  useEffect(() => {
+    return () => {
+      if (lastBlobUrlRef.current) {
+        URL.revokeObjectURL(lastBlobUrlRef.current);
+      }
+    };
+  }, []);
 
   const loadCandidates = useCallback(async (issueDate?: string) => {
     setLoadingCandidates(true);
@@ -147,8 +163,30 @@ export const CreateCertificateForm: React.FC<CreateCertificateFormProps> = ({
       );
 
       // Authoritative persistence confirmed!
-      setLastIssued(result);
       onCertificateCreated(result.certificate);
+
+      // Automatically generate, open in a new tab, and download the official PDF
+      let pdfMeta: { pdfFileName?: string; pdfBlobUrl?: string; popupBlocked?: boolean } = {};
+      try {
+        if (lastBlobUrlRef.current) {
+          URL.revokeObjectURL(lastBlobUrlRef.current);
+          lastBlobUrlRef.current = null;
+        }
+        const generated = await openAndDownloadCertificatePdf(result.certificate, pdfBranding);
+        lastBlobUrlRef.current = generated.blobUrl;
+        pdfMeta = {
+          pdfFileName: generated.fileName,
+          pdfBlobUrl: generated.blobUrl,
+          popupBlocked: !generated.openedInNewTab,
+        };
+      } catch {
+        pdfMeta = { popupBlocked: true };
+      }
+
+      setLastIssued({
+        ...result,
+        ...pdfMeta,
+      });
 
       // Rotate idempotency key ONLY after confirmed persistence
       idempotencyKeyRef.current = createIdempotencyKey();
@@ -211,31 +249,40 @@ export const CreateCertificateForm: React.FC<CreateCertificateFormProps> = ({
         </div>
       </div>
 
-      {/* Confirmed Issuance Banner */}
+      {/* Confirmed Issuance Banner with Automatic PDF Status & Fallbacks */}
       {lastIssued && (
         <div className="mt-6 p-4 rounded-lg bg-emerald-50 border border-emerald-200 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
           <div className="flex items-start gap-3">
             <CheckCircle2 className="w-5 h-5 text-[#059669] shrink-0 mt-0.5" />
             <div className="text-sm">
               <p className="font-semibold text-emerald-950">
-                Certificate Issued & Committed Successfully
+                Certificate Issued &amp; PDF Generated ({lastIssued.pdfFileName ?? 'Official PDF'})
               </p>
               <p className="text-emerald-900 mt-0.5 font-mono text-xs tabular-nums">
                 {lastIssued.certificate.certificateNumber} · {lastIssued.certificate.scrappingRegNumber} ·{' '}
                 {lastIssued.certificate.ownerName} ({lastIssued.certificate.vehicleRegNumber}) · Committed in{' '}
                 {lastIssued.persistenceMs}ms
               </p>
+              {lastIssued.popupBlocked && (
+                <p className="text-xs text-amber-800 mt-1">
+                  Your browser blocked automatic new-tab opening. Use <strong>Open PDF</strong> or{' '}
+                  <strong>Download PDF</strong> below.
+                </p>
+              )}
             </div>
           </div>
-          <div className="flex items-center gap-2 shrink-0">
-            <button
-              type="button"
-              onClick={() => onPreviewCertificate(lastIssued.certificate)}
-              className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold bg-white border border-emerald-300 text-emerald-900 hover:bg-emerald-100 transition-colors cursor-pointer whitespace-nowrap"
-            >
-              <Eye className="w-3.5 h-3.5" />
-              Preview & QR
-            </button>
+          <div className="flex flex-wrap items-center gap-2 shrink-0">
+            {lastIssued.pdfBlobUrl && (
+              <a
+                href={lastIssued.pdfBlobUrl}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold bg-[#0B1F3A] hover:bg-[#132f57] text-white transition-colors whitespace-nowrap"
+              >
+                <ExternalLink className="w-3.5 h-3.5" />
+                Open PDF
+              </a>
+            )}
             <button
               type="button"
               onClick={() => void downloadCertificatePdf(lastIssued.certificate, pdfBranding)}
@@ -243,6 +290,14 @@ export const CreateCertificateForm: React.FC<CreateCertificateFormProps> = ({
             >
               <Download className="w-3.5 h-3.5" />
               Download PDF
+            </button>
+            <button
+              type="button"
+              onClick={() => onPreviewCertificate(lastIssued.certificate)}
+              className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold bg-white border border-emerald-300 text-emerald-900 hover:bg-emerald-100 transition-colors cursor-pointer whitespace-nowrap"
+            >
+              <Eye className="w-3.5 h-3.5" />
+              Preview &amp; QR
             </button>
           </div>
         </div>
@@ -264,7 +319,7 @@ export const CreateCertificateForm: React.FC<CreateCertificateFormProps> = ({
           <h3 className="text-sm font-bold text-[#0B1F3A] mb-4">
             01. Certificate Issuance Dates
           </h3>
-          <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
             <div>
               <label className="block text-xs font-medium text-slate-700 mb-1.5">
                 Issue Date <span className="text-red-600">*</span>
@@ -287,19 +342,6 @@ export const CreateCertificateForm: React.FC<CreateCertificateFormProps> = ({
                 value={form.handoverDate}
                 onChange={(e) => updateField('handoverDate', e.target.value)}
                 className="w-full px-3 py-2 rounded-lg border border-slate-300 text-sm font-mono focus:outline-none focus:ring-2 focus:ring-[#059669]"
-              />
-            </div>
-            <div>
-              <label className="block text-xs font-medium text-slate-700 mb-1.5">
-                RTO / Registering Authority <span className="text-red-600">*</span>
-              </label>
-              <input
-                type="text"
-                required
-                value={form.rtoAuthority}
-                onChange={(e) => updateField('rtoAuthority', e.target.value)}
-                placeholder="e.g. RTO Gurugram (HR-26)"
-                className="w-full px-3 py-2 rounded-lg border border-slate-300 text-sm focus:outline-none focus:ring-2 focus:ring-[#059669]"
               />
             </div>
           </div>

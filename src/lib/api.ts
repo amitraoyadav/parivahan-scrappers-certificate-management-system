@@ -154,6 +154,32 @@ export const api = {
     });
   },
 
+  editCertificateMaker(
+    id: string,
+    payload: { updates: Partial<CreateCertificateInput>; reason?: string }
+  ): Promise<{ certificate: CertificateRecord }> {
+    return apiRequest(`/api/certificates/${encodeURIComponent(id)}`, {
+      method: 'PUT',
+      body: JSON.stringify(payload),
+    });
+  },
+
+  deleteCertificateMaker(
+    id: string,
+    reason?: string
+  ): Promise<{
+    success: boolean;
+    deletedId: string;
+    certificateNumber: string;
+    deletedAt: string;
+    deletedBy: string;
+  }> {
+    return apiRequest(`/api/certificates/${encodeURIComponent(id)}`, {
+      method: 'DELETE',
+      body: JSON.stringify({ reason }),
+    });
+  },
+
   // Main Core Admin
   getAdminStats(): Promise<DashboardStats> {
     return apiRequest<DashboardStats>('/api/admin/stats');
@@ -279,6 +305,8 @@ export const api = {
     settings: SystemSettings;
     envManagedCredentials: boolean;
     makerPasswordEnvManaged: boolean;
+    makerAuthSource: 'firestore' | 'env_bootstrap_pending' | 'unconfigured';
+    staleMakerEnvIgnored: boolean;
     makerUsername: string;
     driveEnvConfigured: boolean;
     storageMode: 'firestore' | 'staging_memory' | 'firestore_unconfigured';

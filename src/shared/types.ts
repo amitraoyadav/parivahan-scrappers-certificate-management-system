@@ -30,7 +30,7 @@ export interface CertificateVersionSnapshot {
     chassisNumber: string;
     engineNumber: string;
     unhideChassisEngine?: boolean;
-    rtoAuthority: string;
+    rtoAuthority?: string;
     issueDate: string;
     handoverDate: string;
     facilityName: string;
@@ -64,7 +64,7 @@ export interface CertificateRecord {
   chassisNumber: string;
   engineNumber: string;
   unhideChassisEngine: boolean;
-  rtoAuthority: string;
+  rtoAuthority?: string;
 
   // Scrapping Facility Particulars
   facilityName: string;
@@ -112,7 +112,7 @@ export interface CreateCertificateInput {
   chassisNumber: string;
   engineNumber: string;
   unhideChassisEngine?: boolean;
-  rtoAuthority: string;
+  rtoAuthority?: string;
   remarks?: string;
 }
 

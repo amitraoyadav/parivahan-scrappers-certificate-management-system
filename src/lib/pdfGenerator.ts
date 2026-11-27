@@ -860,49 +860,42 @@ export async function buildCertificatePdfDoc(
       value: cert.vehicleRegNumber,
       boldValue: true,
       drawBottomBorder: true,
-      rowHeight: 5.85,
+      rowHeight: 6.75,
     },
     {
       label: 'Chassis No.',
       value: displayChassis,
       boldValue: false,
       drawBottomBorder: true,
-      rowHeight: 5.85,
+      rowHeight: 6.75,
     },
     {
       label: 'Engine No.',
       value: displayEngine,
       boldValue: false,
       drawBottomBorder: false,
-      rowHeight: 5.85,
+      rowHeight: 6.75,
     },
     {
       label: 'Maker (Bike Brand)',
       value: cert.make,
       boldValue: false,
       drawBottomBorder: false,
-      rowHeight: 5.85,
+      rowHeight: 6.75,
     },
     {
       label: 'Model',
       value: cert.model,
       boldValue: false,
-      drawBottomBorder: false,
-      rowHeight: 5.85,
-    },
-    {
-      label: 'Location',
-      value: cert.rtoAuthority,
-      boldValue: false,
       drawBottomBorder: true,
-      rowHeight: 5.85,
+      rowHeight: 6.75,
     },
     {
       label: 'Year of Manufacture',
       value: String(cert.manufactureYear),
       boldValue: false,
       drawBottomBorder: true,
-      rowHeight: 5.85,
+      rowHeight: 6.75,
     },
     {
       label: 'Date of Handover',
@@ -919,7 +912,7 @@ export async function buildCertificatePdfDoc(
 
   let curRowY = vehTableY;
   vehicleRows.forEach((row, idx) => {
-    const baselineY = curRowY + (idx === vehicleRows.length - 1 ? 4.3 : 4.1);
+    const baselineY = curRowY + (idx === vehicleRows.length - 1 ? 4.6 : 4.55);
 
     doc.setFont('helvetica', 'bold');
     doc.setFontSize(8.5);
@@ -1148,14 +1141,54 @@ export async function buildCertificatePdfDoc(
   doc.setTextColor(...COLORS.navy);
   doc.text('Scan QR Code to Verify', contentRight, 287.2, { align: 'right' });
 
-  const safeFileName = `${cert.certificateNumber.replace(/\//g, '_')}_${cert.vehicleRegNumber}.pdf`;
+  const safeFileName = getCertificatePdfFilename(cert.certificateNumber);
   return { doc, fileName: safeFileName, verifyUrl };
+}
+
+export function getCertificatePdfFilename(certificateNumber: string): string {
+  const sanitized = certificateNumber
+    .trim()
+    .replace(/[\\/]+/g, '-')
+    .replace(/[^A-Za-z0-9._-]/g, '-');
+  return `${sanitized}.pdf`;
 }
 
 export async function downloadCertificatePdf(
   cert: CertificateRecord,
   options?: PdfBrandingOptions
-): Promise<void> {
+): Promise<string> {
   const { doc, fileName } = await buildCertificatePdfDoc(cert, options);
   doc.save(fileName);
+  return fileName;
+}
+
+export async function openAndDownloadCertificatePdf(
+  cert: CertificateRecord,
+  options?: PdfBrandingOptions
+): Promise<{ fileName: string; blobUrl: string; openedInNewTab: boolean }> {
+  const { doc, fileName } = await buildCertificatePdfDoc(cert, options);
+  const blob = doc.output('blob');
+  const blobUrl = URL.createObjectURL(blob);
+
+  // Attempt to open in a new browser tab; gracefully report if blocked by popup blocker
+  let openedInNewTab = false;
+  try {
+    const openedWin = window.open(blobUrl, '_blank', 'noopener,noreferrer');
+    if (openedWin && !openedWin.closed) {
+      openedInNewTab = true;
+    }
+  } catch {
+    openedInNewTab = false;
+  }
+
+  // Automatically trigger file download with exact certificate number filename
+  const link = document.createElement('a');
+  link.href = blobUrl;
+  link.download = fileName;
+  link.rel = 'noopener noreferrer';
+  document.body.appendChild(link);
+  link.click();
+  document.body.removeChild(link);
+
+  return { fileName, blobUrl, openedInNewTab };
 }

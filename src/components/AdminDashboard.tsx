@@ -78,7 +78,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
   // Settings, Security & Health
   const [settings, setSettings] = useState<SystemSettings | null>(null);
   const [envManagedCreds, setEnvManagedCreds] = useState(false);
-  const [makerPasswordEnvManaged, setMakerPasswordEnvManaged] = useState(false);
+  const [staleMakerEnvIgnored, setStaleMakerEnvIgnored] = useState(false);
   const [activeMakerUsername, setActiveMakerUsername] = useState('');
   const [driveEnvConfigured, setDriveEnvConfigured] = useState(false);
   const [healthInfo, setHealthInfo] = useState<{
@@ -101,6 +101,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
   // Password Rotation
   const [currentMainPassword, setCurrentMainPassword] = useState('');
   const [newMakerPassword, setNewMakerPassword] = useState('');
+  const [confirmMakerPassword, setConfirmMakerPassword] = useState('');
   const [newMainAdminPassword, setNewMainAdminPassword] = useState('');
   const [newProtectedPassword, setNewProtectedPassword] = useState('');
 
@@ -152,7 +153,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
       ]);
       setSettings(settingsRes.settings);
       setEnvManagedCreds(settingsRes.envManagedCredentials);
-      setMakerPasswordEnvManaged(settingsRes.makerPasswordEnvManaged);
+      setStaleMakerEnvIgnored(settingsRes.staleMakerEnvIgnored);
       setActiveMakerUsername(settingsRes.makerUsername);
       setDriveEnvConfigured(settingsRes.driveEnvConfigured);
       setHealthInfo(healthRes);
@@ -256,6 +257,14 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
   const handleRotatePasswords = async (e: React.FormEvent) => {
     e.preventDefault();
     setBanner(null);
+    if (newMakerPassword && newMakerPassword !== confirmMakerPassword) {
+      setBanner({ type: 'error', text: 'New Maker password and confirmation do not match.' });
+      return;
+    }
+    if (!newMakerPassword && !newMainAdminPassword && !newProtectedPassword) {
+      setBanner({ type: 'error', text: 'Enter at least one new password to rotate.' });
+      return;
+    }
     try {
       const makerOnly =
         Boolean(newMakerPassword) && !newMainAdminPassword && !newProtectedPassword;
@@ -273,6 +282,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
       onSessionUpdated(res.session);
       setCurrentMainPassword('');
       setNewMakerPassword('');
+      setConfirmMakerPassword('');
       setNewMainAdminPassword('');
       setNewProtectedPassword('');
       setBanner({ type: 'success', text: res.message });
@@ -475,7 +485,11 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                         </td>
                         <td className="py-3.5 px-4">
                           <div className="font-medium text-slate-900">{cert.ownerName}</div>
-                          <div className="text-xs text-slate-500">{cert.rtoAuthority}</div>
+                          {cert.ownerAddress && (
+                            <div className="text-xs text-slate-500 truncate max-w-[220px]">
+                              {cert.ownerAddress}
+                            </div>
+                          )}
                         </td>
                         <td className="py-3.5 px-4">
                           <div className="font-mono font-semibold text-slate-900">
@@ -1045,94 +1059,110 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                   </strong>
                 </span>
                 <span>
-                  Maker Password Source:{' '}
-                  <strong className="font-mono text-[#0B1F3A]">
-                    {makerPasswordEnvManaged
-                      ? 'Vercel ADMIN_PASSWORD (overrides Firestore)'
-                      : 'Firestore admins/primary_credentials'}
+                  Maker Auth Source:{' '}
+                  <strong className="font-mono text-[#059669]">
+                    Firestore admins/primary_credentials (Authoritative)
                   </strong>
                 </span>
               </div>
 
-              {envManagedCreds ? (
+              {staleMakerEnvIgnored && (
+                <div className="mb-3 rounded-lg bg-amber-50 border border-amber-200 px-3.5 py-2.5 text-xs text-amber-900">
+                  Note: Legacy <code className="font-mono">ADMIN_PASSWORD</code> or{' '}
+                  <code className="font-mono">ADMIN_USERNAME</code> environment variables were
+                  detected and are automatically ignored because Firestore{' '}
+                  <code className="font-mono">admins/primary_credentials</code> is authoritative for
+                  Maker login.
+                </div>
+              )}
+
+              <form onSubmit={handleRotatePasswords} className="mt-4 space-y-3.5">
                 <p className="text-xs text-slate-600 leading-relaxed">
-                  Authentication passwords are managed via Vercel Environment Variables (
-                  <code className="font-mono">ADMIN_PASSWORD</code>,{' '}
-                  <code className="font-mono">MAIN_ADMIN_PASSWORD</code>,{' '}
-                  <code className="font-mono">ADMIN_PROTECTED_PASSWORD</code>,{' '}
-                  <code className="font-mono">ADMIN_DELETE_PASSWORD</code>). Rotate secrets in
-                  Vercel Project Settings and redeploy to invalidate all active sessions globally.
+                  Rotate the Certificate Maker password directly in Firestore{' '}
+                  <code className="font-mono">admins/primary_credentials</code> using salted scrypt.
+                  Entering only the Maker password updates ONLY the Maker hash while keeping the
+                  username (<strong className="font-mono">{activeMakerUsername || 'pscrappers'}</strong>)
+                  and Main Core Admin credentials untouched.
                 </p>
-              ) : (
-                <form onSubmit={handleRotatePasswords} className="mt-4 space-y-3.5">
-                  <p className="text-xs text-slate-600">
-                    Enter only a New Maker Password to rotate the Maker hash alone while keeping
-                    the username and Main Core Admin password completely unchanged. All prior
-                    sessions are invalidated immediately.
-                  </p>
+                <div>
+                  <label className="block text-xs font-medium text-slate-700 mb-1">
+                    Current Main Core Admin Password <span className="text-red-600">*</span>
+                  </label>
+                  <input
+                    type="password"
+                    required
+                    value={currentMainPassword}
+                    onChange={(e) => setCurrentMainPassword(e.target.value)}
+                    className="w-full px-3 py-2 rounded-lg border border-slate-300 text-sm"
+                  />
+                </div>
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                   <div>
                     <label className="block text-xs font-medium text-slate-700 mb-1">
-                      Current Main Core Admin Password <span className="text-red-600">*</span>
+                      New Maker Password
                     </label>
                     <input
                       type="password"
-                      required
-                      value={currentMainPassword}
-                      onChange={(e) => setCurrentMainPassword(e.target.value)}
+                      minLength={8}
+                      value={newMakerPassword}
+                      onChange={(e) => setNewMakerPassword(e.target.value)}
+                      placeholder="Minimum 8 characters"
                       className="w-full px-3 py-2 rounded-lg border border-slate-300 text-sm"
                     />
                   </div>
-                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                  <div>
+                    <label className="block text-xs font-medium text-slate-700 mb-1">
+                      Confirm New Maker Password
+                    </label>
+                    <input
+                      type="password"
+                      minLength={8}
+                      value={confirmMakerPassword}
+                      onChange={(e) => setConfirmMakerPassword(e.target.value)}
+                      placeholder="Re-enter new Maker password"
+                      className="w-full px-3 py-2 rounded-lg border border-slate-300 text-sm"
+                    />
+                  </div>
+                </div>
+                {!envManagedCreds && (
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                     <div>
                       <label className="block text-xs font-medium text-slate-700 mb-1">
-                        New Maker Password
-                      </label>
-                      <input
-                        type="password"
-                        minLength={8}
-                        value={newMakerPassword}
-                        onChange={(e) => setNewMakerPassword(e.target.value)}
-                        placeholder="Leave blank to keep"
-                        className="w-full px-3 py-2 rounded-lg border border-slate-300 text-sm"
-                      />
-                    </div>
-                    <div>
-                      <label className="block text-xs font-medium text-slate-700 mb-1">
-                        New Admin Password
+                        New Admin Password (Optional)
                       </label>
                       <input
                         type="password"
                         minLength={8}
                         value={newMainAdminPassword}
                         onChange={(e) => setNewMainAdminPassword(e.target.value)}
-                        placeholder="Leave blank to keep"
+                        placeholder="Leave blank to keep unchanged"
                         className="w-full px-3 py-2 rounded-lg border border-slate-300 text-sm"
                       />
                     </div>
                     <div>
                       <label className="block text-xs font-medium text-slate-700 mb-1">
-                        New Protected Password
+                        New Protected Password (Optional)
                       </label>
                       <input
                         type="password"
                         minLength={8}
                         value={newProtectedPassword}
                         onChange={(e) => setNewProtectedPassword(e.target.value)}
-                        placeholder="Leave blank to keep"
+                        placeholder="Leave blank to keep unchanged"
                         className="w-full px-3 py-2 rounded-lg border border-slate-300 text-sm"
                       />
                     </div>
                   </div>
-                  <div className="flex justify-end">
-                    <button
-                      type="submit"
-                      className="px-4 py-2 rounded-lg bg-[#059669] hover:bg-[#047857] text-white text-sm font-semibold cursor-pointer"
-                    >
-                      Rotate Passwords & Invalidate Old Sessions
-                    </button>
-                  </div>
-                </form>
-              )}
+                )}
+                <div className="flex justify-end">
+                  <button
+                    type="submit"
+                    className="px-4 py-2 rounded-lg bg-[#059669] hover:bg-[#047857] text-white text-sm font-semibold cursor-pointer"
+                  >
+                    Rotate Password & Invalidate Old Sessions
+                  </button>
+                </div>
+              </form>
             </div>
           </div>
 

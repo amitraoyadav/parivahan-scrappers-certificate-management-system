@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useState } from 'react';
 import {
   AlertCircle,
+  CheckCircle2,
   KeyRound,
   LogOut,
   QrCode,
@@ -14,6 +15,7 @@ import { AdminDashboard } from './components/AdminDashboard';
 import { CertificatePreviewModal } from './components/CertificatePreviewModal';
 import { CreateCertificateForm } from './components/CreateCertificateForm';
 import { LoginView } from './components/LoginView';
+import { MakerEditCertificateModal } from './components/MakerEditCertificateModal';
 import { PublicVerifyView } from './components/PublicVerifyView';
 import { RecentCertificatesPanel } from './components/RecentCertificatesPanel';
 
@@ -41,9 +43,11 @@ export default function App() {
   // Maker workspace state
   const [recentCertificates, setRecentCertificates] = useState<CertificateRecord[]>([]);
   const [loadingRecent, setLoadingRecent] = useState(false);
+  const [makerNotice, setMakerNotice] = useState<string | null>(null);
 
   // Modals
   const [previewCert, setPreviewCert] = useState<CertificateRecord | null>(null);
+  const [editingCert, setEditingCert] = useState<CertificateRecord | null>(null);
   const [showAdminUnlockModal, setShowAdminUnlockModal] = useState(false);
   const [unlockPassword, setUnlockPassword] = useState('');
   const [unlockError, setUnlockError] = useState<string | null>(null);
@@ -107,6 +111,20 @@ export default function App() {
     setSession(null);
     setRecentCertificates([]);
     await loadAuthStatus();
+  };
+
+  const handleMakerDelete = async (cert: CertificateRecord) => {
+    await api.deleteCertificateMaker(cert.id);
+    if (previewCert?.id === cert.id) {
+      setPreviewCert(null);
+    }
+    if (editingCert?.id === cert.id) {
+      setEditingCert(null);
+    }
+    setMakerNotice(
+      `Certificate ${cert.certificateNumber} has been deleted from active records. Its certificate number remains permanently reserved.`
+    );
+    await loadRecentForMaker();
   };
 
   const handleQuickAdminUnlock = async (e: React.FormEvent) => {
@@ -236,14 +254,32 @@ export default function App() {
                   Certificate Maker Workspace
                 </h1>
                 <p className="text-sm text-slate-600 mt-0.5">
-                  Role: Certificate Maker · Authorized for new certificate issuance and latest five
-                  records only.
+                  Role: Certificate Maker · Authorized for new certificate issuance and managing the
+                  latest five records.
                 </p>
               </div>
             </div>
 
+            {makerNotice && (
+              <div className="p-3.5 rounded-lg bg-emerald-50 border border-emerald-200 text-emerald-900 text-sm flex items-center justify-between gap-3">
+                <div className="flex items-center gap-2">
+                  <CheckCircle2 className="w-4 h-4 text-[#059669] shrink-0" />
+                  <span>{makerNotice}</span>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setMakerNotice(null)}
+                  className="p-1 rounded-md text-emerald-700 hover:bg-emerald-100 cursor-pointer"
+                  aria-label="Dismiss notice"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+            )}
+
             <CreateCertificateForm
               onCertificateCreated={() => {
+                setMakerNotice(null);
                 void loadRecentForMaker();
               }}
               onPreviewCertificate={(cert) => setPreviewCert(cert)}
@@ -258,6 +294,8 @@ export default function App() {
               certificates={recentCertificates}
               loading={loadingRecent}
               onPreview={(cert) => setPreviewCert(cert)}
+              onEdit={(cert) => setEditingCert(cert)}
+              onDelete={handleMakerDelete}
               onOpenVerify={(cert) => navigateToVerify(cert.certificateNumber, cert.qrToken)}
               pdfBranding={{
                 customDomain: authStatus.publicDomain,
@@ -293,6 +331,21 @@ export default function App() {
           customDomain: authStatus.publicDomain,
           authorizedSignatory: authStatus.authorizedSignatory,
           signatoryDesignation: authStatus.signatoryDesignation,
+        }}
+      />
+
+      {/* Streamlined Maker Certificate Edit Modal */}
+      <MakerEditCertificateModal
+        key={editingCert?.id ?? 'closed'}
+        certificate={editingCert}
+        onClose={() => setEditingCert(null)}
+        onSaved={(updated) => {
+          setEditingCert(null);
+          setPreviewCert(updated);
+          setMakerNotice(
+            `Certificate ${updated.certificateNumber} updated to v${updated.version}. SHA-256 integrity hash, QR verification token, preview, and PDF have been refreshed.`
+          );
+          void loadRecentForMaker();
         }}
       />
 

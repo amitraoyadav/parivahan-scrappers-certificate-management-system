@@ -331,23 +331,17 @@ export const CertificatePreviewModal: React.FC<CertificatePreviewModalProps> = (
                           </div>
                           <div className="px-3 py-1 text-[#1D293D]">{certificate.make}</div>
                         </div>
-                        <div className="grid grid-cols-[41%_59%] bg-white">
-                          <div className="px-3 py-1 font-bold text-[#1D293D] border-r border-[#B4CBE5]">
+                        <div className="grid grid-cols-[41%_59%] border-b border-[#B4CBE5] bg-white">
+                          <div className="px-3 py-1.5 font-bold text-[#1D293D] border-r border-[#B4CBE5]">
                             Model
                           </div>
-                          <div className="px-3 py-1 text-[#1D293D]">{certificate.model}</div>
+                          <div className="px-3 py-1.5 text-[#1D293D]">{certificate.model}</div>
                         </div>
                         <div className="grid grid-cols-[41%_59%] border-b border-[#B4CBE5] bg-white">
-                          <div className="px-3 py-1 font-bold text-[#1D293D] border-r border-[#B4CBE5]">
-                            Location
-                          </div>
-                          <div className="px-3 py-1 text-[#1D293D]">{certificate.rtoAuthority}</div>
-                        </div>
-                        <div className="grid grid-cols-[41%_59%] border-b border-[#B4CBE5] bg-white">
-                          <div className="px-3 py-1 font-bold text-[#1D293D] border-r border-[#B4CBE5]">
+                          <div className="px-3 py-1.5 font-bold text-[#1D293D] border-r border-[#B4CBE5]">
                             Year of Manufacture
                           </div>
-                          <div className="px-3 py-1 text-[#1D293D]">
+                          <div className="px-3 py-1.5 text-[#1D293D]">
                             {certificate.manufactureYear}
                           </div>
                         </div>

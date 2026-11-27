@@ -23,12 +23,13 @@ import {
   maskSensitiveNumber,
   signSessionToken,
   timingSafeStringEqual,
+  validateScryptHashFormat,
   verifyPassword,
   verifySessionToken,
 } from './crypto.js';
 import { isDriveConfigured, syncCertificateToDriveInBackground } from './driveSync.js';
 import { checkRateLimit, clearAuthFailures, recordAuthFailure } from './rateLimit.js';
-import { getStore, type StoredCredentials } from './store.js';
+import { getStore, type RegistryStore, type StoredCredentials } from './store.js';
 
 const SESSION_COOKIE_NAME = 'ps_session';
 
@@ -81,18 +82,186 @@ function hasAnyEnvPasswordConfigured(): boolean {
   );
 }
 
-function verifyEnvOrHash(plain: string, envValue: string | undefined, storedHash: string | undefined): boolean {
+type AuthDiagnosticCode =
+  | 'INCORRECT_USERNAME'
+  | 'INCORRECT_PASSWORD'
+  | 'MISSING_FIRESTORE_CREDENTIALS'
+  | 'FIREBASE_CONNECTION_FAILURE'
+  | 'INVALID_PASSWORD_HASH_FORMAT'
+  | 'SESSION_CREATION_FAILURE';
+
+function sanitizeDiagnosticDetail(detail: string | undefined): string | undefined {
+  if (!detail) return undefined;
+  // Strip any accidental key/hash-like fragments before logging
+  return detail
+    .replace(/scrypt\$[^\s"'`]+/gi, '[REDACTED_HASH]')
+    .replace(/-----BEGIN [A-Z ]+-----[\s\S]*?-----END [A-Z ]+-----/g, '[REDACTED_KEY]')
+    .slice(0, 220);
+}
+
+function logAuthDiagnostic(params: {
+  role: UserRole;
+  code: AuthDiagnosticCode;
+  source?: 'firestore' | 'env' | 'env_bootstrap' | 'none';
+  ip: string;
+  detail?: string;
+}): void {
+  const payload = {
+    event: 'AUTH_FAILURE',
+    timestamp: new Date().toISOString(),
+    role: params.role,
+    code: params.code,
+    source: params.source ?? 'none',
+    ip: params.ip,
+    ...(params.detail ? { detail: sanitizeDiagnosticDetail(params.detail) } : {}),
+  };
+  console.warn(`[AUTH_DIAGNOSTIC] ${JSON.stringify(payload)}`);
+}
+
+function convertEnvSecretToScryptHash(rawEnv: string, varName: string): { ok: true; hash: string } | { ok: false; detail: string } {
+  const normalized = normalizeEnvCredentialValue(rawEnv);
+  if (!normalized) {
+    return { ok: false, detail: `${varName}_empty` };
+  }
+  if (normalized.startsWith('scrypt$')) {
+    const check = validateScryptHashFormat(normalized);
+    if (!check.valid) {
+      return { ok: false, detail: `${varName}_${check.reason}` };
+    }
+    return { ok: true, hash: normalized };
+  }
+  return { ok: true, hash: hashPassword(normalized) };
+}
+
+type AuthoritativeCredentialsResult =
+  | { ok: true; creds: StoredCredentials | null; bootstrappedFromEnv: boolean }
+  | { ok: false; code: 'FIREBASE_CONNECTION_FAILURE' | 'INVALID_PASSWORD_HASH_FORMAT'; detail: string };
+
+/**
+ * Single source of truth for Maker authentication:
+ * 1. Firestore `admins/primary_credentials` is authoritative whenever present.
+ * 2. Environment variables (`ADMIN_PASSWORD`, `MAIN_ADMIN_PASSWORD`, etc.) are used ONLY
+ *    for one-time initial bootstrap when `admins/primary_credentials` does not yet exist.
+ * 3. Bootstrap uses atomic `createCredentialsIfAbsent` so it can NEVER overwrite an existing
+ *    valid Firestore credentials document, and stale env vars can NEVER override Firestore.
+ */
+async function resolveAuthoritativeCredentials(
+  store: RegistryStore
+): Promise<AuthoritativeCredentialsResult> {
+  let existing: StoredCredentials | null = null;
+  try {
+    existing = await store.getCredentials();
+  } catch (err) {
+    return {
+      ok: false,
+      code: 'FIREBASE_CONNECTION_FAILURE',
+      detail: err instanceof Error ? err.message : 'Unable to read admins/primary_credentials',
+    };
+  }
+
+  if (existing) {
+    return { ok: true, creds: existing, bootstrappedFromEnv: false };
+  }
+
+  // No Firestore credentials document exists yet.
+  // If env credentials are provided and storage is writable, perform a one-time atomic seed.
+  if (store.mode === 'firestore_unconfigured' || !hasEnvCredentialsConfigured()) {
+    return { ok: true, creds: null, bootstrappedFromEnv: false };
+  }
+
+  const makerHashRes = convertEnvSecretToScryptHash(process.env.ADMIN_PASSWORD || '', 'ADMIN_PASSWORD');
+  if (!makerHashRes.ok) {
+    return { ok: false, code: 'INVALID_PASSWORD_HASH_FORMAT', detail: makerHashRes.detail };
+  }
+
+  const mainHashRes = convertEnvSecretToScryptHash(process.env.MAIN_ADMIN_PASSWORD || '', 'MAIN_ADMIN_PASSWORD');
+  if (!mainHashRes.ok) {
+    return { ok: false, code: 'INVALID_PASSWORD_HASH_FORMAT', detail: mainHashRes.detail };
+  }
+
+  const rawProtected =
+    normalizeEnvCredentialValue(process.env.ADMIN_PROTECTED_PASSWORD) ||
+    normalizeEnvCredentialValue(process.env.ADMIN_DELETE_PASSWORD) ||
+    normalizeEnvCredentialValue(process.env.MAIN_ADMIN_PASSWORD);
+  const rawDelete =
+    normalizeEnvCredentialValue(process.env.ADMIN_DELETE_PASSWORD) ||
+    normalizeEnvCredentialValue(process.env.ADMIN_PROTECTED_PASSWORD) ||
+    normalizeEnvCredentialValue(process.env.MAIN_ADMIN_PASSWORD);
+
+  const protHashRes = convertEnvSecretToScryptHash(rawProtected, 'ADMIN_PROTECTED_PASSWORD');
+  if (!protHashRes.ok) {
+    return { ok: false, code: 'INVALID_PASSWORD_HASH_FORMAT', detail: protHashRes.detail };
+  }
+  const delHashRes = convertEnvSecretToScryptHash(rawDelete, 'ADMIN_DELETE_PASSWORD');
+  if (!delHashRes.ok) {
+    return { ok: false, code: 'INVALID_PASSWORD_HASH_FORMAT', detail: delHashRes.detail };
+  }
+
+  const now = new Date().toISOString();
+  const seedCreds: StoredCredentials = {
+    makerUsername: normalizeEnvCredentialValue(process.env.ADMIN_USERNAME) || DEFAULT_MAKER_USERNAME,
+    makerPasswordHash: makerHashRes.hash,
+    mainAdminPasswordHash: mainHashRes.hash,
+    protectedPasswordHash: protHashRes.hash,
+    deletePasswordHash: delHashRes.hash,
+    sessionVersion: 1,
+    bootstrappedAt: now,
+    updatedAt: now,
+  };
+
+  try {
+    const created = await store.createCredentialsIfAbsent(seedCreds);
+    if (created) {
+      await store.addAuditLog({
+        id: generateRecordId('aud'),
+        timestamp: now,
+        actor: 'system-bootstrap',
+        actorRole: 'main_admin',
+        action: 'BOOTSTRAP_SECURITY',
+        reason: 'One-time initial credentials seeded into Firestore from server environment variables',
+      });
+      return { ok: true, creds: seedCreds, bootstrappedFromEnv: true };
+    }
+    // Another concurrent request created the document first; read the authoritative doc
+    const reloaded = await store.getCredentials();
+    return { ok: true, creds: reloaded, bootstrappedFromEnv: false };
+  } catch (err) {
+    return {
+      ok: false,
+      code: 'FIREBASE_CONNECTION_FAILURE',
+      detail: err instanceof Error ? err.message : 'Failed to initialize credentials in Firestore',
+    };
+  }
+}
+
+function verifyEnvOrHashDetailed(
+  plain: string,
+  envValue: string | undefined,
+  storedHash: string | undefined
+): { matched: boolean; source: 'env' | 'firestore' | 'none'; invalidHashDetail?: string } {
   const normalizedEnv = normalizeEnvCredentialValue(envValue);
   if (normalizedEnv.length > 0) {
     if (normalizedEnv.startsWith('scrypt$')) {
-      return verifyPassword(plain, normalizedEnv);
+      const fmt = validateScryptHashFormat(normalizedEnv);
+      if (!fmt.valid) {
+        return { matched: false, source: 'env', invalidHashDetail: fmt.reason };
+      }
+      return { matched: verifyPassword(plain, normalizedEnv), source: 'env' };
     }
-    return timingSafeStringEqual(plain, normalizedEnv);
+    return { matched: timingSafeStringEqual(plain, normalizedEnv), source: 'env' };
   }
   if (storedHash) {
-    return verifyPassword(plain, storedHash);
+    const fmt = validateScryptHashFormat(storedHash);
+    if (!fmt.valid) {
+      return { matched: false, source: 'firestore', invalidHashDetail: fmt.reason };
+    }
+    return { matched: verifyPassword(plain, storedHash), source: 'firestore' };
   }
-  return false;
+  return { matched: false, source: 'none' };
+}
+
+function verifyEnvOrHash(plain: string, envValue: string | undefined, storedHash: string | undefined): boolean {
+  return verifyEnvOrHashDetailed(plain, envValue, storedHash).matched;
 }
 
 async function getSessionVersion(): Promise<number> {
@@ -263,9 +432,6 @@ function validateCertificatePayload(
   }
   if (engineNumber.length < 5) {
     return { ok: false, error: 'Engine number must be at least 5 characters.' };
-  }
-  if (rtoAuthority.length < 2) {
-    return { ok: false, error: 'RTO / Registering Authority is required.' };
   }
   if (certificateNumber && !isValidCertificateNumberFormat(certificateNumber)) {
     return { ok: false, error: 'Invalid certificate number format. Expected PS/YY/R[7 digits].' };
@@ -483,7 +649,12 @@ export function createApiApp(): express.Express {
       updatedAt: now,
     };
 
-    await store.saveCredentials(creds);
+    const created = await store.createCredentialsIfAbsent(creds);
+    if (!created) {
+      res.status(403).json({ error: 'System security credentials have already been initialized.' });
+      return;
+    }
+
     await store.addAuditLog({
       id: generateRecordId('aud'),
       timestamp: now,
@@ -501,7 +672,7 @@ export function createApiApp(): express.Express {
     });
   });
 
-  // Certificate Maker Login
+  // Certificate Maker Login (Authoritative Source: Firestore admins/primary_credentials)
   router.post('/auth/login', async (req, res) => {
     const store = getStore();
     const ip = getClientIp(req);
@@ -519,41 +690,95 @@ export function createApiApp(): express.Express {
       return;
     }
 
-    const creds = await store.getCredentials();
-    const envUsername = normalizeEnvCredentialValue(process.env.ADMIN_USERNAME);
-    const hasEnvMakerPassword = Boolean(normalizeEnvCredentialValue(process.env.ADMIN_PASSWORD));
-    const expectedUsername =
-      envUsername ||
-      creds?.makerUsername ||
-      (hasEnvMakerPassword ? DEFAULT_MAKER_USERNAME : '');
-    if (!expectedUsername) {
+    const credResult = await resolveAuthoritativeCredentials(store);
+    if (!credResult.ok) {
+      logAuthDiagnostic({
+        role: 'maker',
+        code: credResult.code,
+        source: 'firestore',
+        ip,
+        detail: credResult.detail,
+      });
+      res.status(credResult.code === 'FIREBASE_CONNECTION_FAILURE' ? 503 : 500).json({
+        error:
+          credResult.code === 'FIREBASE_CONNECTION_FAILURE'
+            ? 'Unable to reach the authentication database. Please retry or contact your administrator.'
+            : 'Authentication configuration error. Please contact your administrator.',
+      });
+      return;
+    }
+
+    const creds = credResult.creds;
+    if (!creds || !creds.makerUsername || !creds.makerPasswordHash) {
+      logAuthDiagnostic({
+        role: 'maker',
+        code: 'MISSING_FIRESTORE_CREDENTIALS',
+        source: 'firestore',
+        ip,
+        detail: !creds ? 'admins/primary_credentials_not_found' : 'maker_credential_field_missing',
+      });
       res.status(503).json({
         error: 'System credentials are not initialized yet. Complete first-run setup first.',
       });
       return;
     }
 
+    // Validate stored scrypt hash format before verifying password
+    const hashCheck = validateScryptHashFormat(creds.makerPasswordHash);
+    if (!hashCheck.valid) {
+      logAuthDiagnostic({
+        role: 'maker',
+        code: 'INVALID_PASSWORD_HASH_FORMAT',
+        source: 'firestore',
+        ip,
+        detail: `firestore_makerPasswordHash_${hashCheck.reason}`,
+      });
+      res.status(500).json({
+        error: 'Authentication credential verification error. Please contact your administrator.',
+      });
+      return;
+    }
+
+    // Authoritative check strictly against Firestore admins/primary_credentials
+    // (never silently overridden by a stale ADMIN_PASSWORD or ADMIN_USERNAME env var)
+    const expectedUsername = creds.makerUsername.trim();
     const usernameMatches = timingSafeStringEqual(
       username.toLowerCase(),
       expectedUsername.toLowerCase()
     );
-    const passwordMatches = verifyEnvOrHash(
-      password,
-      process.env.ADMIN_PASSWORD,
-      creds?.makerPasswordHash
-    );
+    const passwordMatches = verifyPassword(password, creds.makerPasswordHash);
 
     if (!usernameMatches || !passwordMatches) {
-      const failState = recordAuthFailure(rateKey);
-      await store.addAuditLog({
-        id: generateRecordId('aud'),
-        timestamp: new Date().toISOString(),
-        actor: username || 'unknown',
-        actorRole: 'maker',
-        action: 'LOGIN_FAILED',
-        ipAddress: ip,
-        reason: 'Invalid Certificate Maker credentials',
+      const failureCode: AuthDiagnosticCode = !usernameMatches
+        ? 'INCORRECT_USERNAME'
+        : 'INCORRECT_PASSWORD';
+      logAuthDiagnostic({
+        role: 'maker',
+        code: failureCode,
+        source: 'firestore',
+        ip,
+        detail: !usernameMatches
+          ? `providedLen=${username.length},expectedLen=${expectedUsername.length}`
+          : 'scrypt_digest_mismatch',
       });
+      const failState = recordAuthFailure(rateKey);
+      try {
+        await store.addAuditLog({
+          id: generateRecordId('aud'),
+          timestamp: new Date().toISOString(),
+          actor: username || 'unknown',
+          actorRole: 'maker',
+          action: 'LOGIN_FAILED',
+          ipAddress: ip,
+          reason:
+            failureCode === 'INCORRECT_USERNAME'
+              ? 'Invalid Certificate Maker username'
+              : 'Invalid Certificate Maker password',
+          metadata: { diagnosticCode: failureCode, authSource: 'firestore' },
+        });
+      } catch {
+        // Do not mask auth failure with an audit write error
+      }
       res.status(401).json({
         error: failState.locked
           ? 'Account login temporarily locked due to multiple failed attempts.'
@@ -562,28 +787,57 @@ export function createApiApp(): express.Express {
       return;
     }
 
-    clearAuthFailures(rateKey);
-    const sessionVersion = creds?.sessionVersion ?? 1;
-    const { token, session } = signSessionToken({
-      username: expectedUsername,
-      role: 'maker',
-      sessionVersion,
-    });
+    let token: string;
+    let session: SessionInfo;
+    try {
+      const sessionVersion = creds.sessionVersion ?? 1;
+      const signed = signSessionToken({
+        username: expectedUsername,
+        role: 'maker',
+        sessionVersion,
+      });
+      token = signed.token;
+      session = signed.session;
+      setSessionCookie(res, token, session.expiresAt - session.issuedAt);
+    } catch (err) {
+      logAuthDiagnostic({
+        role: 'maker',
+        code: 'SESSION_CREATION_FAILURE',
+        source: 'firestore',
+        ip,
+        detail: err instanceof Error ? err.message : 'Unable to create session token',
+      });
+      res.status(500).json({
+        error: 'Unable to establish an authenticated session. Please try again.',
+      });
+      return;
+    }
 
-    setSessionCookie(res, token, session.expiresAt - session.issuedAt);
-    await store.addAuditLog({
-      id: generateRecordId('aud'),
-      timestamp: new Date().toISOString(),
-      actor: expectedUsername,
-      actorRole: 'maker',
-      action: 'LOGIN_SUCCESS',
-      ipAddress: ip,
-    });
+    clearAuthFailures(rateKey);
+    try {
+      await store.addAuditLog({
+        id: generateRecordId('aud'),
+        timestamp: new Date().toISOString(),
+        actor: expectedUsername,
+        actorRole: 'maker',
+        action: 'LOGIN_SUCCESS',
+        ipAddress: ip,
+        metadata: { authSource: 'firestore' },
+      });
+    } catch (err) {
+      logAuthDiagnostic({
+        role: 'maker',
+        code: 'FIREBASE_CONNECTION_FAILURE',
+        source: 'firestore',
+        ip,
+        detail: `audit_log_write_warning:${err instanceof Error ? err.message : 'unknown'}`,
+      });
+    }
 
     res.json({ session, token });
   });
 
-  // Main Core Admin Separate Unlock
+  // Main Core Admin Separate Unlock (Preserves existing Main Core Admin auth behavior unchanged)
   router.post('/auth/admin-unlock', async (req, res) => {
     const store = getStore();
     const ip = getClientIp(req);
@@ -599,32 +853,83 @@ export function createApiApp(): express.Express {
 
     const body = (req.body ?? {}) as Record<string, unknown>;
     const password = typeof body.password === 'string' ? body.password : '';
-    const creds = await store.getCredentials();
 
-    if (!process.env.MAIN_ADMIN_PASSWORD?.trim() && !creds?.mainAdminPasswordHash) {
+    const credResult = await resolveAuthoritativeCredentials(store);
+    if (!credResult.ok) {
+      logAuthDiagnostic({
+        role: 'main_admin',
+        code: credResult.code,
+        source: 'firestore',
+        ip,
+        detail: credResult.detail,
+      });
+      res.status(credResult.code === 'FIREBASE_CONNECTION_FAILURE' ? 503 : 500).json({
+        error:
+          credResult.code === 'FIREBASE_CONNECTION_FAILURE'
+            ? 'Unable to reach the authentication database. Please retry.'
+            : 'Authentication configuration error. Please contact your administrator.',
+      });
+      return;
+    }
+
+    const creds = credResult.creds;
+    if (!normalizeEnvCredentialValue(process.env.MAIN_ADMIN_PASSWORD) && !creds?.mainAdminPasswordHash) {
+      logAuthDiagnostic({
+        role: 'main_admin',
+        code: 'MISSING_FIRESTORE_CREDENTIALS',
+        source: 'none',
+        ip,
+        detail: 'main_admin_credential_not_configured',
+      });
       res.status(503).json({
         error: 'Main Core Admin password is not configured yet. Complete first-run setup or set MAIN_ADMIN_PASSWORD.',
       });
       return;
     }
 
-    const ok = verifyEnvOrHash(
+    const check = verifyEnvOrHashDetailed(
       password,
       process.env.MAIN_ADMIN_PASSWORD,
       creds?.mainAdminPasswordHash
     );
 
-    if (!ok) {
-      const failState = recordAuthFailure(rateKey);
-      await store.addAuditLog({
-        id: generateRecordId('aud'),
-        timestamp: new Date().toISOString(),
-        actor: 'Main Core Admin',
-        actorRole: 'main_admin',
-        action: 'ADMIN_UNLOCK_FAILED',
-        ipAddress: ip,
-        reason: 'Invalid Main Core Admin unlock password',
+    if (check.invalidHashDetail) {
+      logAuthDiagnostic({
+        role: 'main_admin',
+        code: 'INVALID_PASSWORD_HASH_FORMAT',
+        source: check.source,
+        ip,
+        detail: check.invalidHashDetail,
       });
+      res.status(500).json({
+        error: 'Main Core Admin credential format error. Please contact your administrator.',
+      });
+      return;
+    }
+
+    if (!check.matched) {
+      logAuthDiagnostic({
+        role: 'main_admin',
+        code: 'INCORRECT_PASSWORD',
+        source: check.source,
+        ip,
+        detail: 'main_admin_password_mismatch',
+      });
+      const failState = recordAuthFailure(rateKey);
+      try {
+        await store.addAuditLog({
+          id: generateRecordId('aud'),
+          timestamp: new Date().toISOString(),
+          actor: 'Main Core Admin',
+          actorRole: 'main_admin',
+          action: 'ADMIN_UNLOCK_FAILED',
+          ipAddress: ip,
+          reason: 'Invalid Main Core Admin unlock password',
+          metadata: { diagnosticCode: 'INCORRECT_PASSWORD', authSource: check.source },
+        });
+      } catch {
+        // non-fatal
+      }
       res.status(401).json({
         error: failState.locked
           ? 'Main Core Admin unlock temporarily locked due to repeated failed attempts.'
@@ -633,23 +938,46 @@ export function createApiApp(): express.Express {
       return;
     }
 
-    clearAuthFailures(rateKey);
-    const sessionVersion = creds?.sessionVersion ?? 1;
-    const { token, session } = signSessionToken({
-      username: 'Main Core Admin',
-      role: 'main_admin',
-      sessionVersion,
-    });
+    let token: string;
+    let session: SessionInfo;
+    try {
+      const sessionVersion = creds?.sessionVersion ?? 1;
+      const signed = signSessionToken({
+        username: 'Main Core Admin',
+        role: 'main_admin',
+        sessionVersion,
+      });
+      token = signed.token;
+      session = signed.session;
+      setSessionCookie(res, token, session.expiresAt - session.issuedAt);
+    } catch (err) {
+      logAuthDiagnostic({
+        role: 'main_admin',
+        code: 'SESSION_CREATION_FAILURE',
+        source: check.source,
+        ip,
+        detail: err instanceof Error ? err.message : 'Unable to create admin session token',
+      });
+      res.status(500).json({
+        error: 'Unable to establish an authenticated session. Please try again.',
+      });
+      return;
+    }
 
-    setSessionCookie(res, token, session.expiresAt - session.issuedAt);
-    await store.addAuditLog({
-      id: generateRecordId('aud'),
-      timestamp: new Date().toISOString(),
-      actor: 'Main Core Admin',
-      actorRole: 'main_admin',
-      action: 'ADMIN_UNLOCK_SUCCESS',
-      ipAddress: ip,
-    });
+    clearAuthFailures(rateKey);
+    try {
+      await store.addAuditLog({
+        id: generateRecordId('aud'),
+        timestamp: new Date().toISOString(),
+        actor: 'Main Core Admin',
+        actorRole: 'main_admin',
+        action: 'ADMIN_UNLOCK_SUCCESS',
+        ipAddress: ip,
+        metadata: { authSource: check.source },
+      });
+    } catch {
+      // non-fatal
+    }
 
     res.json({ session, token });
   });
@@ -788,6 +1116,191 @@ export function createApiApp(): express.Express {
     res.json({ certificate: cert });
   });
 
+  // Authenticated Maker Edit (within Maker's permitted latest-5 scope; preserves certificate number, updates SHA-256 & audit history)
+  router.put('/certificates/:id', requireAuth, async (req: AuthedRequest, res) => {
+    const store = getStore();
+    const id = sanitizeText(req.params.id, 100);
+    const existing = await store.getCertificateById(id);
+    if (!existing) {
+      res.status(404).json({ error: 'Certificate not found.' });
+      return;
+    }
+
+    if (req.session!.role === 'maker') {
+      if (existing.status !== 'ACTIVE') {
+        res.status(400).json({ error: 'Only active certificates can be edited by a Certificate Maker.' });
+        return;
+      }
+      const recentFive = await store.getRecentActiveCertificates(5);
+      const isAllowed = recentFive.some((c) => c.id === existing.id);
+      if (!isAllowed) {
+        res.status(403).json({
+          error: 'Forbidden: Certificate Maker editing is restricted to the latest five active certificates.',
+        });
+        return;
+      }
+    }
+
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const rawUpdates = body.updates && typeof body.updates === 'object' ? (body.updates as Record<string, unknown>) : body;
+    const reason = sanitizeText(body.reason, 300) || `Updated by ${req.session!.role === 'main_admin' ? 'Main Core Admin' : 'Certificate Maker'}`;
+
+    const validated = validateCertificatePayload({
+      ...existing,
+      ...rawUpdates,
+      // Always preserve immutable identifiers and existing rtoAuthority (no longer edited)
+      certificateNumber: existing.certificateNumber,
+      scrappingRegNumber: existing.scrappingRegNumber,
+      rtoAuthority: existing.rtoAuthority ?? '',
+    });
+    if (!validated.ok) {
+      res.status(400).json({ error: validated.error });
+      return;
+    }
+
+    const now = new Date().toISOString();
+    const snapshot = {
+      version: existing.version,
+      editedAt: now,
+      editedBy: req.session!.username,
+      reason,
+      previousCanonicalHash: existing.canonicalHash,
+      previousData: {
+        ownerName: existing.ownerName,
+        ownerAddress: existing.ownerAddress,
+        idProofType: existing.idProofType,
+        idProofNumber: existing.idProofNumber,
+        vehicleRegNumber: existing.vehicleRegNumber,
+        make: existing.make,
+        model: existing.model,
+        manufactureYear: existing.manufactureYear,
+        chassisNumber: existing.chassisNumber,
+        engineNumber: existing.engineNumber,
+        unhideChassisEngine: existing.unhideChassisEngine,
+        rtoAuthority: existing.rtoAuthority ?? '',
+        issueDate: existing.issueDate,
+        handoverDate: existing.handoverDate,
+        facilityName: existing.facilityName,
+        facilityAddress: existing.facilityAddress,
+        remarks: existing.remarks,
+      },
+    };
+
+    const updates = validated.data;
+    const nextCertBase: Omit<CertificateRecord, 'canonicalHash'> = {
+      ...existing,
+      issueDate: updates.issueDate,
+      handoverDate: updates.handoverDate,
+      ownerName: updates.ownerName,
+      ownerAddress: updates.ownerAddress ?? '',
+      idProofType: updates.idProofType ?? '',
+      idProofNumber: updates.idProofNumber ?? '',
+      vehicleRegNumber: updates.vehicleRegNumber,
+      make: updates.make,
+      model: updates.model,
+      manufactureYear: updates.manufactureYear,
+      chassisNumber: updates.chassisNumber,
+      engineNumber: updates.engineNumber,
+      unhideChassisEngine: updates.unhideChassisEngine === true,
+      rtoAuthority: existing.rtoAuthority ?? '',
+      remarks: updates.remarks ?? '',
+      version: existing.version + 1,
+      qrToken: generateQrToken(),
+      updatedAt: now,
+      versionHistory: [snapshot, ...(existing.versionHistory ?? [])],
+    };
+
+    const updated: CertificateRecord = {
+      ...nextCertBase,
+      canonicalHash: computeCanonicalHash(nextCertBase),
+    };
+
+    await store.saveCertificate(updated);
+    await store.addAuditLog({
+      id: generateRecordId('aud'),
+      timestamp: now,
+      actor: req.session!.username,
+      actorRole: req.session!.role,
+      action: 'CERTIFICATE_EDITED',
+      certificateId: updated.id,
+      certificateNumber: updated.certificateNumber,
+      reason,
+      ipAddress: getClientIp(req),
+      metadata: {
+        previousVersion: existing.version,
+        newVersion: updated.version,
+      },
+    });
+
+    res.json({ certificate: updated });
+  });
+
+  // Authenticated Maker Delete (soft-delete with active session, no password re-entry; preserves reserved numbers & audit log)
+  router.delete('/certificates/:id', requireAuth, async (req: AuthedRequest, res) => {
+    const store = getStore();
+    const id = sanitizeText(req.params.id, 100);
+    const existing = await store.getCertificateById(id);
+    if (!existing) {
+      res.status(404).json({ error: 'Certificate not found.' });
+      return;
+    }
+    if (existing.status === 'SOFT_DELETED') {
+      res.status(400).json({ error: 'Certificate has already been deleted.' });
+      return;
+    }
+
+    if (req.session!.role === 'maker') {
+      const recentFive = await store.getRecentActiveCertificates(5);
+      const isAllowed = recentFive.some((c) => c.id === existing.id);
+      if (!isAllowed) {
+        res.status(403).json({
+          error: 'Forbidden: Certificate Maker deletion is restricted to the latest five active certificates.',
+        });
+        return;
+      }
+    }
+
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const reason =
+      sanitizeText(body.reason, 300) ||
+      `Deleted by authenticated ${req.session!.role === 'main_admin' ? 'Main Core Admin' : 'Certificate Maker'}`;
+
+    const now = new Date().toISOString();
+    const softDeletedBase: Omit<CertificateRecord, 'canonicalHash'> = {
+      ...existing,
+      status: 'SOFT_DELETED',
+      deletedAt: now,
+      deletedBy: req.session!.username,
+      deleteReason: reason,
+      updatedAt: now,
+    };
+    const updated: CertificateRecord = {
+      ...softDeletedBase,
+      canonicalHash: computeCanonicalHash(softDeletedBase),
+    };
+
+    await store.saveCertificate(updated);
+    await store.addAuditLog({
+      id: generateRecordId('aud'),
+      timestamp: now,
+      actor: req.session!.username,
+      actorRole: req.session!.role,
+      action: 'CERTIFICATE_SOFT_DELETED',
+      certificateId: updated.id,
+      certificateNumber: updated.certificateNumber,
+      reason,
+      ipAddress: getClientIp(req),
+    });
+
+    res.json({
+      success: true,
+      deletedId: updated.id,
+      certificateNumber: updated.certificateNumber,
+      deletedAt: now,
+      deletedBy: req.session!.username,
+    });
+  });
+
   // Atomic Certificate Creation with Idempotency Key & Collision Protection
   router.post('/certificates', requireAuth, async (req: AuthedRequest, res) => {
     const startMs = Date.now();
@@ -853,7 +1366,7 @@ export function createApiApp(): express.Express {
         chassisNumber: input.chassisNumber,
         engineNumber: input.engineNumber,
         unhideChassisEngine: input.unhideChassisEngine === true,
-        rtoAuthority: input.rtoAuthority,
+        rtoAuthority: input.rtoAuthority ?? '',
         facilityName: settings.facilityName,
         facilityRvsfCode: settings.facilityRvsfCode,
         facilityAddress: settings.facilityAddress,
@@ -1061,7 +1574,7 @@ export function createApiApp(): express.Express {
       chassisNumber: updates.chassisNumber,
       engineNumber: updates.engineNumber,
       unhideChassisEngine: updates.unhideChassisEngine === true,
-      rtoAuthority: updates.rtoAuthority,
+      rtoAuthority: existing.rtoAuthority ?? '',
       remarks: updates.remarks ?? '',
       version: existing.version + 1,
       qrToken: generateQrToken(),
@@ -1411,20 +1924,27 @@ export function createApiApp(): express.Express {
   // Settings & Password Rotation
   router.get('/admin/settings', requireMainAdmin, async (_req, res) => {
     const store = getStore();
-    const [settings, creds] = await Promise.all([
+    const [settings, credRes] = await Promise.all([
       store.getSettings(),
-      store.getCredentials(),
+      resolveAuthoritativeCredentials(store),
     ]);
+    const creds = credRes.ok ? credRes.creds : null;
     const envUsername = normalizeEnvCredentialValue(process.env.ADMIN_USERNAME);
-    const makerPasswordEnvManaged = Boolean(normalizeEnvCredentialValue(process.env.ADMIN_PASSWORD));
+    const staleMakerEnvIgnored = Boolean(
+      creds &&
+        (normalizeEnvCredentialValue(process.env.ADMIN_PASSWORD) ||
+          (envUsername && envUsername.toLowerCase() !== creds.makerUsername.toLowerCase()))
+    );
     res.json({
       settings,
-      envManagedCredentials: hasEnvCredentialsConfigured(),
-      makerPasswordEnvManaged,
+      envManagedCredentials: Boolean(normalizeEnvCredentialValue(process.env.MAIN_ADMIN_PASSWORD)),
+      makerPasswordEnvManaged: false,
+      makerAuthSource: creds ? 'firestore' : hasEnvCredentialsConfigured() ? 'env_bootstrap_pending' : 'unconfigured',
+      staleMakerEnvIgnored,
       makerUsername:
-        envUsername ||
         creds?.makerUsername ||
-        (makerPasswordEnvManaged ? DEFAULT_MAKER_USERNAME : ''),
+        envUsername ||
+        (hasAnyEnvPasswordConfigured() ? DEFAULT_MAKER_USERNAME : ''),
       driveEnvConfigured: Boolean(
         process.env.GOOGLE_DRIVE_CLIENT_EMAIL?.trim() &&
           process.env.GOOGLE_DRIVE_PRIVATE_KEY?.trim()
@@ -1474,18 +1994,12 @@ export function createApiApp(): express.Express {
   // Password rotation + immediate global session invalidation
   router.post('/admin/rotate-passwords', requireMainAdmin, async (req: AuthedRequest, res) => {
     const store = getStore();
-    if (hasEnvCredentialsConfigured()) {
-      res.status(400).json({
-        error: 'Credentials are controlled by Vercel Environment Variables. Rotate them in Vercel Project Settings and redeploy.',
-      });
-      return;
-    }
-
-    const creds = await store.getCredentials();
-    if (!creds) {
+    const credRes = await resolveAuthoritativeCredentials(store);
+    if (!credRes.ok || !credRes.creds) {
       res.status(400).json({ error: 'Stored credentials not found.' });
       return;
     }
+    const creds = credRes.creds;
 
     const body = (req.body ?? {}) as Record<string, unknown>;
     const currentMainPassword = typeof body.currentMainPassword === 'string' ? body.currentMainPassword : '';
@@ -1499,9 +2013,9 @@ export function createApiApp(): express.Express {
     const newMainAdminPassword = typeof body.newMainAdminPassword === 'string' ? body.newMainAdminPassword : '';
     const newProtectedPassword = typeof body.newProtectedPassword === 'string' ? body.newProtectedPassword : '';
 
-    if (newMakerPassword && normalizeEnvCredentialValue(process.env.ADMIN_PASSWORD)) {
+    if (newMainAdminPassword && normalizeEnvCredentialValue(process.env.MAIN_ADMIN_PASSWORD)) {
       res.status(400).json({
-        error: 'ADMIN_PASSWORD is set in Vercel Environment Variables and overrides Firestore. Update ADMIN_PASSWORD in Vercel Project Settings and redeploy.',
+        error: 'MAIN_ADMIN_PASSWORD is managed via Vercel Environment Variables. Update MAIN_ADMIN_PASSWORD in Vercel Project Settings, or use Maker-Only Password Rotation to rotate the Maker password in Firestore.',
       });
       return;
     }
@@ -1557,17 +2071,25 @@ export function createApiApp(): express.Express {
     });
   });
 
-  // Dedicated Maker-Only Password Rotation (preserves makerUsername & Main Core Admin password untouched)
+  // Dedicated Maker-Only Password Rotation (Firestore is authoritative; updates ONLY makerPasswordHash, preserves username & Main Core Admin)
   router.post('/admin/rotate-maker-password', requireMainAdmin, async (req: AuthedRequest, res) => {
     const store = getStore();
-    if (normalizeEnvCredentialValue(process.env.ADMIN_PASSWORD)) {
-      res.status(400).json({
-        error: 'Maker password is controlled by the ADMIN_PASSWORD Vercel Environment Variable (which overrides Firestore). Update ADMIN_PASSWORD in Vercel Project Settings with a salted scrypt hash and redeploy.',
+    const credRes = await resolveAuthoritativeCredentials(store);
+    if (!credRes.ok) {
+      logAuthDiagnostic({
+        role: 'main_admin',
+        code: credRes.code,
+        source: 'firestore',
+        ip: getClientIp(req),
+        detail: credRes.detail,
+      });
+      res.status(credRes.code === 'FIREBASE_CONNECTION_FAILURE' ? 503 : 500).json({
+        error: 'Unable to read stored credentials from Firestore.',
       });
       return;
     }
 
-    const creds = await store.getCredentials();
+    const creds = credRes.creds;
     if (!creds) {
       res.status(404).json({ error: 'Stored primary_credentials document not found.' });
       return;
@@ -1587,17 +2109,31 @@ export function createApiApp(): express.Express {
       return;
     }
 
+    const nextHash = hashPassword(newMakerPassword);
+    const selfCheck = validateScryptHashFormat(nextHash);
+    if (!selfCheck.valid || !verifyPassword(newMakerPassword, nextHash)) {
+      res.status(500).json({ error: 'Internal password hash self-check failed. No changes were written.' });
+      return;
+    }
+
     const now = new Date().toISOString();
     const nextVersion = creds.sessionVersion + 1;
     const updatedCreds: StoredCredentials = {
       ...creds,
       // Explicitly update ONLY makerPasswordHash, sessionVersion, and updatedAt
-      makerPasswordHash: hashPassword(newMakerPassword),
+      makerPasswordHash: nextHash,
       sessionVersion: nextVersion,
       updatedAt: now,
     };
 
     await store.saveCredentials(updatedCreds);
+
+    // Read back from Firestore to verify persisted hash integrity before returning success
+    const reloaded = await store.getCredentials();
+    if (!reloaded || !verifyPassword(newMakerPassword, reloaded.makerPasswordHash)) {
+      res.status(500).json({ error: 'Post-write credential verification failed. Please retry.' });
+      return;
+    }
 
     const { token, session } = signSessionToken({
       username: 'Main Core Admin',
@@ -1613,16 +2149,16 @@ export function createApiApp(): express.Express {
       actorRole: req.session!.role,
       action: 'PASSWORD_ROTATED',
       ipAddress: getClientIp(req),
-      reason: 'Rotated Maker password hash only (username and Main Core Admin password unchanged)',
-      metadata: { scope: 'maker_only', newSessionVersion: nextVersion },
+      reason: 'Rotated Maker password hash only in Firestore (username and Main Core Admin password unchanged)',
+      metadata: { scope: 'maker_only', authSource: 'firestore', newSessionVersion: nextVersion },
     });
 
     res.json({
       success: true,
       session,
       token,
-      makerUsername: updatedCreds.makerUsername,
-      message: 'Maker password updated with a new salted scrypt hash. Previous sessions have been invalidated.',
+      makerUsername: reloaded.makerUsername,
+      message: 'Maker password updated in Firestore with a new salted scrypt hash. Previous sessions have been invalidated.',
     });
   });
 

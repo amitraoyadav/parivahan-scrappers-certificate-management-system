@@ -61,6 +61,7 @@ export interface RegistryStore {
   // Credentials & Settings
   getCredentials(): Promise<StoredCredentials | null>;
   saveCredentials(creds: StoredCredentials): Promise<void>;
+  createCredentialsIfAbsent(creds: StoredCredentials): Promise<boolean>;
   getSettings(): Promise<SystemSettings>;
   saveSettings(settings: SystemSettings): Promise<void>;
 
@@ -153,6 +154,14 @@ class StagingMemoryStore implements RegistryStore {
 
   async saveCredentials(creds: StoredCredentials): Promise<void> {
     this.credentials = { ...creds };
+  }
+
+  async createCredentialsIfAbsent(creds: StoredCredentials): Promise<boolean> {
+    return this.runAtomic(() => {
+      if (this.credentials !== null) return false;
+      this.credentials = { ...creds };
+      return true;
+    });
   }
 
   async getSettings(): Promise<SystemSettings> {
@@ -840,6 +849,29 @@ export class FirestoreRestStore implements RegistryStore {
     await this.setDoc('admins', 'primary_credentials', creds);
   }
 
+  async createCredentialsIfAbsent(creds: StoredCredentials): Promise<boolean> {
+    // Atomic precondition exists: false guarantees bootstrap can NEVER overwrite existing credentials
+    const writes = [
+      {
+        update: {
+          name: `${this.docRoot}/admins/primary_credentials`,
+          fields: toFirestoreFields(creds as unknown as Record<string, unknown>),
+        },
+        currentDocument: { exists: false },
+      },
+    ];
+    const res = await this.fsFetch(`${this.apiBase}:commit`, {
+      method: 'POST',
+      body: JSON.stringify({ writes }),
+    });
+    if (res.ok) return true;
+    const text = await res.text();
+    if (res.status === 409 || text.includes('ALREADY_EXISTS') || text.includes('FAILED_PRECONDITION')) {
+      return false;
+    }
+    throw new Error(`Firestore atomic createCredentialsIfAbsent failed (${res.status}): ${text}`);
+  }
+
   async getSettings(): Promise<SystemSettings> {
     const existing = await this.getDoc<SystemSettings>('settings', 'global');
     const merged = existing ? { ...DEFAULT_SETTINGS, ...existing } : { ...DEFAULT_SETTINGS };
@@ -1285,6 +1317,7 @@ class UnconfiguredProductionStore implements RegistryStore {
   }
   async getCredentials() { return null; }
   async saveCredentials() { this.fail(); }
+  async createCredentialsIfAbsent(): Promise<boolean> { this.fail(); }
   async getSettings() {
     return {
       ...DEFAULT_SETTINGS,

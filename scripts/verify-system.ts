@@ -97,6 +97,7 @@ async function runTests(): Promise<void> {
     console.log('✓ 4. Maker RBAC isolation verified (403 on all admin & full-registry routes)');
 
     // 5. Concurrent random certificate creation (7 certificates) + format uniqueness + latest-5 restriction
+    // Note: RTO field is completely removed from new creations (idx 1..6 omit rtoAuthority; idx 7 tests backward compatibility if legacy rtoAuthority exists)
     const makePayload = (idx: number) => ({
       issueDate: '2026-11-24',
       handoverDate: '2026-11-23',
@@ -112,7 +113,7 @@ async function runTests(): Promise<void> {
       chassisNumber: `MA3EJKD1S0012345${idx}`,
       engineNumber: `K12MN456789${idx}`,
       unhideChassisEngine: false,
-      rtoAuthority: 'RTO Gurugram (HR-26)',
+      ...(idx === 7 ? { rtoAuthority: 'Legacy RTO Gurugram (HR-26)' } : {}),
       remarks: 'Verified scrap test',
     });
 
@@ -360,13 +361,20 @@ async function runTests(): Promise<void> {
     assert.equal((dryRun.json.dryRun as Record<string, unknown>).checksumValid, true);
     console.log('✓ 12. Verified backup snapshot, JSON checksum export & SHA-256 restore dry-run verified');
 
-    // 13. Official PDF & QR Code generation verification
-    const { buildCertificatePdfDoc } = await import('../src/lib/pdfGenerator.js');
+    // 13. Official PDF & QR Code generation verification (exact certificate-number filename)
+    const { buildCertificatePdfDoc, getCertificatePdfFilename } = await import('../src/lib/pdfGenerator.js');
     const pdfBuilt = await buildCertificatePdfDoc(editedCert as never, {
       customDomain: 'https://parivahan-certificate-fresh.vercel.app',
       authorizedSignatory: 'Authorized RVSF Officer',
       signatoryDesignation: 'Facility Compliance Head',
     });
+    const expectedFileName = getCertificatePdfFilename(String(editedCert.certificateNumber));
+    assert.match(expectedFileName, /^PS-26-R\d{7}\.pdf$/);
+    assert.equal(
+      pdfBuilt.fileName,
+      expectedFileName,
+      'PDF filename must strictly match certificate number (PS-26-Rxxxxxxx.pdf) with no vehicle reg suffix'
+    );
     const pdfBytes = Buffer.from(pdfBuilt.doc.output('arraybuffer'));
     assert.ok(pdfBytes.subarray(0, 5).toString('utf8') === '%PDF-', 'Generated file must be a valid PDF stream');
     assert.ok(pdfBytes.length > 5000, 'Generated PDF must contain full layout and embedded QR image');
@@ -374,7 +382,9 @@ async function runTests(): Promise<void> {
       pdfBuilt.verifyUrl.startsWith('https://parivahan-certificate-fresh.vercel.app/verify?certificateNumber='),
       'QR verification URL must use configured custom production domain'
     );
-    console.log(`✓ 13. Official PDF (${pdfBytes.length} bytes) & QR verification URL generation verified`);
+    console.log(
+      `✓ 13. Official PDF (${pdfBytes.length} bytes, exact filename ${pdfBuilt.fileName}) & QR verification URL generation verified`
+    );
 
     // 14. Password rotation & immediate old-session invalidation
     const rotate = await req('/api/admin/rotate-passwords', {
@@ -460,10 +470,10 @@ async function runTests(): Promise<void> {
       '✓ 17. Login rate limiting (429 lockout) and CSRF guard (403) verified'
     );
 
-    // 18. Env-Var Auth (pscrappers + quoted salted scrypt hashes + cookie flags + env password rotation session invalidation)
+    // 18. Firestore-Authoritative Precedence & One-Time Env Bootstrap (stale ADMIN_PASSWORD/ADMIN_USERNAME ignored once Firestore exists)
     await runEnvManagedAuthTests();
     console.log(
-      '✓ 18. Env-managed auth (pscrappers, quoted salted scrypt env hashes, HttpOnly/Secure/SameSite cookies, bootstrap lock, zero secret leak, instant rotation invalidation) verified'
+      '✓ 18. Single-source-of-truth Maker precedence (one-time env bootstrap, Firestore authoritative, stale ADMIN_PASSWORD/ADMIN_USERNAME ignored, rotation invalidates sessions) verified'
     );
 
     // 19. Vercel Production Firestore Safety Guard (VERCEL=1 refuses ephemeral memory fallback)
@@ -478,7 +488,19 @@ async function runTests(): Promise<void> {
       '✓ 20. Maker-only password rotation (/api/admin/rotate-maker-password) verified (pscrappers & Main Core Admin preserved, new Maker login succeeds)'
     );
 
-    console.log('\nALL 20 ISOLATED STAGING, AUTH, SPARK-FIRESTORE, BACKUP/RESTORE, PDF & SECURITY CHECKS PASSED.\n');
+    // 21. Maker Direct Edit & Password-Free Soft Delete, Legacy RTO SHA-256 Compatibility, Scope Isolation & Public Rejection
+    await runMakerEditDeleteAndVerifyTests();
+    console.log(
+      '✓ 21. Maker edit & password-free soft-delete, RTO-free creation, legacy RTO SHA-256 compatibility, latest-5 isolation & public 401/404 checks verified'
+    );
+
+    // 22. Safe Auth Diagnostics (distinguishes username, password, missing creds, invalid hash format, Firebase error; zero secret leakage)
+    await runAuthDiagnosticsTests();
+    console.log(
+      '✓ 22. Safe server-side auth diagnostics (INCORRECT_USERNAME, INCORRECT_PASSWORD, MISSING_FIRESTORE_CREDENTIALS, INVALID_PASSWORD_HASH_FORMAT, FIREBASE_CONNECTION_FAILURE; zero secret leak) verified'
+    );
+
+    console.log('\nALL 22 ISOLATED STAGING, AUTH PRECEDENCE, DIAGNOSTICS, SPARK-FIRESTORE, BACKUP/RESTORE, PDF, MAKER EDIT/DELETE & SECURITY CHECKS PASSED.\n');
   } finally {
     await new Promise<void>((resolve) => server.close(() => resolve()));
   }
@@ -696,6 +718,33 @@ async function runMockFirestoreSparkTests(): Promise<void> {
     assert.equal(ping.ok, true);
     assert.equal(collections.size, 0, 'Read-only ping must not write any documents');
 
+    // 1b. Atomic createCredentialsIfAbsent creates once and NEVER overwrites an existing valid doc
+    const firstCreate = await fsStore.createCredentialsIfAbsent({
+      makerUsername: 'pscrappers',
+      makerPasswordHash: 'scrypt$00112233445566778899aabbccddeeff$' + 'a'.repeat(128),
+      mainAdminPasswordHash: 'scrypt$00112233445566778899aabbccddeeff$' + 'b'.repeat(128),
+      protectedPasswordHash: 'scrypt$00112233445566778899aabbccddeeff$' + 'c'.repeat(128),
+      deletePasswordHash: 'scrypt$00112233445566778899aabbccddeeff$' + 'd'.repeat(128),
+      sessionVersion: 1,
+      bootstrappedAt: '2026-11-27T00:00:00.000Z',
+      updatedAt: '2026-11-27T00:00:00.000Z',
+    });
+    assert.equal(firstCreate, true, 'First createCredentialsIfAbsent should succeed');
+
+    const overwriteAttempt = await fsStore.createCredentialsIfAbsent({
+      makerUsername: 'attacker_overwrite',
+      makerPasswordHash: 'scrypt$ffeeddccbbaa99887766554433221100$' + 'f'.repeat(128),
+      mainAdminPasswordHash: 'scrypt$ffeeddccbbaa99887766554433221100$' + 'f'.repeat(128),
+      protectedPasswordHash: 'scrypt$ffeeddccbbaa99887766554433221100$' + 'f'.repeat(128),
+      deletePasswordHash: 'scrypt$ffeeddccbbaa99887766554433221100$' + 'f'.repeat(128),
+      sessionVersion: 99,
+      bootstrappedAt: '2026-11-27T01:00:00.000Z',
+      updatedAt: '2026-11-27T01:00:00.000Z',
+    });
+    assert.equal(overwriteAttempt, false, 'Second createCredentialsIfAbsent must never overwrite existing Firestore credentials');
+    const keptCreds = await fsStore.getCredentials();
+    assert.equal(keptCreds?.makerUsername, 'pscrappers', 'Existing Firestore credentials must remain intact');
+
     // 2. Create 6 certificates atomically
     const makeCert = (i: number) => ({
       id: `cert_mock_${i}`,
@@ -878,7 +927,7 @@ async function runEnvManagedAuthTests(): Promise<void> {
     });
     assert.equal(bootRes.status, 403);
 
-    // Maker login succeeds with pscrappers and quoted salted scrypt env hash
+    // Maker login succeeds with pscrappers and quoted salted scrypt env hash (one-time bootstrap into Firestore)
     const makerRes = await fetch(`${origin}/api/auth/login`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'XMLHttpRequest' },
@@ -908,16 +957,57 @@ async function runEnvManagedAuthTests(): Promise<void> {
     assert.equal(adminRes.status, 200);
     const adminJson = (await adminRes.json()) as { token: string };
 
-    // Rotating ADMIN_PASSWORD in env immediately invalidates previously issued tokens
-    process.env.ADMIN_PASSWORD = hashPassword(`Rotated@${crypto.randomBytes(6).toString('hex')}`);
+    // CRITICAL PRECEDENCE CHECK: Changing ADMIN_PASSWORD / ADMIN_USERNAME in env AFTER Firestore
+    // credentials exist MUST NOT overwrite or override Firestore Maker credentials!
+    const staleEnvPassword = `StaleEnv@${crypto.randomBytes(6).toString('hex')}`;
+    process.env.ADMIN_USERNAME = 'stale_wrong_username';
+    process.env.ADMIN_PASSWORD = hashPassword(staleEnvPassword);
+
+    // Existing Firestore Maker credentials (pscrappers + makerPass) STILL succeed!
+    const stillValidMaker = await fetch(`${origin}/api/auth/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'XMLHttpRequest' },
+      body: JSON.stringify({ username: 'pscrappers', password: makerPass }),
+    });
+    assert.equal(
+      stillValidMaker.status,
+      200,
+      'Firestore Maker credentials must remain authoritative even when stale ADMIN_PASSWORD/ADMIN_USERNAME env vars exist'
+    );
+
+    // Stale env password MUST be rejected
+    const staleRejected = await fetch(`${origin}/api/auth/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'XMLHttpRequest' },
+      body: JSON.stringify({ username: 'pscrappers', password: staleEnvPassword }),
+    });
+    assert.equal(staleRejected.status, 401, 'Stale env ADMIN_PASSWORD must not authenticate once Firestore credentials exist');
+
+    // Rotating Maker password via /api/admin/rotate-maker-password succeeds EVEN WITH stale ADMIN_PASSWORD in env,
+    // updates ONLY Firestore makerPasswordHash, and invalidates prior sessions via sessionVersion
+    const rotatedMakerPass = `FreshMaker@${crypto.randomBytes(6).toString('hex')}`;
+    const rotMaker = await fetch(`${origin}/api/admin/rotate-maker-password`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Requested-With': 'XMLHttpRequest',
+        Authorization: `Bearer ${adminJson.token}`,
+      },
+      body: JSON.stringify({ currentMainPassword: adminPass, newMakerPassword: rotatedMakerPass }),
+    });
+    assert.equal(rotMaker.status, 200);
+
     const invalidatedMaker = await fetch(`${origin}/api/certificates/recent`, {
       headers: { Authorization: `Bearer ${makerJson.token}` },
     });
-    assert.equal(invalidatedMaker.status, 401, 'Rotating env password must invalidate prior Maker sessions');
-    const invalidatedAdmin = await fetch(`${origin}/api/admin/stats`, {
-      headers: { Authorization: `Bearer ${adminJson.token}` },
+    assert.equal(invalidatedMaker.status, 401, 'Rotating Maker password in Firestore must invalidate prior Maker sessions');
+
+    const newMakerLogin = await fetch(`${origin}/api/auth/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'XMLHttpRequest' },
+      body: JSON.stringify({ username: 'pscrappers', password: rotatedMakerPass }),
     });
-    assert.equal(invalidatedAdmin.status, 401, 'Rotating env password must invalidate prior Admin sessions');
+    assert.equal(newMakerLogin.status, 200, 'Login with newly rotated Firestore Maker password must succeed');
   } finally {
     await new Promise<void>((resolve) => envServer.close(() => resolve()));
     for (const [k, v] of Object.entries(savedEnv)) {
@@ -1132,6 +1222,361 @@ async function runMakerOnlyRotationTests(): Promise<void> {
     assert.equal(adminStillWorks.status, 200);
   } finally {
     await new Promise<void>((resolve) => rotServer.close(() => resolve()));
+    resetStoreForTesting();
+  }
+}
+
+async function runMakerEditDeleteAndVerifyTests(): Promise<void> {
+  const crypto = await import('node:crypto');
+  const { resetStoreForTesting } = await import('../src/server/store.js');
+  resetStoreForTesting();
+
+  const app = createApiApp();
+  const srv = http.createServer(app);
+  await new Promise<void>((resolve) => srv.listen(0, '127.0.0.1', resolve));
+  const addr = srv.address();
+  if (!addr || typeof addr === 'string') throw new Error('Failed to bind Maker edit/delete test server');
+  const origin = `http://127.0.0.1:${addr.port}`;
+
+  const makerPass = `MakerEdit@${crypto.randomBytes(4).toString('hex')}`;
+  const mainAdminPass = `AdminEdit@${crypto.randomBytes(4).toString('hex')}`;
+  const protectedPass = `ProtEdit@${crypto.randomBytes(4).toString('hex')}`;
+
+  async function callApi(
+    path: string,
+    opts: { method?: string; token?: string; body?: unknown; skipCsrf?: boolean; headers?: Record<string, string> } = {}
+  ) {
+    const headers: Record<string, string> = { ...(opts.headers ?? {}) };
+    if (!opts.skipCsrf) headers['X-Requested-With'] = 'XMLHttpRequest';
+    if (opts.body !== undefined) headers['Content-Type'] = 'application/json';
+    if (opts.token) headers['Authorization'] = `Bearer ${opts.token}`;
+    const res = await fetch(`${origin}${path}`, {
+      method: opts.method ?? 'GET',
+      headers,
+      body: opts.body !== undefined ? JSON.stringify(opts.body) : undefined,
+    });
+    const json = (await res.json()) as Record<string, unknown>;
+    return { status: res.status, json };
+  }
+
+  try {
+    // 1. Bootstrap & log in as Maker
+    const boot = await callApi('/api/auth/bootstrap', {
+      method: 'POST',
+      body: {
+        makerUsername: 'pscrappers',
+        makerPassword: makerPass,
+        mainAdminPassword: mainAdminPass,
+        protectedPassword: protectedPass,
+      },
+    });
+    assert.equal(boot.status, 201);
+
+    const login = await callApi('/api/auth/login', {
+      method: 'POST',
+      body: { username: 'pscrappers', password: makerPass },
+    });
+    assert.equal(login.status, 200);
+    const makerToken = String(login.json.token);
+
+    const adminUnlock = await callApi('/api/auth/admin-unlock', {
+      method: 'POST',
+      body: { password: mainAdminPass },
+    });
+    assert.equal(adminUnlock.status, 200);
+    const adminToken = String(adminUnlock.json.token);
+
+    // 2. Create 6 certificates (1..5 omit rtoAuthority; #6 simulates an existing legacy record with rtoAuthority)
+    const created: Array<Record<string, unknown>> = [];
+    for (let i = 1; i <= 6; i++) {
+      const res = await callApi('/api/certificates', {
+        method: 'POST',
+        token: makerToken,
+        headers: { 'Idempotency-Key': `maker_ed_cert_${i}` },
+        body: {
+          issueDate: '2026-11-27',
+          handoverDate: '2026-11-26',
+          ownerName: `Maker Owner ${i}`,
+          ownerAddress: i % 2 === 0 ? `Sector ${i}, Faridabad` : '',
+          vehicleRegNumber: `HR51AB200${i}`,
+          make: 'Maruti Suzuki',
+          model: 'Alto K10',
+          manufactureYear: 2011,
+          chassisNumber: `MA3EJKD1S0098765${i}`,
+          engineNumber: `K10BN654321${i}`,
+          unhideChassisEngine: false,
+          ...(i === 6 ? { rtoAuthority: 'Legacy RTO Faridabad (HR-51)' } : {}),
+          remarks: 'Test record',
+        },
+      });
+      assert.equal(res.status, 201);
+      created.push(res.json.certificate as Record<string, unknown>);
+      // Small delay so createdAt ordering is strictly deterministic across all 6 records
+      await new Promise((r) => setTimeout(r, 5));
+    }
+
+    const oldestCert = created[0]; // outside Maker latest-5
+    const recentNoRtoCert = created[4]; // within Maker latest-5, no RTO
+    const recentLegacyRtoCert = created[5]; // within Maker latest-5, has legacy RTO
+
+    // 3. Public verification succeeds for BOTH RTO-free certificate and legacy-RTO certificate, and fails cleanly for invalid cert
+    const verifyNoRto = await callApi(
+      `/api/verify?certificateNumber=${encodeURIComponent(String(recentNoRtoCert.certificateNumber))}&token=${encodeURIComponent(String(recentNoRtoCert.qrToken))}`
+    );
+    assert.equal(verifyNoRto.status, 200);
+    assert.equal(verifyNoRto.json.found, true);
+    assert.equal(verifyNoRto.json.verified, true);
+    assert.equal(verifyNoRto.json.integrityMatch, true);
+
+    const verifyLegacyRto = await callApi(
+      `/api/verify?certificateNumber=${encodeURIComponent(String(recentLegacyRtoCert.certificateNumber))}&token=${encodeURIComponent(String(recentLegacyRtoCert.qrToken))}`
+    );
+    assert.equal(verifyLegacyRto.status, 200);
+    assert.equal(verifyLegacyRto.json.found, true);
+    assert.equal(verifyLegacyRto.json.verified, true);
+    assert.equal(verifyLegacyRto.json.integrityMatch, true);
+
+    const verifyInvalid = await callApi('/api/verify?certificateNumber=PS%2F26%2FR0000000');
+    assert.equal(verifyInvalid.status, 404);
+    assert.equal(verifyInvalid.json.found, false);
+    assert.equal(verifyInvalid.json.verified, false);
+    assert.equal(verifyInvalid.json.integrityMatch, false);
+
+    // 4. Unauthenticated public users are strictly rejected on PUT and DELETE
+    const unauthPut = await callApi(`/api/certificates/${recentNoRtoCert.id}`, {
+      method: 'PUT',
+      body: { ownerName: 'Hacked Owner' },
+    });
+    assert.equal(unauthPut.status, 401, 'Unauthenticated PUT /api/certificates/:id must return 401');
+
+    const unauthDelete = await callApi(`/api/certificates/${recentNoRtoCert.id}`, {
+      method: 'DELETE',
+    });
+    assert.equal(unauthDelete.status, 401, 'Unauthenticated DELETE /api/certificates/:id must return 401');
+
+    const csrfBlockedDelete = await callApi(`/api/certificates/${recentNoRtoCert.id}`, {
+      method: 'DELETE',
+      skipCsrf: true,
+      headers: { Origin: 'https://evil.example' },
+    });
+    assert.equal(csrfBlockedDelete.status, 403, 'Cross-site DELETE without CSRF header must return 403');
+
+    // 5. Maker cannot edit or delete older certificates outside latest-5 scope (403)
+    const makerEditOld = await callApi(`/api/certificates/${oldestCert.id}`, {
+      method: 'PUT',
+      token: makerToken,
+      body: { ownerName: 'Should Fail' },
+    });
+    assert.equal(makerEditOld.status, 403, 'Maker must receive 403 when editing outside latest-5');
+
+    const makerDeleteOld = await callApi(`/api/certificates/${oldestCert.id}`, {
+      method: 'DELETE',
+      token: makerToken,
+    });
+    assert.equal(makerDeleteOld.status, 403, 'Maker must receive 403 when deleting outside latest-5');
+
+    // 6. Authenticated Maker edits a recent certificate (and legacy-RTO certificate) cleanly without password re-entry
+    const makerEdit = await callApi(`/api/certificates/${recentLegacyRtoCert.id}`, {
+      method: 'PUT',
+      token: makerToken,
+      body: {
+        ownerName: 'Corrected Maker Owner 6',
+        vehicleRegNumber: 'HR51AB9996',
+        reason: 'Corrected typo in owner name and registration number',
+      },
+    });
+    assert.equal(makerEdit.status, 200);
+    const updatedCert = makerEdit.json.certificate as Record<string, unknown>;
+    assert.equal(updatedCert.certificateNumber, recentLegacyRtoCert.certificateNumber, 'Certificate number must be preserved');
+    assert.equal(updatedCert.scrappingRegNumber, recentLegacyRtoCert.scrappingRegNumber, 'Scrapping reg number must be preserved');
+    assert.equal(updatedCert.ownerName, 'Corrected Maker Owner 6');
+    assert.equal(updatedCert.vehicleRegNumber, 'HR51AB9996');
+    assert.equal(updatedCert.version, 2);
+    assert.equal((updatedCert.versionHistory as unknown[]).length, 1);
+    assert.notEqual(updatedCert.canonicalHash, recentLegacyRtoCert.canonicalHash);
+    assert.notEqual(updatedCert.qrToken, recentLegacyRtoCert.qrToken);
+
+    // Public verification passes with the updated certificate and rotated QR token
+    const verifyAfterEdit = await callApi(
+      `/api/verify?certificateNumber=${encodeURIComponent(String(updatedCert.certificateNumber))}&token=${encodeURIComponent(String(updatedCert.qrToken))}`
+    );
+    assert.equal(verifyAfterEdit.status, 200);
+    assert.equal(verifyAfterEdit.json.verified, true);
+    assert.equal(verifyAfterEdit.json.integrityMatch, true);
+    assert.equal(verifyAfterEdit.json.tokenMatch, true);
+    assert.equal(verifyAfterEdit.json.ownerName, 'Corrected Maker Owner 6');
+
+    // 7. Authenticated Maker deletes a recent certificate WITHOUT password re-entry
+    const makerDel = await callApi(`/api/certificates/${recentNoRtoCert.id}`, {
+      method: 'DELETE',
+      token: makerToken,
+    });
+    assert.equal(makerDel.status, 200);
+    assert.equal(makerDel.json.success, true);
+    assert.equal(makerDel.json.deletedId, recentNoRtoCert.id);
+    assert.equal(makerDel.json.certificateNumber, recentNoRtoCert.certificateNumber);
+    assert.equal(makerDel.json.deletedBy, 'pscrappers');
+    assert.ok(typeof makerDel.json.deletedAt === 'string' && makerDel.json.deletedAt.length > 0);
+
+    // Confirm record is SOFT_DELETED in admin registry (preserving auditability & number reservations)
+    const adminCheckDeleted = await callApi(
+      `/api/admin/certificates?search=${encodeURIComponent(String(recentNoRtoCert.certificateNumber))}&status=SOFT_DELETED`,
+      { token: adminToken }
+    );
+    assert.equal(adminCheckDeleted.status, 200);
+    assert.equal(adminCheckDeleted.json.total, 1, 'Maker-deleted certificate should remain soft-deleted in admin ledger');
+
+    // Deleted certificate no longer appears in Maker's recent list or passes public verification
+    const recentAfterDel = await callApi('/api/certificates/recent', { token: makerToken });
+    assert.equal(recentAfterDel.status, 200);
+    const recentIds = (recentAfterDel.json.certificates as Array<Record<string, unknown>>).map((c) => String(c.id));
+    assert.equal(recentIds.includes(String(recentNoRtoCert.id)), false, 'Deleted cert must not appear in recent list');
+
+    const verifyDeleted = await callApi(
+      `/api/verify?certificateNumber=${encodeURIComponent(String(recentNoRtoCert.certificateNumber))}`
+    );
+    assert.equal(verifyDeleted.status, 404);
+    assert.equal(verifyDeleted.json.found, false);
+    assert.equal(verifyDeleted.json.verified, false);
+
+    // Verify audit logs captured both CERTIFICATE_EDITED and CERTIFICATE_SOFT_DELETED
+    const auditLogs = await callApi('/api/admin/audit-logs?limit=25', { token: adminToken });
+    assert.equal(auditLogs.status, 200);
+    const actions = (auditLogs.json.logs as Array<Record<string, unknown>>).map((l) => String(l.action));
+    assert.ok(actions.includes('CERTIFICATE_EDITED'), 'Audit log must record Maker edit');
+    assert.ok(actions.includes('CERTIFICATE_SOFT_DELETED'), 'Audit log must record Maker soft delete');
+  } finally {
+    await new Promise<void>((resolve) => srv.close(() => resolve()));
+    resetStoreForTesting();
+  }
+}
+
+async function runAuthDiagnosticsTests(): Promise<void> {
+  const crypto = await import('node:crypto');
+  const { getStore, resetStoreForTesting } = await import('../src/server/store.js');
+  const { hashPassword } = await import('../src/server/crypto.js');
+  resetStoreForTesting();
+
+  const capturedLogs: string[] = [];
+  const origWarn = console.warn;
+  console.warn = (...args: unknown[]) => {
+    capturedLogs.push(args.map(String).join(' '));
+  };
+
+  const diagApp = createApiApp();
+  const diagServer = http.createServer(diagApp);
+  await new Promise<void>((resolve) => diagServer.listen(0, '127.0.0.1', resolve));
+  const addr = diagServer.address();
+  if (!addr || typeof addr === 'string') throw new Error('Failed to bind diagnostics test server');
+  const origin = `http://127.0.0.1:${addr.port}`;
+
+  const secretMakerPass = `DiagSecret@${crypto.randomBytes(4).toString('hex')}`;
+  const secretAdminPass = `DiagAdmin@${crypto.randomBytes(4).toString('hex')}`;
+
+  try {
+    // 1. MISSING_FIRESTORE_CREDENTIALS on empty store
+    const missingRes = await fetch(`${origin}/api/auth/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'XMLHttpRequest' },
+      body: JSON.stringify({ username: 'pscrappers', password: secretMakerPass }),
+    });
+    assert.equal(missingRes.status, 503);
+    assert.ok(
+      capturedLogs.some((l) => l.includes('MISSING_FIRESTORE_CREDENTIALS')),
+      'Expected MISSING_FIRESTORE_CREDENTIALS diagnostic'
+    );
+
+    // 2. INVALID_PASSWORD_HASH_FORMAT when stored makerPasswordHash is corrupted
+    const store = getStore();
+    await store.saveCredentials({
+      makerUsername: 'pscrappers',
+      makerPasswordHash: 'scrypt$bad_salt$not_valid_hex',
+      mainAdminPasswordHash: hashPassword(secretAdminPass),
+      protectedPasswordHash: hashPassword(secretAdminPass),
+      deletePasswordHash: hashPassword(secretAdminPass),
+      sessionVersion: 1,
+      bootstrappedAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    });
+    const invalidFmtRes = await fetch(`${origin}/api/auth/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'XMLHttpRequest' },
+      body: JSON.stringify({ username: 'pscrappers', password: secretMakerPass }),
+    });
+    assert.equal(invalidFmtRes.status, 500);
+    const invalidFmtText = await invalidFmtRes.text();
+    assert.equal(invalidFmtText.includes('scrypt$'), false, 'Public response must never expose hash');
+    assert.ok(
+      capturedLogs.some((l) => l.includes('INVALID_PASSWORD_HASH_FORMAT')),
+      'Expected INVALID_PASSWORD_HASH_FORMAT diagnostic'
+    );
+
+    // 3. Valid hash saved -> test INCORRECT_USERNAME vs INCORRECT_PASSWORD
+    const validHash = hashPassword(secretMakerPass);
+    await store.saveCredentials({
+      makerUsername: 'pscrappers',
+      makerPasswordHash: validHash,
+      mainAdminPasswordHash: hashPassword(secretAdminPass),
+      protectedPasswordHash: hashPassword(secretAdminPass),
+      deletePasswordHash: hashPassword(secretAdminPass),
+      sessionVersion: 1,
+      bootstrappedAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    });
+
+    const wrongUserRes = await fetch(`${origin}/api/auth/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'XMLHttpRequest' },
+      body: JSON.stringify({ username: 'wrong_user', password: secretMakerPass }),
+    });
+    assert.equal(wrongUserRes.status, 401);
+    assert.ok(
+      capturedLogs.some((l) => l.includes('INCORRECT_USERNAME')),
+      'Expected INCORRECT_USERNAME diagnostic'
+    );
+
+    const wrongPassRes = await fetch(`${origin}/api/auth/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'XMLHttpRequest' },
+      body: JSON.stringify({ username: 'pscrappers', password: 'WrongPassword#99' }),
+    });
+    assert.equal(wrongPassRes.status, 401);
+    assert.ok(
+      capturedLogs.some((l) => l.includes('INCORRECT_PASSWORD')),
+      'Expected INCORRECT_PASSWORD diagnostic'
+    );
+
+    // 4. Logout + Login again succeeds cleanly
+    const okLogin1 = await fetch(`${origin}/api/auth/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'XMLHttpRequest' },
+      body: JSON.stringify({ username: 'pscrappers', password: secretMakerPass }),
+    });
+    assert.equal(okLogin1.status, 200);
+    const { token: tok1 } = (await okLogin1.json()) as { token: string };
+
+    const logoutRes = await fetch(`${origin}/api/auth/logout`, {
+      method: 'POST',
+      headers: { 'X-Requested-With': 'XMLHttpRequest', Authorization: `Bearer ${tok1}` },
+    });
+    assert.equal(logoutRes.status, 200);
+
+    const okLogin2 = await fetch(`${origin}/api/auth/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'XMLHttpRequest' },
+      body: JSON.stringify({ username: 'pscrappers', password: secretMakerPass }),
+    });
+    assert.equal(okLogin2.status, 200);
+
+    // 5. Verify ZERO secrets, plaintext passwords, or scrypt hashes leaked into diagnostic logs
+    const joinedLogs = capturedLogs.join('\n');
+    assert.equal(joinedLogs.includes(secretMakerPass), false, 'Logs must never contain plaintext Maker password');
+    assert.equal(joinedLogs.includes(secretAdminPass), false, 'Logs must never contain plaintext Admin password');
+    assert.equal(joinedLogs.includes(validHash), false, 'Logs must never contain scrypt hashes');
+    assert.equal(joinedLogs.includes('WrongPassword#99'), false, 'Logs must never contain attempted passwords');
+  } finally {
+    console.warn = origWarn;
+    await new Promise<void>((resolve) => diagServer.close(() => resolve()));
     resetStoreForTesting();
   }
 }

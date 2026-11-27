@@ -11,19 +11,42 @@ const ephemeralFallbackSecret = crypto.randomBytes(32).toString('hex');
 function getSessionSecret(): Buffer {
   const configured = process.env.ADMIN_SESSION_SECRET?.trim();
   const baseSecret = configured && configured.length >= 16 ? configured : ephemeralFallbackSecret;
-  // Bind signing key to env-managed credential values so rotating ADMIN_PASSWORD,
-  // MAIN_ADMIN_PASSWORD, ADMIN_USERNAME, or ADMIN_SESSION_SECRET in Vercel
-  // immediately invalidates all previously issued session tokens.
+  // Bind signing key to ADMIN_SESSION_SECRET and MAIN_ADMIN_PASSWORD (when env-managed).
+  // Maker password rotations invalidate all prior sessions globally via Firestore sessionVersion.
   return crypto
     .createHash('sha256')
     .update(baseSecret)
     .update('|')
-    .update(process.env.ADMIN_USERNAME?.trim() || '')
-    .update('|')
-    .update(process.env.ADMIN_PASSWORD?.trim() || '')
-    .update('|')
     .update(process.env.MAIN_ADMIN_PASSWORD?.trim() || '')
     .digest();
+}
+
+export type PasswordHashValidationResult =
+  | { valid: true; salt: string; keyHex: string }
+  | { valid: false; reason: string };
+
+export function validateScryptHashFormat(storedHash: unknown): PasswordHashValidationResult {
+  if (typeof storedHash !== 'string' || storedHash.length === 0) {
+    return { valid: false, reason: 'hash_missing_or_empty' };
+  }
+  if (storedHash !== storedHash.trim()) {
+    return { valid: false, reason: 'hash_has_leading_or_trailing_whitespace' };
+  }
+  const parts = storedHash.split('$');
+  if (parts.length !== 3) {
+    return { valid: false, reason: `invalid_segment_count_${parts.length}` };
+  }
+  const [algorithm, salt, keyHex] = parts;
+  if (algorithm !== 'scrypt') {
+    return { valid: false, reason: 'unsupported_algorithm_prefix' };
+  }
+  if (!salt || salt.length < 16 || /\s/.test(salt)) {
+    return { valid: false, reason: 'invalid_salt_format' };
+  }
+  if (!keyHex || keyHex.length !== SCRYPT_KEYLEN * 2 || !/^[0-9a-fA-F]+$/.test(keyHex)) {
+    return { valid: false, reason: 'invalid_derived_key_hex_format' };
+  }
+  return { valid: true, salt, keyHex };
 }
 
 export function hashPassword(plainPassword: string): string {
@@ -34,14 +57,12 @@ export function hashPassword(plainPassword: string): string {
 
 export function verifyPassword(plainPassword: string, storedHash: string): boolean {
   if (!plainPassword || !storedHash) return false;
-  const parts = storedHash.split('$');
-  if (parts.length !== 3 || parts[0] !== 'scrypt') return false;
-  const [, salt, keyHex] = parts;
-  if (!salt || !keyHex) return false;
+  const parsed = validateScryptHashFormat(storedHash);
+  if (!parsed.valid) return false;
 
   try {
-    const derived = crypto.scryptSync(plainPassword, salt, SCRYPT_KEYLEN, SCRYPT_PARAMS);
-    const expected = Buffer.from(keyHex, 'hex');
+    const derived = crypto.scryptSync(plainPassword, parsed.salt, SCRYPT_KEYLEN, SCRYPT_PARAMS);
+    const expected = Buffer.from(parsed.keyHex, 'hex');
     if (derived.length !== expected.length) return false;
     return crypto.timingSafeEqual(derived, expected);
   } catch {
@@ -190,7 +211,7 @@ export function computeCanonicalHash(
     manufactureYear: Number(cert.manufactureYear),
     chassisNumber: cert.chassisNumber.trim().toUpperCase(),
     engineNumber: cert.engineNumber.trim().toUpperCase(),
-    rtoAuthority: cert.rtoAuthority.trim().toUpperCase(),
+    rtoAuthority: (cert.rtoAuthority ?? '').trim().toUpperCase(),
     facilityRvsfCode: cert.facilityRvsfCode.trim().toUpperCase(),
     qrToken: cert.qrToken,
   };
