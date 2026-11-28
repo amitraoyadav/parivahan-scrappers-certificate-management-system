@@ -11,6 +11,7 @@
     "clean": "node -e \"const fs=require('fs');fs.rmSync('dist',{recursive:true,force:true});fs.rmSync('server.js',{force:true});\"",
     "lint": "tsc --noEmit",
     "scan:predeploy": "tsx scripts/predeploy-scan.ts",
+    "audit:db": "tsx scripts/audit-database.ts",
     "test:security": "tsx scripts/verify-system.ts",
     "test:firestore": "tsx scripts/test-firestore.ts",
     "hash:password": "tsx scripts/hash-password.ts",

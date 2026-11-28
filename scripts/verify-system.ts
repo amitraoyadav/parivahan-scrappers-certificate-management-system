@@ -288,12 +288,15 @@ async function runTests(): Promise<void> {
     assert.equal(restoreSoft.status, 200);
     assert.equal((restoreSoft.json.certificate as Record<string, unknown>).status, 'ACTIVE');
 
-    // Permanent delete requires exact phrase + protected delete password and never frees reserved numbers
+    // Permanent delete requires fresh Main Core Admin password + Protected Delete password + exact cert number + exact phrase
+    const deletedCertSnapshot = createdList[3].json.certificate as Record<string, unknown>;
     const badPermPhrase = await req(`/api/admin/certificates/${certIds[3]}`, {
       method: 'DELETE',
       token: adminToken,
       body: {
+        mainAdminPassword: 'MainAdmin#2026Secure',
         deletePassword: 'ProtectedAction#2026',
+        confirmCertificateNumber: String(deletedCertSnapshot.certificateNumber),
         reason: 'Testing permanent deletion confirmation phrase',
         permanent: true,
         confirmPhrase: 'DELETE',
@@ -301,12 +304,40 @@ async function runTests(): Promise<void> {
     });
     assert.equal(badPermPhrase.status, 400);
 
-    const deletedCertSnapshot = createdList[3].json.certificate as Record<string, unknown>;
-    const permDel = await req(`/api/admin/certificates/${certIds[3]}`, {
+    const missingMainPass = await req(`/api/admin/certificates/${certIds[3]}`, {
       method: 'DELETE',
       token: adminToken,
       body: {
         deletePassword: 'ProtectedAction#2026',
+        confirmCertificateNumber: String(deletedCertSnapshot.certificateNumber),
+        reason: 'Testing missing fresh Main Core Admin password',
+        permanent: true,
+        confirmPhrase: 'PERMANENT DELETE',
+      },
+    });
+    assert.equal(missingMainPass.status, 403);
+
+    const wrongCertNumber = await req(`/api/admin/certificates/${certIds[3]}`, {
+      method: 'DELETE',
+      token: adminToken,
+      body: {
+        mainAdminPassword: 'MainAdmin#2026Secure',
+        deletePassword: 'ProtectedAction#2026',
+        confirmCertificateNumber: 'PS/26/R0000000',
+        reason: 'Testing mismatched certificate number confirmation',
+        permanent: true,
+        confirmPhrase: 'PERMANENT DELETE',
+      },
+    });
+    assert.equal(wrongCertNumber.status, 400);
+
+    const permDel = await req(`/api/admin/certificates/${certIds[3]}`, {
+      method: 'DELETE',
+      token: adminToken,
+      body: {
+        mainAdminPassword: 'MainAdmin#2026Secure',
+        deletePassword: 'ProtectedAction#2026',
+        confirmCertificateNumber: String(deletedCertSnapshot.certificateNumber),
         reason: 'Authorized permanent purge with safety backup',
         permanent: true,
         confirmPhrase: 'PERMANENT DELETE',
@@ -506,7 +537,25 @@ async function runTests(): Promise<void> {
       '✓ 23. Maker cookie session, serverless cross-instance signing, /api/certificates/next-numbers non-consumption, certificate issuance, PDF filename, logout revocation & secret-free diagnostics verified'
     );
 
-    console.log('\nALL 23 ISOLATED STAGING, SESSION, AUTH PRECEDENCE, DIAGNOSTICS, SPARK-FIRESTORE, BACKUP/RESTORE, PDF, MAKER EDIT/DELETE & SECURITY CHECKS PASSED.\n');
+    // 24. Optional Address & ID Proof PDF Layout (6 Scenarios), Issuing Facility Removal & Simplified Manufacturer List
+    await runPdfOptionalFieldsAndManufacturersTests();
+    console.log(
+      '✓ 24. Optional Address/ID PDF layout (all 6 scenarios), Issuing Facility removal & simplified manufacturer list verified'
+    );
+
+    // 25. Two-Brand Certificate System (Parivahan Scrappers + PIN-Protected Scrap Route) & Remember Me Sessions
+    await runTwoBrandScrapRouteAndRememberMeTests();
+    console.log(
+      '✓ 25. Two-brand issuance (Parivahan & Scrap Route), server-side PIN + rate limit, PDF branding isolation, QR verification, brand immutability & 30-day Remember Me verified'
+    );
+
+    // 26. Permanent Data Protection, Immutable Version History, Archive/Restore, Integrity Gate, Staging Backup Verification & Owner Export
+    await runDataProtectionIntegrityAndRecoveryTests();
+    console.log(
+      '✓ 26. Permanent data protection (read-back verification, immutable v1 & append-only history, Maker archive-only, integrity-gated permanent delete, staging restore verification, owner JSON export & read-only integrity monitor) verified'
+    );
+
+    console.log('\nALL 26 ISOLATED STAGING, DATA PROTECTION, INTEGRITY, RECOVERY, SESSION, AUTH, SPARK-FIRESTORE, PDF, TWO-BRAND & SECURITY CHECKS PASSED.\n');
   } finally {
     await new Promise<void>((resolve) => server.close(() => resolve()));
   }
@@ -1993,6 +2042,1050 @@ async function runMakerSessionAndNextNumbersTests(): Promise<void> {
     console.warn = origWarn;
     await new Promise<void>((resolve) => serverA.close(() => resolve()));
     await new Promise<void>((resolve) => serverB.close(() => resolve()));
+    for (const [k, v] of Object.entries(savedEnv)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+    resetStoreForTesting();
+  }
+}
+
+async function runPdfOptionalFieldsAndManufacturersTests(): Promise<void> {
+  const { buildCertificatePdfDoc } = await import('../src/lib/pdfGenerator.js');
+  const { COMMON_MANUFACTURERS, OTHER_MANUFACTURER_VALUE } = await import(
+    '../src/shared/vehicleData.js'
+  );
+
+  // Verify exact simplified manufacturer list
+  assert.deepEqual([...COMMON_MANUFACTURERS], [
+    'Hero MotoCorp',
+    'Yamaha',
+    'Bajaj',
+    'HERO',
+    'HERO HONDA',
+    'TVS',
+    'Royal Enfield',
+    'Suzuki',
+  ]);
+  assert.equal(OTHER_MANUFACTURER_VALUE, '__OTHER__');
+
+  const extractPdfPageText = (doc: { internal: { pages: string[][] } }): string =>
+    (doc.internal.pages[1] ?? []).join('\n');
+
+  const baseCert = {
+    id: 'cert-pdf-test',
+    certificateNumber: 'PS-26-TEST0001',
+    scrappingRegNumber: 'SCR-26-TEST0001',
+    issueDate: '2026-11-27',
+    handoverDate: '2026-11-26',
+    ownerName: 'Rajesh Sharma',
+    ownerAddress: '',
+    idProofType: '' as const,
+    idProofNumber: '',
+    vehicleRegNumber: 'DL01AB1234',
+    make: 'Hero MotoCorp',
+    model: 'Splendor Plus',
+    manufactureYear: 2013,
+    chassisNumber: 'MBLHA10EYD9A12345',
+    engineNumber: 'HA10EJD9A12345',
+    unhideChassisEngine: false,
+    facilityName: 'Parivahan Scrappers Authorized RVSF',
+    facilityRvsfCode: 'PS-RVSF-DEL-01',
+    facilityAddress: 'B12, Dwarka, New Delhi.',
+    remarks: '',
+    status: 'ACTIVE' as const,
+    version: 1,
+    canonicalHash: 'a'.repeat(64),
+    qrToken: 'tok_test_123456',
+    createdAt: '2026-11-27T00:00:00.000Z',
+    updatedAt: '2026-11-27T00:00:00.000Z',
+    createdBy: 'test-maker',
+    createdByRole: 'maker' as const,
+    driveSyncStatus: 'NOT_CONFIGURED' as const,
+    versionHistory: [],
+  };
+
+  const assertCommonPdfInvariants = (
+    doc: { getNumberOfPages: () => number; output: (type: 'arraybuffer') => ArrayBuffer },
+    pageStream: string
+  ) => {
+    assert.equal(doc.getNumberOfPages(), 1, 'Certificate PDF must remain a single A4 page');
+    const bytes = Buffer.from(doc.output('arraybuffer'));
+    assert.equal(bytes.subarray(0, 5).toString('utf8'), '%PDF-');
+    assert.equal(pageStream.includes('Issuing Facility'), false, 'PDF must not include Issuing Facility');
+    assert.equal(
+      pageStream.includes('Parivahan Scrappers Authorized RVSF'),
+      false,
+      'PDF must not include Parivahan Scrappers Authorized RVSF'
+    );
+    assert.equal(pageStream.includes('Not Provided'), false, 'PDF must never print Not Provided');
+    assert.equal(pageStream.includes('(N/A)'), false, 'PDF must never print N/A');
+  };
+
+  // Case 1: Address and ID both provided
+  const case1 = await buildCertificatePdfDoc(
+    {
+      ...baseCert,
+      ownerAddress: '45 Green Park Extension, New Delhi 110016',
+      idProofType: 'Aadhaar Card',
+      idProofNumber: 'XXXX-XXXX-9012',
+    },
+    { customDomain: 'https://parivahan.example.test' }
+  );
+  const stream1 = extractPdfPageText(case1.doc as unknown as { internal: { pages: string[][] } });
+  assertCommonPdfInvariants(case1.doc, stream1);
+  assert.ok(stream1.includes('(Address)'), 'Case 1 must include Address label');
+  assert.ok(stream1.includes('45 Green Park Extension'), 'Case 1 must include address value');
+  assert.ok(stream1.includes('(ID Proof Number)'), 'Case 1 must include ID Proof Number label');
+  assert.ok(stream1.includes('Aadhaar Card: XXXX-XXXX-9012'), 'Case 1 must include ID value');
+
+  // Case 2: Address and ID both blank
+  const case2 = await buildCertificatePdfDoc(
+    {
+      ...baseCert,
+      ownerAddress: '   ',
+      idProofType: '',
+      idProofNumber: '',
+    },
+    { customDomain: 'https://parivahan.example.test' }
+  );
+  const stream2 = extractPdfPageText(case2.doc as unknown as { internal: { pages: string[][] } });
+  assertCommonPdfInvariants(case2.doc, stream2);
+  assert.equal(stream2.includes('(Address)'), false, 'Case 2 must hide Address label when blank');
+  assert.equal(
+    stream2.includes('(ID Proof Number)'),
+    false,
+    'Case 2 must hide ID Proof Number label when blank'
+  );
+
+  // Case 3: Only Address provided (ID blank)
+  const case3 = await buildCertificatePdfDoc(
+    {
+      ...baseCert,
+      ownerAddress: 'Plot 19, Sector 14, Gurugram',
+      idProofType: 'PAN Card',
+      idProofNumber: '   ',
+    },
+    { customDomain: 'https://parivahan.example.test' }
+  );
+  const stream3 = extractPdfPageText(case3.doc as unknown as { internal: { pages: string[][] } });
+  assertCommonPdfInvariants(case3.doc, stream3);
+  assert.ok(stream3.includes('(Address)'), 'Case 3 must show Address label');
+  assert.ok(stream3.includes('Plot 19, Sector 14, Gurugram'), 'Case 3 must show address value');
+  assert.equal(
+    stream3.includes('(ID Proof Number)'),
+    false,
+    'Case 3 must hide ID Proof Number when ID number is blank'
+  );
+
+  // Case 4: Only ID provided (Address blank)
+  const case4 = await buildCertificatePdfDoc(
+    {
+      ...baseCert,
+      ownerAddress: '',
+      idProofType: 'PAN Card',
+      idProofNumber: 'ABCDE1234F',
+    },
+    { customDomain: 'https://parivahan.example.test' }
+  );
+  const stream4 = extractPdfPageText(case4.doc as unknown as { internal: { pages: string[][] } });
+  assertCommonPdfInvariants(case4.doc, stream4);
+  assert.equal(stream4.includes('(Address)'), false, 'Case 4 must hide Address label when blank');
+  assert.ok(stream4.includes('(ID Proof Number)'), 'Case 4 must show ID Proof Number label');
+  assert.ok(stream4.includes('PAN Card: ABCDE1234F'), 'Case 4 must show ID proof value');
+
+  // Case 5: Manufacturer selected from preset dropdown
+  const case5 = await buildCertificatePdfDoc(
+    {
+      ...baseCert,
+      make: 'Hero MotoCorp',
+    },
+    { customDomain: 'https://parivahan.example.test' }
+  );
+  const stream5 = extractPdfPageText(case5.doc as unknown as { internal: { pages: string[][] } });
+  assertCommonPdfInvariants(case5.doc, stream5);
+  assert.ok(stream5.includes('(Hero MotoCorp)'), 'Case 5 must print selected dropdown manufacturer');
+
+  // Case 6: Other selected with custom manufacturer name
+  const case6 = await buildCertificatePdfDoc(
+    {
+      ...baseCert,
+      make: 'Kawasaki Custom Motors',
+    },
+    { customDomain: 'https://parivahan.example.test' }
+  );
+  const stream6 = extractPdfPageText(case6.doc as unknown as { internal: { pages: string[][] } });
+  assertCommonPdfInvariants(case6.doc, stream6);
+  assert.ok(
+    stream6.includes('(Kawasaki Custom Motors)'),
+    'Case 6 must print exact custom manufacturer name'
+  );
+  assert.equal(stream6.includes('__OTHER__'), false, 'Case 6 must never print __OTHER__');
+}
+
+async function runTwoBrandScrapRouteAndRememberMeTests(): Promise<void> {
+  const crypto = await import('node:crypto');
+  const { getStore, resetStoreForTesting } = await import('../src/server/store.js');
+  const { computeCanonicalHash, generateQrToken, hashPassword } = await import('../src/server/crypto.js');
+  const { buildCertificatePdfDoc } = await import('../src/lib/pdfGenerator.js');
+
+  const savedEnv = {
+    SCRAP_ROUTE_PIN: process.env.SCRAP_ROUTE_PIN,
+    SCRAP_ROUTE_PIN_HASH: process.env.SCRAP_ROUTE_PIN_HASH,
+  };
+
+  resetStoreForTesting();
+  const store = getStore();
+
+  const makerPass = `TwoBrandMaker@${crypto.randomBytes(5).toString('hex')}`;
+  const adminPass = `TwoBrandAdmin@${crypto.randomBytes(5).toString('hex')}`;
+  const scrapRoutePin = `SR-${crypto.randomBytes(3).toString('hex').toUpperCase()}`;
+
+  // Configure SCRAP_ROUTE_PIN dynamically for test (never hardcoded)
+  process.env.SCRAP_ROUTE_PIN = scrapRoutePin;
+  delete process.env.SCRAP_ROUTE_PIN_HASH;
+
+  const app = createApiApp();
+  const srv = http.createServer(app);
+  await new Promise<void>((resolve) => srv.listen(0, '127.0.0.1', resolve));
+  const addr = srv.address();
+  if (!addr || typeof addr === 'string') throw new Error('Failed to start two-brand test server');
+  const origin = `http://127.0.0.1:${addr.port}`;
+
+  const extractPdfPageText = (doc: { internal: { pages: string[][] } }): string =>
+    (doc.internal.pages[1] ?? []).join('\n');
+
+  const extractCookies = (res: Response): string[] => {
+    const hdrs = res.headers as unknown as { getSetCookie?: () => string[] };
+    if (typeof hdrs.getSetCookie === 'function') return hdrs.getSetCookie();
+    const raw = res.headers.get('set-cookie');
+    return raw ? [raw] : [];
+  };
+
+  try {
+    await store.saveCredentials({
+      makerUsername: 'user-pscrappers',
+      makerPasswordHash: hashPassword(makerPass),
+      mainAdminPasswordHash: hashPassword(adminPass),
+      protectedPasswordHash: hashPassword(adminPass),
+      deletePasswordHash: hashPassword(adminPass),
+      sessionVersion: 1,
+      bootstrappedAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    });
+
+    // 1. Seed a legacy Parivahan certificate WITHOUT `brand` field to confirm 100% backward compatibility
+    const legacyToken = generateQrToken();
+    const legacyBase = {
+      certificateNumber: 'PS/26/R9991111',
+      scrappingRegNumber: 'REG-C991111',
+      issueDate: '2026-10-15',
+      handoverDate: '2026-10-14',
+      ownerName: 'Legacy Parivahan Owner',
+      ownerAddress: 'Rohini Sector 8, Delhi',
+      idProofType: 'PAN Card' as const,
+      idProofNumber: 'ABCDE1234F',
+      vehicleRegNumber: 'DL08CD4321',
+      make: 'Hero MotoCorp',
+      model: 'Splendor',
+      manufactureYear: 2012,
+      chassisNumber: 'MBLHA10EYC9A54321',
+      engineNumber: 'HA10EJC9A54321',
+      unhideChassisEngine: false,
+      facilityName: 'Parivahan Scrappers Authorized RVSF',
+      facilityRvsfCode: 'PS-RVSF-DEL-01',
+      facilityAddress: 'Industrial Area Phase II',
+      remarks: 'Legacy pre-two-brand record',
+      version: 1,
+      status: 'ACTIVE' as const,
+      qrToken: legacyToken,
+    };
+    const legacyHash = computeCanonicalHash(legacyBase);
+    await store.createCertificateAtomic({
+      certificate: {
+        ...legacyBase,
+        id: 'cert_legacy_no_brand',
+        canonicalHash: legacyHash,
+        qrToken: legacyToken,
+        createdAt: '2026-10-15T08:00:00.000Z',
+        updatedAt: '2026-10-15T08:00:00.000Z',
+        createdBy: 'user-pscrappers',
+        createdByRole: 'maker',
+        versionHistory: [],
+        driveSyncStatus: 'NOT_CONFIGURED',
+      },
+      idempotencyKey: 'legacy_seed_1',
+      auditLog: {
+        id: 'aud_legacy_seed_1',
+        timestamp: '2026-10-15T08:00:00.000Z',
+        actor: 'user-pscrappers',
+        actorRole: 'maker',
+        action: 'CERTIFICATE_CREATED',
+        certificateId: 'cert_legacy_no_brand',
+        certificateNumber: legacyBase.certificateNumber,
+      },
+    });
+
+    const verifyLegacy = await fetch(
+      `${origin}/api/verify?certificateNumber=${encodeURIComponent(legacyBase.certificateNumber)}&token=${encodeURIComponent(legacyToken)}`
+    );
+    assert.equal(verifyLegacy.status, 200);
+    const verifyLegacyJson = (await verifyLegacy.json()) as Record<string, unknown>;
+    assert.equal(verifyLegacyJson.verified, true, 'Legacy record without brand must still pass verification');
+    assert.equal(verifyLegacyJson.integrityMatch, true, 'Legacy SHA-256 hash must remain identical');
+    assert.equal(verifyLegacyJson.tokenMatch, true);
+    assert.equal(verifyLegacyJson.brand, 'parivahan');
+    assert.equal(verifyLegacyJson.brandDisplayName, 'Parivahan Scrappers');
+
+    // 2. Maker login with rememberMe: true creates a 30-day persistent cookie session
+    const loginRes = await fetch(`${origin}/api/auth/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'XMLHttpRequest' },
+      body: JSON.stringify({ username: 'user-pscrappers', password: makerPass, rememberMe: true }),
+    });
+    assert.equal(loginRes.status, 200);
+    const loginCookies = extractCookies(loginRes);
+    const sessionSetCookie = loginCookies.find((c) => c.startsWith('ps_session=')) || '';
+    assert.ok(sessionSetCookie.includes('HttpOnly'), 'Remember Me cookie must be HttpOnly');
+    assert.ok(sessionSetCookie.includes('Secure'), 'Remember Me cookie must be Secure');
+    assert.ok(sessionSetCookie.includes('SameSite=None'), 'Remember Me cookie must be SameSite=None');
+    assert.ok(sessionSetCookie.includes('Max-Age=2592000'), 'Remember Me cookie must have 30-day Max-Age');
+    const sessionCookiePair = sessionSetCookie.split(';')[0];
+    const loginJson = (await loginRes.json()) as {
+      token: string;
+      session: {
+        sid: string;
+        rememberMe?: boolean;
+        expiresAt: string;
+      };
+    };
+    assert.equal(loginJson.session.rememberMe, true);
+    const ttlMs = new Date(loginJson.session.expiresAt).getTime() - Date.now();
+    assert.ok(ttlMs > 29 * 24 * 60 * 60 * 1000, 'Remember Me session expiry must exceed 29 days');
+
+    // Confirm cookie-only automatic sign-in via /api/auth/status returns active session & Scrap Route PIN status
+    const statusRes = await fetch(`${origin}/api/auth/status`, {
+      headers: { Cookie: sessionCookiePair, 'X-Requested-With': 'XMLHttpRequest' },
+    });
+    assert.equal(statusRes.status, 200);
+    const statusJson = (await statusRes.json()) as {
+      session: { username: string; rememberMe?: boolean } | null;
+      scrapRouteAuthorized?: boolean;
+      scrapRoutePinConfigured?: boolean;
+    };
+    assert.equal(statusJson.session?.username, 'user-pscrappers');
+    assert.equal(statusJson.session?.rememberMe, true);
+    assert.equal(statusJson.scrapRouteAuthorized, false);
+    assert.equal(statusJson.scrapRoutePinConfigured, true);
+
+    // 3. Parivahan issuance works without Scrap Route PIN & PDF matches updated Parivahan branding
+    const psNextRes = await fetch(`${origin}/api/certificates/next-numbers?brand=parivahan&issueDate=2026-11-27`, {
+      headers: { Cookie: sessionCookiePair, 'X-Requested-With': 'XMLHttpRequest' },
+    });
+    assert.equal(psNextRes.status, 200);
+    const psNext = (await psNextRes.json()) as {
+      brand: string;
+      certificateNumber: string;
+      scrappingRegNumber: string;
+    };
+    assert.equal(psNext.brand, 'parivahan');
+    assert.match(psNext.certificateNumber, /^PS\/26\/R\d{7}$/);
+    assert.match(psNext.scrappingRegNumber, /^REG-C\d{6}$/);
+
+    const psCreateRes = await fetch(`${origin}/api/certificates`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Requested-With': 'XMLHttpRequest',
+        'Idempotency-Key': `ps_brand_${crypto.randomBytes(5).toString('hex')}`,
+        Cookie: sessionCookiePair,
+      },
+      body: JSON.stringify({
+        brand: 'parivahan',
+        certificateNumber: psNext.certificateNumber,
+        scrappingRegNumber: psNext.scrappingRegNumber,
+        issueDate: '2026-11-27',
+        handoverDate: '2026-11-26',
+        ownerName: 'Parivahan TwoBrand Owner',
+        ownerAddress: 'Janakpuri, New Delhi',
+        vehicleRegNumber: 'DL09PQ1122',
+        make: 'Bajaj',
+        model: 'Pulsar 150',
+        manufactureYear: 2014,
+        chassisNumber: 'MD2A11CZ0ECA11223',
+        engineNumber: 'DHYCE11223',
+        unhideChassisEngine: false,
+      }),
+    });
+    assert.equal(psCreateRes.status, 201);
+    const psCert = ((await psCreateRes.json()) as { certificate: Record<string, unknown> }).certificate;
+    assert.equal(psCert.brand, 'parivahan');
+
+    const psPdf = await buildCertificatePdfDoc(psCert as never, {
+      customDomain: 'https://verify.example.test',
+    });
+    assert.equal(psPdf.doc.getNumberOfPages(), 1);
+    const psStream = extractPdfPageText(psPdf.doc as unknown as { internal: { pages: string[][] } });
+    assert.ok(psStream.includes('PARIVAHAN SCRAPPERS'), 'Parivahan PDF must show PARIVAHAN SCRAPPERS');
+    assert.ok(psStream.includes('A UNIT OF SCRAP ROUTE'), 'Parivahan PDF bottom must show A UNIT OF SCRAP ROUTE');
+    assert.ok(
+      psStream.includes('https://parivahanscrappers.netlify.app/'),
+      'Parivahan PDF must show https://parivahanscrappers.netlify.app/'
+    );
+    assert.equal(
+      psStream.toLowerCase().includes('scrapping yard'),
+      false,
+      'Parivahan PDF must never mention Scrapping Yard Ltd.'
+    );
+    assert.equal(
+      psStream.includes('parivahan-scrappers.netlify.app'),
+      false,
+      'Parivahan PDF must not use the old hyphenated URL'
+    );
+
+    // 4. Unverified Scrap Route access is strictly rejected (403 SCRAP_ROUTE_PIN_REQUIRED)
+    const srNextBlocked = await fetch(
+      `${origin}/api/certificates/next-numbers?brand=scrap_route&issueDate=2026-11-27`,
+      { headers: { Cookie: sessionCookiePair, 'X-Requested-With': 'XMLHttpRequest' } }
+    );
+    assert.equal(srNextBlocked.status, 403);
+    assert.equal(((await srNextBlocked.json()) as { code?: string }).code, 'SCRAP_ROUTE_PIN_REQUIRED');
+
+    const srCreateBlocked = await fetch(`${origin}/api/certificates`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Requested-With': 'XMLHttpRequest',
+        Cookie: sessionCookiePair,
+      },
+      body: JSON.stringify({
+        brand: 'scrap_route',
+        issueDate: '2026-11-27',
+        handoverDate: '2026-11-26',
+        ownerName: 'Blocked Scrap Route Owner',
+        vehicleRegNumber: 'DL01SR0001',
+        make: 'TVS',
+        model: 'Jupiter',
+        manufactureYear: 2015,
+        chassisNumber: 'MD626BG4XF1A00001',
+        engineNumber: 'BG4F1A00001',
+      }),
+    });
+    assert.equal(srCreateBlocked.status, 403);
+    assert.equal(((await srCreateBlocked.json()) as { code?: string }).code, 'SCRAP_ROUTE_PIN_REQUIRED');
+
+    // 5. Scrap Route PIN verification: rejects wrong PIN (401) and rate limits after 5 failures (429)
+    // Use a separate client IP header is ignored unless trust proxy, so test wrong PIN attempts first then verify with hash mode
+    const wrongPin1 = await fetch(`${origin}/api/auth/scrap-route/verify-pin`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Requested-With': 'XMLHttpRequest',
+        Cookie: sessionCookiePair,
+      },
+      body: JSON.stringify({ pin: 'WRONG-PIN-000' }),
+    });
+    assert.equal(wrongPin1.status, 401);
+
+    // Verify valid PIN succeeds with salted scrypt hash env var too!
+    delete process.env.SCRAP_ROUTE_PIN;
+    process.env.SCRAP_ROUTE_PIN_HASH = hashPassword(scrapRoutePin);
+
+    const okPinRes = await fetch(`${origin}/api/auth/scrap-route/verify-pin`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Requested-With': 'XMLHttpRequest',
+        Cookie: sessionCookiePair,
+      },
+      body: JSON.stringify({ pin: scrapRoutePin }),
+    });
+    assert.equal(okPinRes.status, 200);
+    const srCookies = extractCookies(okPinRes);
+    const srSetCookie = srCookies.find((c) => c.startsWith('ps_sr_auth=')) || '';
+    assert.ok(srSetCookie.includes('HttpOnly'), 'ps_sr_auth cookie must be HttpOnly');
+    assert.ok(srSetCookie.includes('Secure'), 'ps_sr_auth cookie must be Secure');
+    assert.ok(srSetCookie.includes('SameSite=None'), 'ps_sr_auth cookie must be SameSite=None');
+    const srCookiePair = srSetCookie.split(';')[0];
+    const okPinJson = (await okPinRes.json()) as {
+      authorized: boolean;
+      scrapRouteToken: string;
+      expiresAt: string;
+    };
+    assert.equal(okPinJson.authorized, true);
+    assert.ok(okPinJson.scrapRouteToken.length > 20);
+
+    const combinedCookie = `${sessionCookiePair}; ${srCookiePair}`;
+
+    // 6. Scrap Route candidate numbers & atomic issuance succeed with disjoint SR numbering
+    const srNextRes = await fetch(`${origin}/api/certificates/next-numbers?brand=scrap_route&issueDate=2026-11-27`, {
+      headers: { Cookie: combinedCookie, 'X-Requested-With': 'XMLHttpRequest' },
+    });
+    assert.equal(srNextRes.status, 200);
+    const srNext = (await srNextRes.json()) as {
+      brand: string;
+      certificateNumber: string;
+      scrappingRegNumber: string;
+    };
+    assert.equal(srNext.brand, 'scrap_route');
+    assert.match(srNext.certificateNumber, /^SR\/26\/R\d{7}$/);
+    assert.match(srNext.scrappingRegNumber, /^SR-REG-\d{6}$/);
+
+    const srCreateRes = await fetch(`${origin}/api/certificates`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Requested-With': 'XMLHttpRequest',
+        'Idempotency-Key': `sr_brand_${crypto.randomBytes(5).toString('hex')}`,
+        Cookie: combinedCookie,
+      },
+      body: JSON.stringify({
+        brand: 'scrap_route',
+        certificateNumber: srNext.certificateNumber,
+        scrappingRegNumber: srNext.scrappingRegNumber,
+        issueDate: '2026-11-27',
+        handoverDate: '2026-11-26',
+        ownerName: 'Scrap Route Official Owner',
+        ownerAddress: 'Sector 21, Gurugram, Haryana',
+        vehicleRegNumber: 'HR26SR8899',
+        make: 'Yamaha',
+        model: 'FZ-S',
+        manufactureYear: 2015,
+        chassisNumber: 'ME1RG0627F0088991',
+        engineNumber: 'G3C8E0088991',
+        unhideChassisEngine: false,
+      }),
+    });
+    assert.equal(srCreateRes.status, 201);
+    const srCert = ((await srCreateRes.json()) as { certificate: Record<string, unknown> }).certificate;
+    assert.equal(srCert.brand, 'scrap_route');
+    assert.equal(srCert.certificateNumber, srNext.certificateNumber);
+    assert.equal(srCert.scrappingRegNumber, srNext.scrappingRegNumber);
+
+    // 7. Scrap Route PDF must show SCRAP ROUTE ONLY and ZERO Parivahan Scrappers / ZERO website
+    const srPdf = await buildCertificatePdfDoc(srCert as never, {
+      customDomain: 'https://verify.example.test',
+    });
+    assert.equal(srPdf.doc.getNumberOfPages(), 1);
+    const srStream = extractPdfPageText(srPdf.doc as unknown as { internal: { pages: string[][] } });
+    assert.ok(srStream.includes('SCRAP ROUTE'), 'Scrap Route PDF must include SCRAP ROUTE');
+    assert.ok(srStream.includes(String(srCert.certificateNumber)), 'Scrap Route PDF must include SR certificate number');
+    assert.ok(srStream.includes(String(srCert.scrappingRegNumber)), 'Scrap Route PDF must include SR-REG number');
+    assert.equal(
+      srStream.toLowerCase().includes('parivahan'),
+      false,
+      'Scrap Route PDF must NEVER contain Parivahan anywhere'
+    );
+    assert.equal(
+      srStream.toLowerCase().includes('a unit of'),
+      false,
+      'Scrap Route PDF must NEVER contain "A Unit Of"'
+    );
+    assert.equal(
+      srStream.toLowerCase().includes('scrapping yard'),
+      false,
+      'Scrap Route PDF must NEVER contain "Scrapping Yard"'
+    );
+    assert.equal(
+      srStream.toLowerCase().includes('netlify.app'),
+      false,
+      'Scrap Route PDF must NEVER display any website URL'
+    );
+    assert.equal(
+      srStream.includes('https://'),
+      false,
+      'Scrap Route PDF must NEVER print an https:// website in the PDF text'
+    );
+
+    // 8. Public QR Verification for BOTH brands returns verified: true, integrityMatch: true, and accurate brand
+    const verifyPs = await fetch(
+      `${origin}/api/verify?certificateNumber=${encodeURIComponent(String(psCert.certificateNumber))}&token=${encodeURIComponent(String(psCert.qrToken))}`
+    );
+    assert.equal(verifyPs.status, 200);
+    const verifyPsJson = (await verifyPs.json()) as Record<string, unknown>;
+    assert.equal(verifyPsJson.verified, true);
+    assert.equal(verifyPsJson.integrityMatch, true);
+    assert.equal(verifyPsJson.tokenMatch, true);
+    assert.equal(verifyPsJson.brand, 'parivahan');
+    assert.equal(verifyPsJson.brandDisplayName, 'Parivahan Scrappers');
+
+    const verifySr = await fetch(
+      `${origin}/api/verify?certificateNumber=${encodeURIComponent(String(srCert.certificateNumber))}&token=${encodeURIComponent(String(srCert.qrToken))}`
+    );
+    assert.equal(verifySr.status, 200);
+    const verifySrJson = (await verifySr.json()) as Record<string, unknown>;
+    assert.equal(verifySrJson.verified, true);
+    assert.equal(verifySrJson.integrityMatch, true);
+    assert.equal(verifySrJson.tokenMatch, true);
+    assert.equal(verifySrJson.brand, 'scrap_route');
+    assert.equal(verifySrJson.brandDisplayName, 'SCRAP ROUTE');
+
+    // 9. Brand immutability on Maker Edit AND Admin Edit (HTTP 403 if brand switch attempted)
+    const makerBrandSwitch = await fetch(`${origin}/api/certificates/${srCert.id}`, {
+      method: 'PUT',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Requested-With': 'XMLHttpRequest',
+        Cookie: combinedCookie,
+      },
+      body: JSON.stringify({ brand: 'parivahan', ownerName: 'Attempt Switch' }),
+    });
+    assert.equal(makerBrandSwitch.status, 403, 'Maker must not be able to change certificate brand on edit');
+
+    const makerValidSrEdit = await fetch(`${origin}/api/certificates/${srCert.id}`, {
+      method: 'PUT',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Requested-With': 'XMLHttpRequest',
+        Cookie: combinedCookie,
+      },
+      body: JSON.stringify({ ownerName: 'Scrap Route Updated Owner' }),
+    });
+    assert.equal(makerValidSrEdit.status, 200);
+    const updatedSr = ((await makerValidSrEdit.json()) as { certificate: Record<string, unknown> }).certificate;
+    assert.equal(updatedSr.brand, 'scrap_route', 'Edited Scrap Route certificate must preserve brand');
+
+    // Admin unlock still works and Admin edit also blocks brand switching
+    const adminUnlock = await fetch(`${origin}/api/auth/admin-unlock`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'XMLHttpRequest' },
+      body: JSON.stringify({ password: adminPass }),
+    });
+    assert.equal(adminUnlock.status, 200);
+    const adminToken = ((await adminUnlock.json()) as { token: string }).token;
+
+    const adminBrandSwitch = await fetch(`${origin}/api/admin/certificates/${psCert.id}`, {
+      method: 'PUT',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Requested-With': 'XMLHttpRequest',
+        Authorization: `Bearer ${adminToken}`,
+      },
+      body: JSON.stringify({
+        updates: { brand: 'scrap_route', ownerName: 'Admin Switch Attempt' },
+        reason: 'Testing brand immutability guard',
+        protectedPassword: adminPass,
+      }),
+    });
+    assert.equal(adminBrandSwitch.status, 403, 'Admin edit must not allow switching certificate brand');
+
+    // 10. Locking Scrap Route revokes Scrap Route access immediately WITHOUT logging out Maker
+    const lockRes = await fetch(`${origin}/api/auth/scrap-route/lock`, {
+      method: 'POST',
+      headers: { 'X-Requested-With': 'XMLHttpRequest', Cookie: combinedCookie },
+    });
+    assert.equal(lockRes.status, 200);
+
+    const srAfterLock = await fetch(
+      `${origin}/api/certificates/next-numbers?brand=scrap_route&issueDate=2026-11-27`,
+      { headers: { Cookie: sessionCookiePair, 'X-Requested-With': 'XMLHttpRequest' } }
+    );
+    assert.equal(srAfterLock.status, 403, 'Locked Scrap Route must reject SR requests');
+
+    const psStillWorks = await fetch(
+      `${origin}/api/certificates/next-numbers?brand=parivahan&issueDate=2026-11-27`,
+      { headers: { Cookie: sessionCookiePair, 'X-Requested-With': 'XMLHttpRequest' } }
+    );
+    assert.equal(psStillWorks.status, 200, 'Locking Scrap Route must NOT log out the Maker session');
+
+    // 11. Brute-force rate limiting on /api/auth/scrap-route/verify-pin (429 after 5 failed attempts)
+    let rateLimited = false;
+    for (let i = 0; i < 6; i++) {
+      const attempt = await fetch(`${origin}/api/auth/scrap-route/verify-pin`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Requested-With': 'XMLHttpRequest',
+          Cookie: sessionCookiePair,
+        },
+        body: JSON.stringify({ pin: `BAD-${i}` }),
+      });
+      if (attempt.status === 429) {
+        rateLimited = true;
+        break;
+      }
+      assert.equal(attempt.status, 401);
+    }
+    assert.equal(rateLimited, true, 'Scrap Route PIN endpoint must rate-limit repeated failed attempts (429)');
+
+    // 12. Logout immediately invalidates the Remember Me 30-day session cookie server-side
+    const logoutRes = await fetch(`${origin}/api/auth/logout`, {
+      method: 'POST',
+      headers: { 'X-Requested-With': 'XMLHttpRequest', Cookie: sessionCookiePair },
+    });
+    assert.equal(logoutRes.status, 200);
+    const logoutCookies = extractCookies(logoutRes).join('\n');
+    assert.ok(logoutCookies.includes('ps_session='), 'Logout must clear ps_session cookie');
+    assert.ok(logoutCookies.includes('ps_sr_auth='), 'Logout must clear ps_sr_auth cookie');
+
+    const afterLogout = await fetch(`${origin}/api/certificates/next-numbers?brand=parivahan`, {
+      headers: { Cookie: sessionCookiePair, 'X-Requested-With': 'XMLHttpRequest' },
+    });
+    assert.equal(afterLogout.status, 401, 'Logged-out Remember Me cookie must be immediately rejected');
+  } finally {
+    await new Promise<void>((resolve) => srv.close(() => resolve()));
+    for (const [k, v] of Object.entries(savedEnv)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+    resetStoreForTesting();
+  }
+}
+
+async function runDataProtectionIntegrityAndRecoveryTests(): Promise<void> {
+  const crypto = await import('node:crypto');
+  const { resetStoreForTesting, getStore } = await import('../src/server/store.js');
+  const { runReadOnlyIntegrityAudit } = await import('../src/server/integrity.js');
+  const { clearAllAuthFailures } = await import('../src/server/rateLimit.js');
+
+  const savedEnv = {
+    SCRAP_ROUTE_PIN: process.env.SCRAP_ROUTE_PIN,
+    SCRAP_ROUTE_PIN_HASH: process.env.SCRAP_ROUTE_PIN_HASH,
+    ADMIN_SESSION_SECRET: process.env.ADMIN_SESSION_SECRET,
+  };
+
+  const srPin = `SR-${crypto.randomBytes(4).toString('hex')}`;
+  process.env.SCRAP_ROUTE_PIN = srPin;
+  delete process.env.SCRAP_ROUTE_PIN_HASH;
+  process.env.ADMIN_SESSION_SECRET = crypto.randomBytes(32).toString('hex');
+  resetStoreForTesting();
+  clearAllAuthFailures();
+
+  const app = createApiApp();
+  const srv = http.createServer(app);
+  await new Promise<void>((resolve) => srv.listen(0, '127.0.0.1', resolve));
+  const addr = srv.address();
+  if (!addr || typeof addr === 'string') throw new Error('Failed to bind data protection test server');
+  const origin = `http://127.0.0.1:${addr.port}`;
+
+  const reqJson = async (
+    p: string,
+    opts: { method?: string; body?: unknown; token?: string; headers?: Record<string, string> } = {}
+  ) => {
+    const headers: Record<string, string> = {
+      'X-Requested-With': 'XMLHttpRequest',
+      ...(opts.headers ?? {}),
+    };
+    if (opts.body !== undefined) headers['Content-Type'] = 'application/json';
+    if (opts.token) headers['Authorization'] = `Bearer ${opts.token}`;
+    const res = await fetch(`${origin}${p}`, {
+      method: opts.method ?? 'GET',
+      headers,
+      body: opts.body !== undefined ? JSON.stringify(opts.body) : undefined,
+    });
+    const text = await res.text();
+    let json: Record<string, unknown> = {};
+    try {
+      json = text ? (JSON.parse(text) as Record<string, unknown>) : {};
+    } catch {
+      json = { raw: text };
+    }
+    return { status: res.status, headers: res.headers, json, raw: text };
+  };
+
+  try {
+    // 1. Bootstrap credentials
+    const makerPass = 'MakerProtect#2026';
+    const adminPass = 'AdminProtect#2026';
+    const protPass = 'DeleteProtect#2026';
+    const boot = await reqJson('/api/auth/bootstrap', {
+      method: 'POST',
+      body: {
+        makerUsername: 'user-pscrappers',
+        makerPassword: makerPass,
+        mainAdminPassword: adminPass,
+        protectedPassword: protPass,
+      },
+    });
+    assert.equal(boot.status, 201);
+
+    // 2. Login Maker (device A) + Login Maker (device B) to verify cross-device persistence
+    const loginA = await reqJson('/api/auth/login', {
+      method: 'POST',
+      body: { username: 'user-pscrappers', password: makerPass },
+    });
+    assert.equal(loginA.status, 200);
+    const makerTokenA = String(loginA.json.token);
+
+    const loginB = await reqJson('/api/auth/login', {
+      method: 'POST',
+      body: { username: 'user-pscrappers', password: makerPass },
+    });
+    assert.equal(loginB.status, 200);
+    const makerTokenB = String(loginB.json.token);
+
+    // Unlock Scrap Route PIN for Maker A
+    const pinRes = await reqJson('/api/auth/scrap-route/verify-pin', {
+      method: 'POST',
+      token: makerTokenA,
+      body: { pin: srPin },
+    });
+    assert.equal(pinRes.status, 200);
+    const srToken = String(pinRes.json.scrapRouteToken);
+
+    // 3. Create Parivahan + Scrap Route certificates with post-write read-back verification
+    const psCreate = await reqJson('/api/certificates', {
+      method: 'POST',
+      token: makerTokenA,
+      headers: { 'Idempotency-Key': 'dp_ps_1' },
+      body: {
+        brand: 'parivahan',
+        issueDate: '2026-11-27',
+        handoverDate: '2026-11-26',
+        ownerName: 'Original Parivahan Owner',
+        ownerAddress: 'Sector 18, Gurugram',
+        vehicleRegNumber: 'HR26DP1001',
+        make: 'Hero MotoCorp',
+        model: 'Splendor',
+        manufactureYear: 2013,
+        chassisNumber: 'MBLHA10DP00001001',
+        engineNumber: 'HA10EDP0001001',
+        unhideChassisEngine: false,
+      },
+    });
+    assert.equal(psCreate.status, 201);
+    assert.equal(psCreate.json.verifiedReadBack, true, 'Issuance must confirm post-write read-back verification');
+    const psCert = psCreate.json.certificate as Record<string, unknown>;
+    assert.ok(psCert.originalRecord, 'Immutable originalRecord (v1) must be stored on creation');
+
+    // Network retry with same Idempotency-Key returns exact same record with zero duplicates
+    const psRetry = await reqJson('/api/certificates', {
+      method: 'POST',
+      token: makerTokenA,
+      headers: { 'Idempotency-Key': 'dp_ps_1' },
+      body: {
+        brand: 'parivahan',
+        issueDate: '2026-11-27',
+        handoverDate: '2026-11-26',
+        ownerName: 'Original Parivahan Owner',
+        vehicleRegNumber: 'HR26DP1001',
+        make: 'Hero MotoCorp',
+        model: 'Splendor',
+        manufactureYear: 2013,
+        chassisNumber: 'MBLHA10DP00001001',
+        engineNumber: 'HA10EDP0001001',
+      },
+    });
+    assert.equal(psRetry.status, 200);
+    assert.equal(psRetry.json.idempotentReplay, true);
+    assert.equal((psRetry.json.certificate as Record<string, unknown>).id, psCert.id);
+
+    const srCreate = await reqJson('/api/certificates', {
+      method: 'POST',
+      token: makerTokenA,
+      headers: { 'Idempotency-Key': 'dp_sr_1', 'X-Scrap-Route-Auth': srToken },
+      body: {
+        brand: 'scrap_route',
+        issueDate: '2026-11-27',
+        handoverDate: '2026-11-26',
+        ownerName: 'Original Scrap Route Owner',
+        vehicleRegNumber: 'HR26SR2002',
+        make: 'Honda',
+        model: 'Activa',
+        manufactureYear: 2014,
+        chassisNumber: 'ME4JF50DP00002002',
+        engineNumber: 'JF50EDP0002002',
+      },
+    });
+    assert.equal(srCreate.status, 201);
+    assert.equal(srCreate.json.verifiedReadBack, true);
+    const srCert = srCreate.json.certificate as Record<string, unknown>;
+
+    // Cross-device persistence: Maker B sees both authoritative records immediately
+    const recentB = await reqJson('/api/certificates/recent', { token: makerTokenB });
+    assert.equal(recentB.status, 200);
+    assert.equal((recentB.json.certificates as unknown[]).length, 2);
+
+    // 4. Modify certificate -> preserves immutable v1 originalRecord, logs changedFields & append-only version doc
+    const editRes = await reqJson(`/api/certificates/${psCert.id}`, {
+      method: 'PUT',
+      token: makerTokenA,
+      body: {
+        ownerName: 'Corrected Parivahan Owner',
+        reason: 'Spelling correction from verified RC document',
+      },
+    });
+    assert.equal(editRes.status, 200);
+    const editedPs = editRes.json.certificate as Record<string, unknown>;
+    assert.equal(editedPs.version, 2);
+    const origSnap = editedPs.originalRecord as { version: number; data: { ownerName: string } };
+    assert.equal(origSnap.version, 1);
+    assert.equal(origSnap.data.ownerName, 'Original Parivahan Owner', 'Original v1 ownerName must remain immutable');
+
+    // Public QR verification reflects v2 + originalIssuedAt + versionHistoryCount
+    const verifyV2 = await reqJson(
+      `/api/verify?certificateNumber=${encodeURIComponent(String(editedPs.certificateNumber))}&token=${encodeURIComponent(String(editedPs.qrToken))}`
+    );
+    assert.equal(verifyV2.status, 200);
+    assert.equal(verifyV2.json.verified, true);
+    assert.equal(verifyV2.json.version, 2);
+    assert.equal(verifyV2.json.versionHistoryCount, 1);
+    assert.ok(typeof verifyV2.json.originalIssuedAt === 'string');
+
+    // 5. Maker CANNOT permanently delete (blocked 403), CAN only Archive (reversible)
+    const makerPermBlock = await reqJson(`/api/certificates/${psCert.id}`, {
+      method: 'DELETE',
+      token: makerTokenA,
+      body: { permanent: true, reason: 'Maker attempting permanent delete' },
+    });
+    assert.equal(makerPermBlock.status, 403, 'Maker must NEVER be able to permanently delete a certificate');
+
+    const makerArchive = await reqJson(`/api/certificates/${psCert.id}`, {
+      method: 'DELETE',
+      token: makerTokenA,
+      body: { reason: 'Archiving test certificate' },
+    });
+    assert.equal(makerArchive.status, 200);
+
+    // Main Core Admin unlocks & inspects history, integrity monitor, archive restore, staging verify & export
+    const adminUnlock = await reqJson('/api/auth/admin-unlock', {
+      method: 'POST',
+      body: { password: adminPass },
+    });
+    assert.equal(adminUnlock.status, 200);
+    const adminToken = String(adminUnlock.json.token);
+
+    // Owner-only version history endpoint returns immutable v1 + modification snapshot + append-only lifecycle events
+    const historyRes = await reqJson(`/api/admin/certificates/${psCert.id}/history`, { token: adminToken });
+    assert.equal(historyRes.status, 200);
+    assert.equal((historyRes.json.originalRecord as { version: number }).version, 1);
+    assert.equal((historyRes.json.versionHistory as unknown[]).length, 1);
+    const appendOnly = historyRes.json.appendOnlyVersions as Array<{ event: string }>;
+    assert.ok(appendOnly.some((e) => e.event === 'ISSUED'), 'Append-only versions must include ISSUED');
+    assert.ok(appendOnly.some((e) => e.event === 'MODIFIED'), 'Append-only versions must include MODIFIED');
+    assert.ok(appendOnly.some((e) => e.event === 'ARCHIVED'), 'Append-only versions must include ARCHIVED');
+
+    // Restore archived certificate
+    const restoreRes = await reqJson(`/api/admin/certificates/${psCert.id}/restore`, {
+      method: 'POST',
+      token: adminToken,
+      body: { protectedPassword: protPass, reason: 'Restoring archived certificate' },
+    });
+    assert.equal(restoreRes.status, 200);
+    assert.equal((restoreRes.json.certificate as Record<string, unknown>).status, 'ACTIVE');
+
+    // 6. Bulk deletion payload is strictly rejected (400)
+    const bulkBlock = await reqJson(`/api/admin/certificates/${srCert.id}`, {
+      method: 'DELETE',
+      token: adminToken,
+      body: {
+        ids: [psCert.id, srCert.id],
+        deletePassword: protPass,
+        reason: 'Bulk delete attempt must fail',
+      },
+    });
+    assert.equal(bulkBlock.status, 400, 'Bulk delete payloads must be strictly rejected');
+
+    // 7. Create verified backup -> run Isolated Staging Restore Verification -> run Owner JSON Export
+    const bkpRes = await reqJson('/api/admin/backups/create', { method: 'POST', token: adminToken });
+    assert.equal(bkpRes.status, 201);
+    const backup = bkpRes.json.backup as { id: string; verified: boolean };
+    assert.equal(backup.verified, true, 'Backup must pass post-write read-back verification');
+
+    const stagingRes = await reqJson(`/api/admin/backups/${backup.id}/staging-verify`, {
+      method: 'POST',
+      token: adminToken,
+    });
+    assert.equal(stagingRes.status, 200);
+    const staging = stagingRes.json.stagingResult as Record<string, unknown>;
+    assert.equal(staging.checksumValid, true);
+    assert.equal(staging.stagingRestoredCount, 2);
+    assert.equal(staging.stagingParivahanCount, 1);
+    assert.equal(staging.stagingScrapRouteCount, 1);
+    assert.equal(staging.stagingIntegrityHealthy, true);
+    assert.equal(staging.safeForProductionRecovery, true);
+
+    const exportRes = await reqJson('/api/admin/export', { token: adminToken });
+    assert.equal(exportRes.status, 200);
+    assert.ok(exportRes.headers.get('x-export-sha256'), 'Owner export must include X-Export-SHA256 checksum header');
+    assert.equal((exportRes.json.certificates as unknown[]).length, 2);
+
+    // Maker blocked from integrity monitor & owner export (403)
+    const makerMonitorBlock = await reqJson('/api/admin/integrity-monitor', { token: makerTokenA });
+    assert.equal(makerMonitorBlock.status, 403);
+    const makerExportBlock = await reqJson('/api/admin/export', { token: makerTokenA });
+    assert.equal(makerExportBlock.status, 403);
+
+    // 8. Read-Only Integrity Monitor reports healthy counts before corruption
+    const monitorHealthy = await reqJson('/api/admin/integrity-monitor', { token: adminToken });
+    assert.equal(monitorHealthy.status, 200);
+    const reportHealthy = monitorHealthy.json.report as {
+      healthy: boolean;
+      readOnly: boolean;
+      counts: {
+        parivahanCertificates: number;
+        scrapRouteCertificates: number;
+        activeCertificates: number;
+        modifiedCertificates: number;
+        integrityMismatches: number;
+      };
+    };
+    assert.equal(reportHealthy.readOnly, true);
+    assert.equal(reportHealthy.healthy, true);
+    assert.equal(reportHealthy.counts.parivahanCertificates, 1);
+    assert.equal(reportHealthy.counts.scrapRouteCertificates, 1);
+    assert.equal(reportHealthy.counts.activeCertificates, 2);
+    assert.equal(reportHealthy.counts.modifiedCertificates, 1);
+    assert.equal(reportHealthy.counts.integrityMismatches, 0);
+
+    // 9. Integrity gate blocks permanent deletion when corruption exists, and read-only audit NEVER mutates the corrupted record
+    const store = getStore();
+    const srDoc = await store.getCertificateById(String(srCert.id));
+    assert.ok(srDoc);
+    const originalHash = srDoc.canonicalHash;
+    await store.saveCertificate({ ...srDoc, canonicalHash: '0'.repeat(64) });
+
+    const auditCorrupt = await runReadOnlyIntegrityAudit(store);
+    assert.equal(auditCorrupt.healthy, false, 'Integrity audit must detect SHA-256 mismatch');
+    assert.equal(auditCorrupt.counts.integrityMismatches, 1);
+    const afterAuditDoc = await store.getCertificateById(String(srCert.id));
+    assert.equal(
+      afterAuditDoc?.canonicalHash,
+      '0'.repeat(64),
+      'Read-only integrity audit must NEVER automatically repair or mutate any record'
+    );
+
+    const blockedPermDelete = await reqJson(`/api/admin/certificates/${srCert.id}`, {
+      method: 'DELETE',
+      token: adminToken,
+      body: {
+        mainAdminPassword: adminPass,
+        deletePassword: protPass,
+        confirmCertificateNumber: String(srCert.certificateNumber),
+        confirmPhrase: 'PERMANENT DELETE',
+        reason: 'Testing integrity health gate on permanent delete',
+        permanent: true,
+      },
+    });
+    assert.equal(
+      blockedPermDelete.status,
+      409,
+      'Permanent deletion must be blocked (409) when database integrity health check fails'
+    );
+
+    // Restore hash so integrity is healthy again, then verify permanent delete succeeds with verified safety backup
+    await store.saveCertificate({ ...srDoc, canonicalHash: originalHash });
+    const allowedPermDelete = await reqJson(`/api/admin/certificates/${srCert.id}`, {
+      method: 'DELETE',
+      token: adminToken,
+      body: {
+        mainAdminPassword: adminPass,
+        deletePassword: protPass,
+        confirmCertificateNumber: String(srCert.certificateNumber),
+        confirmPhrase: 'PERMANENT DELETE',
+        reason: 'Owner-authorized permanent delete after integrity verified healthy',
+        permanent: true,
+      },
+    });
+    assert.equal(allowedPermDelete.status, 200);
+    assert.equal(allowedPermDelete.json.permanent, true);
+    assert.ok(typeof allowedPermDelete.json.safetyBackupId === 'string');
+
+    // Verify Scrap Route deleted number stays permanently reserved
+    assert.equal(await store.isCertNumberReserved(String(srCert.certificateNumber)), true);
+    assert.equal(await store.isScrappingRegReserved(String(srCert.scrappingRegNumber)), true);
+  } finally {
+    await new Promise<void>((resolve) => srv.close(() => resolve()));
     for (const [k, v] of Object.entries(savedEnv)) {
       if (v === undefined) delete process.env[k];
       else process.env[k] = v;

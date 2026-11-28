@@ -72,17 +72,63 @@ function walk(dir: string, rootDir: string, findings: string[]): void {
   }
 }
 
+const FORBIDDEN_CODE_PATTERNS: Array<{ label: string; regex: RegExp }> = [
+  { label: 'Destructive Collection Wipe Function', regex: /\b(wipeAllCertificates|deleteAllCertificates|clearCertificatesCollection|resetProductionDatabase)\b/ },
+  { label: 'Demo Certificate Auto-Seeding', regex: /\b(seedDemoCertificates|autoSeedCertificates|importHistoricalCertificates)\b/ },
+];
+
+function checkFirestoreRules(rootDir: string, findings: string[]): void {
+  const rulesPath = path.join(rootDir, 'firestore.rules');
+  if (!fs.existsSync(rulesPath)) {
+    findings.push('[SECURITY_RULES] Missing firestore.rules file.');
+    return;
+  }
+  const content = fs.readFileSync(rulesPath, 'utf8');
+  if (!/allow\s+read\s*,\s*write\s*:\s*if\s+false\s*;/.test(content)) {
+    findings.push('[SECURITY_RULES] firestore.rules must enforce zero-trust `allow read, write: if false;`.');
+  }
+}
+
 const rootDir = process.cwd();
 const findings: string[] = [];
 walk(rootDir, rootDir, findings);
+checkFirestoreRules(rootDir, findings);
+
+// Scan runtime source directories (src/, api/) for destructive auto-wipe or demo seeding code
+for (const runtimeDir of ['src', 'api']) {
+  const fullRuntimeDir = path.join(rootDir, runtimeDir);
+  if (!fs.existsSync(fullRuntimeDir)) continue;
+  const stack = [fullRuntimeDir];
+  while (stack.length > 0) {
+    const current = stack.pop()!;
+    for (const entry of fs.readdirSync(current, { withFileTypes: true })) {
+      const fullPath = path.join(current, entry.name);
+      if (entry.isDirectory()) {
+        if (!IGNORED_DIRS.has(entry.name)) stack.push(fullPath);
+        continue;
+      }
+      const ext = path.extname(entry.name).toLowerCase();
+      if (!TEXT_EXTENSIONS.has(ext)) continue;
+      const content = fs.readFileSync(fullPath, 'utf8');
+      const relPath = path.relative(rootDir, fullPath).replace(/\\/g, '/');
+      for (const { label, regex } of FORBIDDEN_CODE_PATTERNS) {
+        if (regex.test(content)) {
+          findings.push(`[FORBIDDEN_CODE] ${label} detected in ${relPath}`);
+        }
+      }
+    }
+  }
+}
 
 if (findings.length > 0) {
-  console.error('\nPre-deployment security & clean-registry scan FAILED:\n');
+  console.error('\nPre-deployment security & data-protection scan FAILED:\n');
   for (const finding of findings) {
     console.error(`  - ${finding}`);
   }
-  console.error('\nRemove forbidden historical data or credential files before deploying.\n');
+  console.error('\nResolve all findings before deploying.\n');
   process.exit(1);
 }
 
-console.log('Pre-deployment scan PASSED: 0 historical certificate files, 0 backup dumps, 0 hardcoded secrets.');
+console.log(
+  'Pre-deployment scan PASSED: 0 historical certificate files, 0 backup dumps, 0 hardcoded secrets, 0 destructive auto-wipe patterns, zero-trust firestore.rules verified.'
+);

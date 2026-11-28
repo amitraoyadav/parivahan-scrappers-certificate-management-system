@@ -1,13 +1,23 @@
 import { jsPDF } from 'jspdf';
 import QRCode from 'qrcode';
-import type { CertificateRecord } from '../shared/types';
+import type { CertificateBrand, CertificateRecord } from '../shared/types';
 import { formatChassisOrEngine } from '../shared/vehicleData';
 
 export const COMPANY_HEADER_NAME = 'PARIVAHAN SCRAPPERS';
-export const COMPANY_SUBTITLE = 'A Unit OF Scrapping Yard Ltd.';
+export const COMPANY_BOTTOM_SUBTITLE = 'A UNIT OF SCRAP ROUTE';
+export const SCRAP_ROUTE_HEADER_NAME = 'SCRAP ROUTE';
 export const COMPANY_ADDRESS_LINE = 'B12, Dwarka, New Delhi.';
 export const COMPANY_PHONE_LINE = '8506925495';
-export const COMPANY_WEBSITE_LINE = 'https://parivahan-scrappers.netlify.app/';
+export const COMPANY_WEBSITE_LINE = 'https://parivahanscrappers.netlify.app/';
+
+export function getCertificateBrand(
+  cert: Pick<CertificateRecord, 'brand' | 'certificateNumber'>
+): CertificateBrand {
+  if (cert.brand === 'scrap_route' || cert.brand === 'parivahan') {
+    return cert.brand;
+  }
+  return cert.certificateNumber?.toUpperCase().startsWith('SR/') ? 'scrap_route' : 'parivahan';
+}
 
 export function buildVerificationUrl(
   cert: Pick<CertificateRecord, 'certificateNumber' | 'qrToken'>,
@@ -54,28 +64,78 @@ export interface PdfBrandingOptions {
 
 type Rgb = [number, number, number];
 
-const COLORS = {
-  navy: [13, 40, 71] as Rgb, // #0D2847
-  navySection: [20, 62, 109] as Rgb, // #143E6D
-  navySubtitle: [30, 58, 95] as Rgb, // #1E3A5F
-  inkDark: [29, 41, 61] as Rgb, // #1D293D
-  inkBody: [51, 65, 85] as Rgb, // #334155
-  inkMuted: [71, 85, 105] as Rgb, // #475569
-  leafGreen: [0, 96, 69] as Rgb, // #006045
-  smallLeafGreen: [0, 122, 85] as Rgb, // #007A55
-  bannerFill: [225, 238, 230] as Rgb, // #E1EEE6
-  bannerText: [34, 77, 54] as Rgb, // #224D36
-  sectionFill: [220, 232, 245] as Rgb, // #DCE8F5
-  tableBorder: [180, 203, 229] as Rgb, // #B4CBE5
-  subtleBorder: [202, 213, 226] as Rgb, // #CAD5E2
-  footerRule: [158, 169, 181] as Rgb, // #9EA9B5
-  signatureBlue: [13, 71, 161] as Rgb, // #0D47A1
-  greenBoxFill: [237, 247, 242] as Rgb, // #EDF7F2
-  greenBoxBorder: [207, 223, 214] as Rgb, // #CFDFD6
-  greenBoxText: [20, 56, 40] as Rgb, // #143828
-  watermarkStroke: [222, 227, 224] as Rgb, // #DEE3E0
-  watermarkText: [224, 228, 226] as Rgb, // #E0E4E2
+interface BrandPalette {
+  primary: Rgb;
+  sectionText: Rgb;
+  subtitle: Rgb;
+  inkDark: Rgb;
+  inkBody: Rgb;
+  inkMuted: Rgb;
+  leafGreen: Rgb;
+  smallLeafGreen: Rgb;
+  bannerFill: Rgb;
+  bannerText: Rgb;
+  sectionFill: Rgb;
+  tableBorder: Rgb;
+  subtleBorder: Rgb;
+  footerRule: Rgb;
+  signatureBlue: Rgb;
+  greenBoxFill: Rgb;
+  greenBoxBorder: Rgb;
+  greenBoxText: Rgb;
+  watermarkStroke: Rgb;
+  watermarkText: Rgb;
+}
+
+const PARIVAHAN_COLORS: BrandPalette = {
+  primary: [13, 40, 71], // #0D2847
+  sectionText: [20, 62, 109], // #143E6D
+  subtitle: [30, 58, 95], // #1E3A5F
+  inkDark: [29, 41, 61], // #1D293D
+  inkBody: [51, 65, 85], // #334155
+  inkMuted: [71, 85, 105], // #475569
+  leafGreen: [0, 96, 69], // #006045
+  smallLeafGreen: [0, 122, 85], // #007A55
+  bannerFill: [225, 238, 230], // #E1EEE6
+  bannerText: [34, 77, 54], // #224D36
+  sectionFill: [220, 232, 245], // #DCE8F5
+  tableBorder: [180, 203, 229], // #B4CBE5
+  subtleBorder: [202, 213, 226], // #CAD5E2
+  footerRule: [158, 169, 181], // #9EA9B5
+  signatureBlue: [13, 71, 161], // #0D47A1
+  greenBoxFill: [237, 247, 242], // #EDF7F2
+  greenBoxBorder: [207, 223, 214], // #CFDFD6
+  greenBoxText: [20, 56, 40], // #143828
+  watermarkStroke: [222, 227, 224], // #DEE3E0
+  watermarkText: [224, 228, 226], // #E0E4E2
 };
+
+const SCRAP_ROUTE_COLORS: BrandPalette = {
+  primary: [20, 34, 48], // #142230 refined charcoal-slate
+  sectionText: [6, 95, 70], // #065F46 deep recycling emerald
+  subtitle: [30, 58, 52], // #1E3A34
+  inkDark: [26, 36, 48], // #1A2430
+  inkBody: [51, 65, 85], // #334155
+  inkMuted: [71, 85, 105], // #475569
+  leafGreen: [5, 110, 78], // #056E4E
+  smallLeafGreen: [4, 120, 87], // #047857
+  bannerFill: [224, 242, 233], // #E0F2E9
+  bannerText: [6, 78, 59], // #064E3B
+  sectionFill: [227, 241, 234], // #E3F1EA
+  tableBorder: [179, 212, 198], // #B3D4C6
+  subtleBorder: [198, 214, 206], // #C6D6CE
+  footerRule: [156, 174, 166], // #9CAEA6
+  signatureBlue: [15, 76, 129], // #0F4C81
+  greenBoxFill: [236, 248, 242], // #ECF8F2
+  greenBoxBorder: [189, 220, 206], // #BDDCCE
+  greenBoxText: [15, 61, 46], // #0F3D2E
+  watermarkStroke: [220, 229, 224], // #DCE5E0
+  watermarkText: [222, 230, 226], // #DEE6E2
+};
+
+function getBrandPalette(brand: CertificateBrand): BrandPalette {
+  return brand === 'scrap_route' ? SCRAP_ROUTE_COLORS : PARIVAHAN_COLORS;
+}
 
 /**
  * Draws centered text with exact letter-spacing compensation (fixes jsPDF charSpace center drift).
@@ -144,7 +204,8 @@ function drawFittedMultiLine(
   lineHeight: number,
   minSize = 6.5
 ): void {
-  const safeText = String(text || 'Not Provided').replace(/\s+/g, ' ').trim() || 'Not Provided';
+  const safeText = String(text ?? '').replace(/\s+/g, ' ').trim();
+  if (!safeText) return;
   let size = baseSize;
   doc.setFont(font, style);
   doc.setFontSize(size);
@@ -176,12 +237,19 @@ function drawFittedMultiLine(
  * Draws the sleek upright Responsible Recycling green leaf emblem at top-right,
  * matching the almond leaf silhouette with single crisp vertical white midrib.
  */
-function drawHeaderLeafIcon(doc: jsPDF, cx: number, topY: number, width: number, height: number): void {
+function drawHeaderLeafIcon(
+  doc: jsPDF,
+  cx: number,
+  topY: number,
+  width: number,
+  height: number,
+  palette: BrandPalette
+): void {
   const halfW = width / 2;
   const bottomY = topY + height;
 
-  doc.setFillColor(...COLORS.leafGreen);
-  doc.setDrawColor(...COLORS.leafGreen);
+  doc.setFillColor(...palette.leafGreen);
+  doc.setDrawColor(...palette.leafGreen);
   doc.setLineWidth(0.08);
 
   const pts: Array<[number, number]> = [];
@@ -209,7 +277,7 @@ function drawHeaderLeafIcon(doc: jsPDF, cx: number, topY: number, width: number,
   doc.setDrawColor(255, 255, 255);
   doc.setLineWidth(0.32);
   doc.line(cx, topY + height * 0.16, cx, bottomY - height * 0.06);
-  doc.setDrawColor(...COLORS.leafGreen);
+  doc.setDrawColor(...palette.leafGreen);
   doc.setLineWidth(0.42);
   doc.line(cx, bottomY - 0.2, cx, bottomY + 0.75);
 }
@@ -217,7 +285,13 @@ function drawHeaderLeafIcon(doc: jsPDF, cx: number, topY: number, width: number,
 /**
  * Draws the solid small tilted green leaf accent (above green banner, QR divider, and eco badge 1).
  */
-function drawSmallTiltedLeaf(doc: jsPDF, cx: number, cy: number, size: number): void {
+function drawSmallTiltedLeaf(
+  doc: jsPDF,
+  cx: number,
+  cy: number,
+  size: number,
+  palette: BrandPalette
+): void {
   const angle = -Math.PI / 4;
   const cos = Math.cos(angle);
   const sin = Math.sin(angle);
@@ -248,33 +322,33 @@ function drawSmallTiltedLeaf(doc: jsPDF, cx: number, cy: number, size: number): 
     segs.push([pts[i][0] - pts[i - 1][0], pts[i][1] - pts[i - 1][1]]);
   }
 
-  doc.setFillColor(...COLORS.smallLeafGreen);
+  doc.setFillColor(...palette.smallLeafGreen);
   doc.lines(segs, pts[0][0], pts[0][1], [1, 1], 'F', true);
 
   // Subtle tiny stem at base
   const [s1x, s1y] = rot(-halfL * 1.18, 0.12);
   const [s2x, s2y] = rot(-halfL * 0.72, 0);
-  doc.setDrawColor(...COLORS.smallLeafGreen);
+  doc.setDrawColor(...palette.smallLeafGreen);
   doc.setLineWidth(0.28);
   doc.line(s1x, s1y, s2x, s2y);
 }
 
 /**
- * Draws the 3 crisp monochrome contact icons in the top-left header.
+ * Draws the crisp monochrome contact icons in the top-left header.
  */
-function drawPinIcon(doc: jsPDF, cx: number, cy: number): void {
-  doc.setDrawColor(...COLORS.navy);
+function drawPinIcon(doc: jsPDF, cx: number, cy: number, color: Rgb): void {
+  doc.setDrawColor(...color);
   doc.setLineWidth(0.28);
   const r = 1.05;
   doc.circle(cx, cy - 0.45, r, 'S');
   doc.line(cx - r * 0.82, cy + 0.15, cx, cy + 1.45);
   doc.line(cx + r * 0.82, cy + 0.15, cx, cy + 1.45);
-  doc.setFillColor(...COLORS.navy);
+  doc.setFillColor(...color);
   doc.circle(cx, cy - 0.45, 0.35, 'F');
 }
 
-function drawPhoneIcon(doc: jsPDF, cx: number, cy: number): void {
-  doc.setDrawColor(...COLORS.navy);
+function drawPhoneIcon(doc: jsPDF, cx: number, cy: number, color: Rgb): void {
+  doc.setDrawColor(...color);
   doc.setLineWidth(0.32);
   const pts: Array<[number, number]> = [
     [cx - 1.05, cy - 1.1],
@@ -312,7 +386,13 @@ function drawGlobeIcon(doc: jsPDF, cx: number, cy: number, r: number, color: Rgb
  * Matches the exact circular rings, top/bottom curved text arcs, and faint inner emblem
  * visible behind the intro paragraph, Owner/Vehicle tables, and Section C in PS-26-R1001042.pdf.
  */
-function drawCircularWatermark(doc: jsPDF, cx: number, cy: number): void {
+function drawCircularWatermark(
+  doc: jsPDF,
+  cx: number,
+  cy: number,
+  brandHeaderName: string,
+  palette: BrandPalette
+): void {
   const outerR = 66.0;
   const dashR = 63.4;
   const innerRingR = 61.1;
@@ -321,7 +401,7 @@ function drawCircularWatermark(doc: jsPDF, cx: number, cy: number): void {
   doc.saveGraphicsState();
 
   // Outer thick solid ring
-  doc.setDrawColor(...COLORS.watermarkStroke);
+  doc.setDrawColor(...palette.watermarkStroke);
   doc.setLineWidth(1.0);
   doc.circle(cx, cy, outerR, 'S');
 
@@ -348,13 +428,13 @@ function drawCircularWatermark(doc: jsPDF, cx: number, cy: number): void {
   doc.setLineWidth(0.35);
   doc.circle(cx, cy, centerRingR, 'S');
 
-  // Curved text along top arc: PARIVAHAN SCRAPPERS
-  doc.setTextColor(...COLORS.watermarkText);
+  // Curved text along top arc: brand name (PARIVAHAN SCRAPPERS or SCRAP ROUTE)
+  doc.setTextColor(...palette.watermarkText);
   doc.setFont('times', 'bold');
   doc.setFontSize(14.0);
-  const topText = 'PARIVAHAN SCRAPPERS';
+  const topText = brandHeaderName;
   const topRadius = 52.6;
-  const topSpanDeg = 122;
+  const topSpanDeg = topText.length <= 12 ? 84 : 122;
   const topStartDeg = -90 - topSpanDeg / 2;
   const topStepDeg = topSpanDeg / Math.max(1, topText.length - 1);
 
@@ -370,8 +450,6 @@ function drawCircularWatermark(doc: jsPDF, cx: number, cy: number): void {
   }
 
   // Curved text along bottom arc: RESPONSIBLE RECYCLING • GREENER INDIA
-  // Positioned at radius 47.4 (center 148.8 -> bottom 196.2mm) so it curves cleanly
-  // across the open lower area of Section B right above Section C just like the reference.
   doc.setFont('times', 'bold');
   doc.setFontSize(9.8);
   const bottomText = 'RESPONSIBLE RECYCLING  •  GREENER INDIA';
@@ -397,9 +475,14 @@ function drawCircularWatermark(doc: jsPDF, cx: number, cy: number): void {
 /**
  * Draws the handwritten blue-ink authorised signatory flourish matching the reference PDF.
  */
-function drawBlueSignatureStroke(doc: jsPDF, startX: number, baseY: number): void {
+function drawBlueSignatureStroke(
+  doc: jsPDF,
+  startX: number,
+  baseY: number,
+  palette: BrandPalette
+): void {
   doc.saveGraphicsState();
-  doc.setDrawColor(...COLORS.signatureBlue);
+  doc.setDrawColor(...palette.signatureBlue);
   doc.setLineWidth(0.44);
   doc.setLineCap('round');
   doc.setLineJoin('round');
@@ -448,30 +531,36 @@ function drawBlueSignatureStroke(doc: jsPDF, startX: number, baseY: number): voi
 /**
  * Draws the 3 Environmental Responsibility circular icons in the bottom middle section.
  */
-function drawEcoBadges(doc: jsPDF, iconCx: number, textX: number, startY: number): void {
+function drawEcoBadges(
+  doc: jsPDF,
+  iconCx: number,
+  textX: number,
+  startY: number,
+  palette: BrandPalette
+): void {
   const rowGap = 5.8;
   const r = 2.05;
 
   // Row 1: Solid green leaf inside circular border
   const y1 = startY;
-  doc.setDrawColor(...COLORS.leafGreen);
+  doc.setDrawColor(...palette.leafGreen);
   doc.setLineWidth(0.28);
   doc.circle(iconCx, y1, r, 'S');
-  drawSmallTiltedLeaf(doc, iconCx, y1, 2.0);
+  drawSmallTiltedLeaf(doc, iconCx, y1, 2.0, palette);
 
   doc.setFont('helvetica', 'normal');
   doc.setFontSize(7.6);
-  doc.setTextColor(...COLORS.inkBody);
+  doc.setTextColor(...palette.inkBody);
   doc.text('Environmentally Responsible', textX, y1 + 0.9);
 
   // Row 2: Circular recycle arrows inside circular border
   const y2 = startY + rowGap;
-  doc.setDrawColor(...COLORS.leafGreen);
+  doc.setDrawColor(...palette.leafGreen);
   doc.setLineWidth(0.28);
   doc.circle(iconCx, y2, r, 'S');
   const ir = 1.05;
   doc.setLineWidth(0.24);
-  doc.setFillColor(...COLORS.leafGreen);
+  doc.setFillColor(...palette.leafGreen);
   for (let arc = 0; arc < 2; arc++) {
     const startDeg = arc === 0 ? -155 : 25;
     const endDeg = arc === 0 ? -25 : 155;
@@ -491,32 +580,39 @@ function drawEcoBadges(doc: jsPDF, iconCx: number, textX: number, startY: number
 
   doc.setFont('helvetica', 'normal');
   doc.setFontSize(7.6);
-  doc.setTextColor(...COLORS.inkBody);
+  doc.setTextColor(...palette.inkBody);
   doc.text('Resource Conservation', textX, y2 + 0.9);
 
   // Row 3: Globe inside circular border
   const y3 = startY + rowGap * 2;
-  doc.setDrawColor(...COLORS.leafGreen);
+  doc.setDrawColor(...palette.leafGreen);
   doc.setLineWidth(0.28);
   doc.circle(iconCx, y3, r, 'S');
-  drawGlobeIcon(doc, iconCx, y3, 1.3, COLORS.leafGreen);
+  drawGlobeIcon(doc, iconCx, y3, 1.3, palette.leafGreen);
 
   doc.setFont('helvetica', 'normal');
   doc.setFontSize(7.6);
-  doc.setTextColor(...COLORS.inkBody);
+  doc.setTextColor(...palette.inkBody);
   doc.text('Sustainable Tomorrow', textX, y3 + 0.9);
 }
 
 /**
- * Draws the introductory paragraph with crisp word spacing and inline bold "PARIVAHAN SCRAPPERS".
+ * Draws the introductory paragraph with crisp word spacing and inline bold brand name.
  */
-function drawIntroParagraph(doc: jsPDF, x: number, y: number, maxWidth: number): void {
+function drawIntroParagraph(
+  doc: jsPDF,
+  x: number,
+  y: number,
+  maxWidth: number,
+  brandHeaderName: string,
+  palette: BrandPalette
+): void {
   const words: Array<{ text: string; bold: boolean }> = [
     ...'This is to certify that the motor vehicle mentioned below has been received by'
       .split(' ')
       .map((text) => ({ text, bold: false })),
-    { text: 'PARIVAHAN SCRAPPERS', bold: true },
-    ...'(A Unit OF Scrapping Yard Ltd.) for dismantling and environmentally sound recycling, in accordance with the provisions of the Vehicle Scrappage Policy and all applicable environmental regulations.'
+    { text: brandHeaderName, bold: true },
+    ...'for dismantling and environmentally sound recycling, in accordance with the provisions of the Vehicle Scrappage Policy and all applicable environmental regulations.'
       .split(' ')
       .map((text) => ({ text, bold: false })),
   ];
@@ -525,7 +621,7 @@ function drawIntroParagraph(doc: jsPDF, x: number, y: number, maxWidth: number):
   const lineHeight = 4.65;
   doc.setFont('times', 'normal');
   doc.setFontSize(fontSize);
-  doc.setTextColor(...COLORS.inkDark);
+  doc.setTextColor(...palette.inkDark);
 
   const naturalSpaceW = Math.max(doc.getTextWidth(' '), 0.95);
 
@@ -580,6 +676,11 @@ export async function buildCertificatePdfDoc(
   cert: CertificateRecord,
   options?: PdfBrandingOptions
 ): Promise<{ doc: jsPDF; fileName: string; verifyUrl: string }> {
+  const brand = getCertificateBrand(cert);
+  const isScrapRoute = brand === 'scrap_route';
+  const palette = getBrandPalette(brand);
+  const brandHeaderName = isScrapRoute ? SCRAP_ROUTE_HEADER_NAME : COMPANY_HEADER_NAME;
+
   const doc = new jsPDF({ orientation: 'portrait', unit: 'mm', format: 'a4' });
   const pageWidth = doc.internal.pageSize.getWidth(); // 210
   const pageHeight = doc.internal.pageSize.getHeight(); // 297
@@ -590,9 +691,9 @@ export async function buildCertificatePdfDoc(
   const centerX = pageWidth / 2; // 105mm
 
   // =========================================================================
-  // 1. DOUBLE-LINE NAVY OUTER BORDER (exact match to PS-26-R1001042.pdf)
+  // 1. DOUBLE-LINE OUTER BORDER
   // =========================================================================
-  doc.setDrawColor(...COLORS.navy);
+  doc.setDrawColor(...palette.primary);
   doc.setLineWidth(0.6);
   doc.rect(4.6, 4.6, pageWidth - 9.2, pageHeight - 9.2);
   doc.setLineWidth(0.25);
@@ -601,56 +702,53 @@ export async function buildCertificatePdfDoc(
   // =========================================================================
   // 2. SUBTLE CIRCULAR WATERMARK BEHIND CENTRAL CONTENT
   // =========================================================================
-  drawCircularWatermark(doc, centerX, 148.8);
+  drawCircularWatermark(doc, centerX, 148.8, brandHeaderName, palette);
 
   // =========================================================================
-  // 3. TOP HEADER — COMPANY BRANDING & RESPONSIBLE RECYCLING PANEL
+  // 3. TOP HEADER — BRANDING & RESPONSIBLE RECYCLING PANEL
   // =========================================================================
   doc.setFont('times', 'bold');
-  doc.setFontSize(23.2);
-  doc.setTextColor(...COLORS.navy);
-  doc.text(COMPANY_HEADER_NAME, contentX, 15.2);
+  doc.setFontSize(isScrapRoute ? 24.5 : 23.2);
+  doc.setTextColor(...palette.primary);
+  doc.text(brandHeaderName, contentX, 17.6);
 
-  doc.setFont('times', 'bold');
-  doc.setFontSize(11.0);
-  doc.setTextColor(...COLORS.inkDark);
-  doc.text(COMPANY_SUBTITLE, contentX, 21.6);
-
-  // Contact Rows with crisp vector icons
+  // Contact Rows with crisp vector icons (NO top subtitle; website shown ONLY on Parivahan)
   const iconX = 10.4;
   const contactTextX = 14.2;
   doc.setFont('helvetica', 'normal');
   doc.setFontSize(8.3);
-  doc.setTextColor(...COLORS.inkDark);
+  doc.setTextColor(...palette.inkDark);
 
-  drawPinIcon(doc, iconX, 28.0);
-  doc.text(COMPANY_ADDRESS_LINE, contactTextX, 28.8);
+  drawPinIcon(doc, iconX, isScrapRoute ? 26.8 : 25.4, palette.primary);
+  doc.text(COMPANY_ADDRESS_LINE, contactTextX, isScrapRoute ? 27.6 : 26.2);
 
-  drawPhoneIcon(doc, iconX, 33.2);
-  doc.text(COMPANY_PHONE_LINE, contactTextX, 34.1);
+  drawPhoneIcon(doc, iconX, isScrapRoute ? 32.8 : 31.0, palette.primary);
+  doc.text(COMPANY_PHONE_LINE, contactTextX, isScrapRoute ? 33.7 : 31.9);
 
-  drawGlobeIcon(doc, iconX, 38.6, 1.35, COLORS.navy);
-  doc.setTextColor(...COLORS.navy);
-  doc.text(COMPANY_WEBSITE_LINE, contactTextX, 39.4);
+  if (!isScrapRoute) {
+    drawGlobeIcon(doc, iconX, 36.8, 1.35, palette.primary);
+    doc.setTextColor(...palette.primary);
+    doc.text(COMPANY_WEBSITE_LINE, contactTextX, 37.6);
+  }
 
   // Vertical Header Divider
-  doc.setDrawColor(...COLORS.navy);
+  doc.setDrawColor(...palette.primary);
   doc.setLineWidth(0.28);
   doc.line(150.7, 9.5, 150.7, 40.6);
 
   // Top-Right Responsible Recycling Logo & Text
-  drawHeaderLeafIcon(doc, 164.0, 19.6, 6.4, 10.2);
+  drawHeaderLeafIcon(doc, 164.0, 19.6, 6.4, 10.2, palette);
 
   doc.setFont('times', 'bold');
   doc.setFontSize(10.6);
-  doc.setTextColor(...COLORS.navy);
+  doc.setTextColor(...palette.primary);
   doc.text('Responsible', 174.3, 21.3);
   doc.text('Recycling', 174.3, 25.9);
-  doc.setTextColor(...COLORS.leafGreen);
+  doc.setTextColor(...palette.leafGreen);
   doc.text('Greener India', 174.3, 30.5);
 
   // Header Horizontal Divider
-  doc.setDrawColor(...COLORS.navy);
+  doc.setDrawColor(...palette.primary);
   doc.setLineWidth(0.42);
   doc.line(contentX, 44.5, contentRight, 44.5);
 
@@ -659,7 +757,7 @@ export async function buildCertificatePdfDoc(
   // =========================================================================
   doc.setFont('times', 'bold');
   doc.setFontSize(10.5);
-  doc.setTextColor(...COLORS.navy);
+  doc.setTextColor(...palette.primary);
   doc.text(`Certificate No. : ${cert.certificateNumber}`, contentX, 50.8);
   doc.text(`Date of Issue : ${formatDisplayDate(cert.issueDate)}`, contentRight, 50.8, {
     align: 'right',
@@ -670,12 +768,12 @@ export async function buildCertificatePdfDoc(
   // =========================================================================
   doc.setFont('times', 'bold');
   doc.setFontSize(20.0);
-  doc.setTextColor(...COLORS.navy);
+  doc.setTextColor(...palette.primary);
   doc.text('VEHICLE SCRAPPING CERTIFICATE', centerX, 62.2, { align: 'center' });
 
   doc.setFont('helvetica', 'normal');
   doc.setFontSize(7.1);
-  doc.setTextColor(...COLORS.navySubtitle);
+  doc.setTextColor(...palette.subtitle);
   drawCenteredSpacedText(
     doc,
     'ISSUED IN ACCORDANCE WITH APPLICABLE VEHICLE SCRAPPAGE REGULATIONS',
@@ -685,14 +783,14 @@ export async function buildCertificatePdfDoc(
   );
 
   // Small centered solid green leaf above banner
-  drawSmallTiltedLeaf(doc, centerX, 72.7, 3.0);
+  drawSmallTiltedLeaf(doc, centerX, 72.7, 3.0, palette);
 
   // Pale-green Sustainability Banner
-  doc.setFillColor(...COLORS.bannerFill);
+  doc.setFillColor(...palette.bannerFill);
   doc.rect(51.65, 76.2, 106.7, 6.4, 'F');
   doc.setFont('helvetica', 'bold');
   doc.setFontSize(7.6);
-  doc.setTextColor(...COLORS.bannerText);
+  doc.setTextColor(...palette.bannerText);
   drawCenteredSpacedText(
     doc,
     'RESPONSIBLE SCRAPPING FOR A GREENER TOMORROW',
@@ -704,132 +802,168 @@ export async function buildCertificatePdfDoc(
   // =========================================================================
   // 6. INTRODUCTORY PARAGRAPH
   // =========================================================================
-  drawIntroParagraph(doc, contentX, 87.9, contentW);
+  drawIntroParagraph(doc, contentX, 87.9, contentW, brandHeaderName, palette);
 
   // =========================================================================
-  // 7. SECTION A — OWNER DETAILS
+  // 7. SECTION A — OWNER DETAILS (Address & ID Proof are optional)
   // =========================================================================
   const secAY = 101.8;
   const secAHdrH = 6.0;
-  const secABodyH = 21.8;
   const ownerSplitX = 73.3;
 
-  // Section A Header Bar
-  doc.setFillColor(...COLORS.sectionFill);
-  doc.setDrawColor(...COLORS.tableBorder);
-  doc.setLineWidth(0.3);
-  doc.rect(contentX, secAY, contentW, secAHdrH, 'FD');
+  const trimmedAddress = (cert.ownerAddress ?? '').trim();
+  const trimmedIdNumber = (cert.idProofNumber ?? '').trim();
+  const formattedIdProof = trimmedIdNumber
+    ? `${cert.idProofType ? `${cert.idProofType}: ` : ''}${trimmedIdNumber}`
+    : '';
 
-  doc.setFont('times', 'bold');
-  doc.setFontSize(9.5);
-  doc.setTextColor(...COLORS.navySection);
-  doc.text('A. OWNER DETAILS', contentX + 2.6, secAY + 4.15);
+  interface OwnerRowSpec {
+    label: string;
+    value: string;
+    kind: 'name' | 'address' | 'id';
+  }
 
-  // Section A White Table Body (opaque white masks watermark cleanly inside owner fields)
-  const ownerBodyY = secAY + secAHdrH;
-  doc.setFillColor(255, 255, 255);
-  doc.setDrawColor(...COLORS.tableBorder);
-  doc.setLineWidth(0.3);
-  doc.rect(contentX, ownerBodyY, contentW, secABodyH, 'FD');
-  doc.line(ownerSplitX, ownerBodyY, ownerSplitX, ownerBodyY + secABodyH);
+  const ownerRows: OwnerRowSpec[] = [
+    { label: 'Owner Name', value: cert.ownerName.toUpperCase(), kind: 'name' },
+  ];
+  if (trimmedAddress) {
+    ownerRows.push({ label: 'Address', value: trimmedAddress, kind: 'address' });
+  }
+  if (formattedIdProof) {
+    ownerRows.push({ label: 'ID Proof Number', value: formattedIdProof, kind: 'id' });
+  }
 
   const ownerLabelX = contentX + 2.6;
   const ownerValX = ownerSplitX + 2.6;
   const ownerValMaxW = contentRight - ownerValX - 2.6;
 
-  const idProofText = cert.idProofNumber
-    ? `${cert.idProofType ? `${cert.idProofType}: ` : ''}${cert.idProofNumber}`
-    : 'Not Provided';
+  // Measure whether address wraps to 2 lines when only 2 rows are rendered
+  let addressWrapsTwoLines = false;
+  if (trimmedAddress) {
+    doc.setFont('helvetica', 'normal');
+    doc.setFontSize(8.4);
+    const addrLines = doc.splitTextToSize(trimmedAddress.replace(/\s+/g, ' '), ownerValMaxW) as string[];
+    addressWrapsTwoLines = addrLines.length > 1;
+  }
 
-  // Row 1: Owner Name
-  doc.setFont('helvetica', 'bold');
-  doc.setFontSize(8.7);
-  doc.setTextColor(...COLORS.inkDark);
-  doc.text('Owner Name', ownerLabelX, ownerBodyY + 5.1);
-  doc.setTextColor(...COLORS.navy);
-  drawFittedSingleLine(
-    doc,
-    cert.ownerName.toUpperCase(),
-    ownerValX,
-    ownerBodyY + 5.1,
-    ownerValMaxW,
-    'helvetica',
-    'bold',
-    8.7,
-    6.8
-  );
+  const secABodyH =
+    ownerRows.length === 3
+      ? 21.8
+      : ownerRows.length === 2
+        ? addressWrapsTwoLines
+          ? 17.6
+          : 14.8
+        : 8.0;
 
-  // Row 2: Address
-  doc.setFont('helvetica', 'bold');
-  doc.setFontSize(8.7);
-  doc.setTextColor(...COLORS.inkDark);
-  doc.text('Address', ownerLabelX, ownerBodyY + 12.2);
-  doc.setTextColor(...COLORS.inkBody);
-  drawFittedMultiLine(
-    doc,
-    cert.ownerAddress || 'Not Provided',
-    ownerValX,
-    ownerBodyY + 12.2,
-    ownerValMaxW,
-    2,
-    'helvetica',
-    'normal',
-    8.4,
-    3.6,
-    6.5
-  );
+  // Section A Header Bar
+  doc.setFillColor(...palette.sectionFill);
+  doc.setDrawColor(...palette.tableBorder);
+  doc.setLineWidth(0.3);
+  doc.rect(contentX, secAY, contentW, secAHdrH, 'FD');
 
-  // Row 3: ID Proof Number
-  doc.setFont('helvetica', 'bold');
-  doc.setFontSize(8.7);
-  doc.setTextColor(...COLORS.inkDark);
-  doc.text('ID Proof Number', ownerLabelX, ownerBodyY + 19.3);
-  doc.setTextColor(...COLORS.inkBody);
-  drawFittedSingleLine(
-    doc,
-    idProofText,
-    ownerValX,
-    ownerBodyY + 19.3,
-    ownerValMaxW,
-    'helvetica',
-    'normal',
-    8.4,
-    6.8
-  );
+  doc.setFont('times', 'bold');
+  doc.setFontSize(9.5);
+  doc.setTextColor(...palette.sectionText);
+  doc.text('A. OWNER DETAILS', contentX + 2.6, secAY + 4.15);
+
+  // Section A White Table Body (opaque white masks watermark cleanly inside owner fields)
+  const ownerBodyY = secAY + secAHdrH;
+  doc.setFillColor(255, 255, 255);
+  doc.setDrawColor(...palette.tableBorder);
+  doc.setLineWidth(0.3);
+  doc.rect(contentX, ownerBodyY, contentW, secABodyH, 'FD');
+  doc.line(ownerSplitX, ownerBodyY, ownerSplitX, ownerBodyY + secABodyH);
+
+  ownerRows.forEach((row, idx) => {
+    const rowBaselineY =
+      ownerRows.length === 1 ? ownerBodyY + 5.2 : ownerBodyY + 5.1 + idx * 7.1;
+
+    doc.setFont('helvetica', 'bold');
+    doc.setFontSize(8.7);
+    doc.setTextColor(...palette.inkDark);
+    doc.text(row.label, ownerLabelX, rowBaselineY);
+
+    if (row.kind === 'name') {
+      doc.setTextColor(...palette.primary);
+      drawFittedSingleLine(
+        doc,
+        row.value,
+        ownerValX,
+        rowBaselineY,
+        ownerValMaxW,
+        'helvetica',
+        'bold',
+        8.7,
+        6.8
+      );
+    } else if (row.kind === 'address') {
+      doc.setTextColor(...palette.inkBody);
+      drawFittedMultiLine(
+        doc,
+        row.value,
+        ownerValX,
+        rowBaselineY,
+        ownerValMaxW,
+        2,
+        'helvetica',
+        'normal',
+        8.4,
+        3.6,
+        6.5
+      );
+    } else {
+      doc.setTextColor(...palette.inkBody);
+      drawFittedSingleLine(
+        doc,
+        row.value,
+        ownerValX,
+        rowBaselineY,
+        ownerValMaxW,
+        'helvetica',
+        'normal',
+        8.4,
+        6.8
+      );
+    }
+  });
+
+  // Automatically redistribute space saved when optional Address/ID rows are omitted
+  // (savedSpace === 0 when all 3 rows are present, preserving exact reference coordinates)
+  const savedSpace = Math.max(0, 21.8 - secABodyH);
+  const secABottom = ownerBodyY + secABodyH;
 
   // =========================================================================
   // 8. SECTION B — VEHICLE DETAILS + QR VERIFICATION PANEL
   // =========================================================================
-  const secBY = 131.9;
+  const secBY = Number((secABottom + 2.3 + savedSpace * 0.15).toFixed(2));
   const secBHdrH = 6.2;
 
   // Section B Header Bar
-  doc.setFillColor(...COLORS.sectionFill);
-  doc.setDrawColor(...COLORS.tableBorder);
+  doc.setFillColor(...palette.sectionFill);
+  doc.setDrawColor(...palette.tableBorder);
   doc.setLineWidth(0.3);
   doc.rect(contentX, secBY, contentW, secBHdrH, 'FD');
 
   doc.setFont('times', 'bold');
   doc.setFontSize(9.5);
-  doc.setTextColor(...COLORS.navySection);
+  doc.setTextColor(...palette.sectionText);
   doc.text('B. VEHICLE DETAILS', contentX + 2.6, secBY + 4.25);
 
   // Main Vehicle Table + QR Panel Box (1.4mm gap below header matches reference)
-  const vehTableY = 139.5;
-  const vehTableH = 58.3; // ends at 197.8mm
+  const vehTableY = Number((secBY + secBHdrH + 1.4).toFixed(2));
+  const vehTableH = 58.3;
   const vehSplitX = 68.9;
   const qrPanelX = 154.8;
   const qrPanelW = contentRight - qrPanelX; // 46.2mm
   const qrCenterX = qrPanelX + qrPanelW / 2; // 177.9mm
 
-  // Solid white fill behind vehicle rows 1-9 text (up to y=191.5mm) and QR panel,
-  // leaving the bottom strip (191.5..197.8mm) open so the curved watermark bottom arc
-  // ("RESPONSIBLE RECYCLING • GREENER INDIA") peeks through identically to PS-26-R1001042.pdf.
+  // Solid white fill behind vehicle rows text and QR panel, leaving the bottom strip open
+  // so the curved watermark bottom arc peeks through cleanly.
   doc.setFillColor(255, 255, 255);
   doc.rect(contentX, vehTableY, qrPanelX - contentX, 52.0, 'F');
   doc.rect(qrPanelX, vehTableY, qrPanelW, vehTableH, 'F');
 
-  doc.setDrawColor(...COLORS.tableBorder);
+  doc.setDrawColor(...palette.tableBorder);
   doc.setLineWidth(0.3);
   doc.rect(contentX, vehTableY, contentW, vehTableH, 'S');
   doc.line(vehSplitX, vehTableY, vehSplitX, vehTableY + vehTableH);
@@ -916,10 +1050,10 @@ export async function buildCertificatePdfDoc(
 
     doc.setFont('helvetica', 'bold');
     doc.setFontSize(8.5);
-    doc.setTextColor(...COLORS.inkDark);
+    doc.setTextColor(...palette.inkDark);
     doc.text(row.label, vehLabelX, baselineY);
 
-    doc.setTextColor(...(row.boldValue ? COLORS.navy : COLORS.inkDark));
+    doc.setTextColor(...(row.boldValue ? palette.primary : palette.inkDark));
     drawFittedSingleLine(
       doc,
       row.value,
@@ -934,20 +1068,20 @@ export async function buildCertificatePdfDoc(
 
     curRowY += row.rowHeight;
     if (row.drawBottomBorder) {
-      doc.setDrawColor(...COLORS.tableBorder);
+      doc.setDrawColor(...palette.tableBorder);
       doc.setLineWidth(0.28);
       doc.line(contentX, curRowY, qrPanelX, curRowY);
     }
   });
 
-  // Right QR Verification Panel
+  // Right QR Verification Panel (positioned relative to vehTableY)
   const verifyUrl = buildVerificationUrl(cert, options?.customDomain);
   const qrDataUrl = await generateQrDataUrl(verifyUrl);
 
   const qrBoxSize = 33.4;
   const qrBoxX = qrCenterX - qrBoxSize / 2; // 161.2mm
-  const qrBoxY = 144.8;
-  doc.setDrawColor(...COLORS.subtleBorder);
+  const qrBoxY = vehTableY + 5.3;
+  doc.setDrawColor(...palette.subtleBorder);
   doc.setLineWidth(0.28);
   doc.roundedRect(qrBoxX, qrBoxY, qrBoxSize, qrBoxSize, 1.0, 1.0, 'S');
 
@@ -965,24 +1099,24 @@ export async function buildCertificatePdfDoc(
   // "SCAN TO VERIFY"
   doc.setFont('times', 'bold');
   doc.setFontSize(8.2);
-  doc.setTextColor(...COLORS.navy);
-  doc.text('SCAN TO VERIFY', qrCenterX, 181.8, { align: 'center' });
+  doc.setTextColor(...palette.primary);
+  doc.text('SCAN TO VERIFY', qrCenterX, vehTableY + 42.3, { align: 'center' });
 
   // Subtle horizontal rule split by solid small green leaf
-  const qrDividerY = 185.7;
-  doc.setDrawColor(...COLORS.subtleBorder);
+  const qrDividerY = vehTableY + 46.2;
+  doc.setDrawColor(...palette.subtleBorder);
   doc.setLineWidth(0.24);
   doc.line(qrBoxX, qrDividerY, qrCenterX - 3.6, qrDividerY);
   doc.line(qrCenterX + 3.6, qrDividerY, qrBoxX + qrBoxSize, qrDividerY);
-  drawSmallTiltedLeaf(doc, qrCenterX, qrDividerY, 2.4);
+  drawSmallTiltedLeaf(doc, qrCenterX, qrDividerY, 2.4, palette);
 
   // Dynamic Certificate Number below QR
-  doc.setTextColor(...COLORS.navy);
+  doc.setTextColor(...palette.primary);
   drawFittedSingleLine(
     doc,
     cert.certificateNumber,
     qrCenterX,
-    191.8,
+    vehTableY + 52.3,
     qrPanelW - 4,
     'helvetica',
     'bold',
@@ -994,39 +1128,41 @@ export async function buildCertificatePdfDoc(
   // =========================================================================
   // 9. SECTION C — TERMS & CERTIFICATIONS
   // =========================================================================
-  const secCY = 200.5;
+  const secCY = Number((vehTableY + vehTableH + 2.7 + savedSpace * 0.2).toFixed(2));
   const secCHdrH = 5.6;
 
-  doc.setFillColor(...COLORS.sectionFill);
-  doc.setDrawColor(...COLORS.tableBorder);
+  doc.setFillColor(...palette.sectionFill);
+  doc.setDrawColor(...palette.tableBorder);
   doc.setLineWidth(0.3);
   doc.rect(contentX, secCY, contentW, secCHdrH, 'FD');
 
   doc.setFont('times', 'bold');
   doc.setFontSize(9.5);
-  doc.setTextColor(...COLORS.navySection);
+  doc.setTextColor(...palette.sectionText);
   doc.text('C. TERMS & CERTIFICATIONS', contentX + 2.6, secCY + 3.9);
 
+  const extraTermStep = Number((savedSpace * 0.06).toFixed(2));
+  const brandProseName = isScrapRoute ? 'Scrap Route' : 'Parivahan Scrappers';
   const terms: Array<{ num: string; text: string; y: number }> = [
     {
       num: '1',
-      text: 'Parivahan Scrappers undertakes to dismantle the vehicle and process all recoverable metal, plastic, and fluid components through authorized channels compliant with environmental and recycling standards.',
-      y: 210.4,
+      text: `${brandProseName} undertakes to dismantle the vehicle and process all recoverable metal, plastic, and fluid components through authorized channels compliant with environmental and recycling standards.`,
+      y: secCY + 9.9,
     },
     {
       num: '2',
       text: 'Once accepted for scrapping, the vehicle, its chassis, engine, or registered component parts shall not be restored, resold, re-registered, or returned to road use in any jurisdiction.',
-      y: 218.4,
+      y: secCY + 17.9 + extraTermStep,
     },
     {
       num: '3',
       text: 'This certificate, with the scrapping video record, constitutes complete documentary proof of the vehicle disposal furnished to the customer.',
-      y: 226.4,
+      y: secCY + 25.9 + extraTermStep * 2,
     },
     {
       num: '4',
       text: "This certificate is issued as proof of handover and processing intent; statutory de-registration remains the customer's responsibility with the transport authority.",
-      y: 232.0,
+      y: secCY + 31.5 + extraTermStep * 3,
     },
   ];
 
@@ -1035,7 +1171,7 @@ export async function buildCertificatePdfDoc(
   const termMaxW = contentRight - termTextX - 0.5;
 
   for (const term of terms) {
-    doc.setFillColor(...COLORS.navy);
+    doc.setFillColor(...palette.primary);
     doc.circle(badgeCx, term.y - 0.7, 1.85, 'F');
     doc.setFont('helvetica', 'bold');
     doc.setFontSize(6.6);
@@ -1044,7 +1180,7 @@ export async function buildCertificatePdfDoc(
 
     doc.setFont('times', 'normal');
     doc.setFontSize(8.2);
-    doc.setTextColor(...COLORS.inkBody);
+    doc.setTextColor(...palette.inkBody);
     const wrapped = doc.splitTextToSize(term.text, termMaxW) as string[];
     wrapped.forEach((line, idx) => {
       doc.text(line, termTextX, term.y + idx * 3.45);
@@ -1054,54 +1190,60 @@ export async function buildCertificatePdfDoc(
   // =========================================================================
   // 10. AUTHORISATION, ENVIRONMENTAL RESPONSIBILITY & GREEN MESSAGE PANEL
   // =========================================================================
-  // Left: Company Authorisation & Signature
-  doc.setFont('times', 'bold');
-  doc.setFontSize(9.0);
-  doc.setTextColor(...COLORS.navy);
-  doc.text('For PARIVAHAN SCRAPPERS', contentX, 240.0);
+  const authBaseY = Number((secCY + 36.9 + extraTermStep * 3 + savedSpace * 0.25).toFixed(2));
 
-  doc.setFont('times', 'normal');
-  doc.setFontSize(7.6);
-  doc.setTextColor(...COLORS.inkMuted);
-  doc.text(`(${COMPANY_SUBTITLE})`, contentX, 243.2);
+  // Left: Brand Authorisation & Signature
+  // Parivahan: Line 1 "PARIVAHAN SCRAPPERS", Line 2 "A UNIT OF SCRAP ROUTE"
+  // Scrap Route: Line 1 "SCRAP ROUTE" ONLY (no Parivahan wording, no second subtitle)
+  doc.setFont('times', 'bold');
+  doc.setFontSize(9.2);
+  doc.setTextColor(...palette.primary);
+  doc.text(brandHeaderName, contentX, authBaseY + 2.6);
+
+  if (!isScrapRoute) {
+    doc.setFont('times', 'bold');
+    doc.setFontSize(7.5);
+    doc.setTextColor(...palette.inkMuted);
+    doc.text(COMPANY_BOTTOM_SUBTITLE, contentX, authBaseY + 6.0);
+  }
 
   // Handwritten Blue Signature
-  drawBlueSignatureStroke(doc, 11.6, 247.3);
+  drawBlueSignatureStroke(doc, 11.6, authBaseY + 9.9, palette);
 
   // Signature Rule & Label
-  doc.setDrawColor(...COLORS.navy);
+  doc.setDrawColor(...palette.primary);
   doc.setLineWidth(0.32);
-  doc.line(contentX, 255.3, 54.7, 255.3);
+  doc.line(contentX, authBaseY + 17.9, 54.7, authBaseY + 17.9);
 
   doc.setFont('times', 'bold');
   doc.setFontSize(8.8);
-  doc.setTextColor(...COLORS.navy);
-  doc.text('Authorised Signatory', contentX, 259.1);
+  doc.setTextColor(...palette.primary);
+  doc.text('Authorised Signatory', contentX, authBaseY + 21.7);
 
   // Middle: Vertical Divider + 3 Environmental Responsibility Badges
-  doc.setDrawColor(...COLORS.subtleBorder);
+  doc.setDrawColor(...palette.subtleBorder);
   doc.setLineWidth(0.25);
-  doc.line(89.8, 241.0, 89.8, 257.4);
-  drawEcoBadges(doc, 95.0, 99.0, 243.5);
+  doc.line(89.8, authBaseY + 3.6, 89.8, authBaseY + 20.0);
+  drawEcoBadges(doc, 95.0, 99.0, authBaseY + 6.1, palette);
 
   // Right: Green Message Panel
   const greenBoxX = 154.8;
-  const greenBoxY = 237.4;
+  const greenBoxY = authBaseY;
   const greenBoxW = 46.2;
   const greenBoxH = 23.0;
   const greenBoxCx = greenBoxX + greenBoxW / 2;
 
-  doc.setFillColor(...COLORS.greenBoxFill);
-  doc.setDrawColor(...COLORS.greenBoxBorder);
+  doc.setFillColor(...palette.greenBoxFill);
+  doc.setDrawColor(...palette.greenBoxBorder);
   doc.setLineWidth(0.35);
   doc.rect(greenBoxX, greenBoxY, greenBoxW, greenBoxH, 'FD');
 
   doc.setFont('times', 'bold');
   doc.setFontSize(9.4);
-  doc.setTextColor(...COLORS.greenBoxText);
-  doc.text('End-of-Life', greenBoxCx, 246.2, { align: 'center' });
-  doc.text('Vehicles Deserve', greenBoxCx, 250.2, { align: 'center' });
-  doc.text('a Better Future.', greenBoxCx, 254.2, { align: 'center' });
+  doc.setTextColor(...palette.greenBoxText);
+  doc.text('End-of-Life', greenBoxCx, greenBoxY + 8.8, { align: 'center' });
+  doc.text('Vehicles Deserve', greenBoxCx, greenBoxY + 12.8, { align: 'center' });
+  doc.text('a Better Future.', greenBoxCx, greenBoxY + 16.8, { align: 'center' });
 
   // =========================================================================
   // 11. CANCELLED STAMP OVERLAY (ONLY IF STATUS IS CANCELLED)
@@ -1121,24 +1263,24 @@ export async function buildCertificatePdfDoc(
   // =========================================================================
   // 12. BOTTOM FOOTER
   // =========================================================================
-  doc.setDrawColor(...COLORS.footerRule);
+  doc.setDrawColor(...palette.footerRule);
   doc.setLineWidth(0.28);
   doc.line(contentX, 283.5, contentRight, 283.5);
 
   // Small minimal laptop/document icon on bottom-left
-  doc.setDrawColor(...COLORS.inkMuted);
+  doc.setDrawColor(...palette.inkMuted);
   doc.setLineWidth(0.28);
   doc.rect(9.3, 285.4, 2.3, 1.55, 'S');
   doc.line(8.9, 287.2, 12.0, 287.2);
 
   doc.setFont('helvetica', 'normal');
   doc.setFontSize(7.1);
-  doc.setTextColor(...COLORS.inkMuted);
+  doc.setTextColor(...palette.inkMuted);
   doc.text('Computer Generated Certificate • Digitally Verified', 15.1, 287.2);
 
   doc.setFont('helvetica', 'bold');
   doc.setFontSize(7.1);
-  doc.setTextColor(...COLORS.navy);
+  doc.setTextColor(...palette.primary);
   doc.text('Scan QR Code to Verify', contentRight, 287.2, { align: 'right' });
 
   const safeFileName = getCertificatePdfFilename(cert.certificateNumber);

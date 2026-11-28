@@ -1,12 +1,21 @@
 import React, { useState } from 'react';
 import { AlertCircle, ShieldAlert, X } from 'lucide-react';
-import type { CertificateRecord, CreateCertificateInput } from '../shared/types';
+import type { CertificateRecord, CreateCertificateInput, IdProofType } from '../shared/types';
 import {
   ALL_PRESET_MANUFACTURERS,
+  COMMON_MANUFACTURERS,
   OTHER_MANUFACTURER_VALUE,
-  VEHICLE_MANUFACTURER_GROUPS,
 } from '../shared/vehicleData';
 import { api, ApiError } from '../lib/api';
+
+const ID_PROOF_OPTIONS: Array<{ value: IdProofType; label: string }> = [
+  { value: '', label: '-- Not Provided (Optional) --' },
+  { value: 'Aadhaar Card', label: 'Aadhaar Card' },
+  { value: 'PAN Card', label: 'PAN Card' },
+  { value: 'Driving License', label: 'Driving License' },
+  { value: 'Passport', label: 'Passport' },
+  { value: 'Voter ID', label: 'Voter ID' },
+];
 
 export type ProtectedActionMode = 'edit' | 'cancel' | 'soft_delete' | 'permanent_delete' | 'restore';
 
@@ -24,6 +33,8 @@ export const ProtectedActionModal: React.FC<ProtectedActionModalProps> = ({
   onSuccess,
 }) => {
   const [protectedPassword, setProtectedPassword] = useState('');
+  const [mainAdminPassword, setMainAdminPassword] = useState('');
+  const [confirmCertificateNumber, setConfirmCertificateNumber] = useState('');
   const [reason, setReason] = useState('');
   const [confirmPhrase, setConfirmPhrase] = useState('');
   const [submitting, setSubmitting] = useState(false);
@@ -35,6 +46,8 @@ export const ProtectedActionModal: React.FC<ProtectedActionModalProps> = ({
   // Editable fields for Protected Edit mode
   const [ownerName, setOwnerName] = useState(certificate?.ownerName ?? '');
   const [ownerAddress, setOwnerAddress] = useState(certificate?.ownerAddress ?? '');
+  const [idProofType, setIdProofType] = useState<IdProofType>(certificate?.idProofType ?? '');
+  const [idProofNumber, setIdProofNumber] = useState(certificate?.idProofNumber ?? '');
   const [vehicleRegNumber, setVehicleRegNumber] = useState(certificate?.vehicleRegNumber ?? '');
   const [selectedMakeOption, setSelectedMakeOption] = useState(
     initialIsPreset ? initialMake : initialMake ? OTHER_MANUFACTURER_VALUE : ''
@@ -53,9 +66,9 @@ export const ProtectedActionModal: React.FC<ProtectedActionModalProps> = ({
   const titles: Record<ProtectedActionMode, string> = {
     edit: 'Protected Certificate Edit',
     cancel: 'Protected Certificate Cancellation',
-    soft_delete: 'Protected Soft Deletion',
-    permanent_delete: 'Permanent Certificate Deletion',
-    restore: 'Restore Soft-Deleted Certificate',
+    soft_delete: 'Archive Certificate (Reversible)',
+    permanent_delete: 'Owner-Authorized Permanent Deletion',
+    restore: 'Restore Archived Certificate',
   };
 
   const handleSubmit = async (e: React.FormEvent) => {
@@ -66,10 +79,30 @@ export const ProtectedActionModal: React.FC<ProtectedActionModalProps> = ({
     try {
       if (mode === 'edit') {
         const effectiveMake =
-          selectedMakeOption === OTHER_MANUFACTURER_VALUE ? customMake.trim() : selectedMakeOption;
+          selectedMakeOption === OTHER_MANUFACTURER_VALUE
+            ? customMake.trim()
+            : selectedMakeOption.trim();
+
+        if (
+          !effectiveMake ||
+          effectiveMake.length < 2 ||
+          effectiveMake === OTHER_MANUFACTURER_VALUE ||
+          (selectedMakeOption === OTHER_MANUFACTURER_VALUE &&
+            effectiveMake.toLowerCase() === 'other')
+        ) {
+          setError('Please enter a valid manufacturer name (at least 2 characters).');
+          return;
+        }
+
+        const cleanedAddress = ownerAddress.trim();
+        const cleanedIdNumber = idProofNumber.trim();
+        const cleanedIdType: IdProofType = cleanedIdNumber ? idProofType : '';
+
         const updates: Partial<CreateCertificateInput> = {
           ownerName,
-          ownerAddress,
+          ownerAddress: cleanedAddress,
+          idProofType: cleanedIdType,
+          idProofNumber: cleanedIdNumber,
           vehicleRegNumber,
           make: effectiveMake,
           model,
@@ -97,6 +130,8 @@ export const ProtectedActionModal: React.FC<ProtectedActionModalProps> = ({
       } else if (mode === 'permanent_delete') {
         await api.deleteCertificateProtected(certificate.id, {
           deletePassword: protectedPassword,
+          mainAdminPassword,
+          confirmCertificateNumber,
           reason,
           permanent: true,
           confirmPhrase,
@@ -192,6 +227,34 @@ export const ProtectedActionModal: React.FC<ProtectedActionModalProps> = ({
               </div>
               <div>
                 <label className="block text-xs font-medium text-slate-700 mb-1">
+                  ID Proof Type <span className="text-slate-400 font-normal">(Optional)</span>
+                </label>
+                <select
+                  value={idProofType}
+                  onChange={(e) => setIdProofType(e.target.value as IdProofType)}
+                  className="w-full px-3 py-2 rounded-lg border border-slate-300 text-sm bg-white"
+                >
+                  {ID_PROOF_OPTIONS.map((opt) => (
+                    <option key={opt.value || 'none'} value={opt.value}>
+                      {opt.label}
+                    </option>
+                  ))}
+                </select>
+              </div>
+              <div>
+                <label className="block text-xs font-medium text-slate-700 mb-1">
+                  ID Proof Number <span className="text-slate-400 font-normal">(Optional)</span>
+                </label>
+                <input
+                  type="text"
+                  value={idProofNumber}
+                  onChange={(e) => setIdProofNumber(e.target.value.toUpperCase())}
+                  placeholder="Optional"
+                  className="w-full px-3 py-2 rounded-lg border border-slate-300 text-sm font-mono"
+                />
+              </div>
+              <div>
+                <label className="block text-xs font-medium text-slate-700 mb-1">
                   Make / Manufacturer
                 </label>
                 <select
@@ -201,28 +264,33 @@ export const ProtectedActionModal: React.FC<ProtectedActionModalProps> = ({
                   className="w-full px-3 py-2 rounded-lg border border-slate-300 text-sm bg-white"
                 >
                   <option value="">-- Select Manufacturer --</option>
-                  {VEHICLE_MANUFACTURER_GROUPS.map((group) => (
-                    <optgroup key={group.category} label={group.category}>
-                      {group.brands.map((brand) => (
-                        <option key={brand} value={brand}>
-                          {brand}
-                        </option>
-                      ))}
-                    </optgroup>
+                  {COMMON_MANUFACTURERS.map((brand) => (
+                    <option key={brand} value={brand}>
+                      {brand}
+                    </option>
                   ))}
-                  <optgroup label="Other">
-                    <option value={OTHER_MANUFACTURER_VALUE}>Other (Type Manually)</option>
-                  </optgroup>
+                  <option value={OTHER_MANUFACTURER_VALUE}>Other</option>
                 </select>
                 {selectedMakeOption === OTHER_MANUFACTURER_VALUE && (
-                  <input
-                    type="text"
-                    required
-                    value={customMake}
-                    onChange={(e) => setCustomMake(e.target.value)}
-                    placeholder="Enter manufacturer"
-                    className="mt-2 w-full px-3 py-2 rounded-lg border border-slate-300 text-sm"
-                  />
+                  <div className="mt-2">
+                    <label
+                      htmlFor="protected-edit-custom-manufacturer"
+                      className="block text-xs font-medium text-slate-700 mb-1"
+                    >
+                      Enter Manufacturer Name <span className="text-red-600">*</span>
+                    </label>
+                    <input
+                      id="protected-edit-custom-manufacturer"
+                      name="customManufacturerName"
+                      type="text"
+                      required
+                      minLength={2}
+                      value={customMake}
+                      onChange={(e) => setCustomMake(e.target.value)}
+                      placeholder="Enter Manufacturer Name"
+                      className="w-full px-3 py-2 rounded-lg border border-slate-300 text-sm"
+                    />
+                  </div>
                 )}
               </div>
               <div>
@@ -292,19 +360,22 @@ export const ProtectedActionModal: React.FC<ProtectedActionModalProps> = ({
 
           {mode === 'soft_delete' && (
             <div className="p-3.5 rounded-lg bg-amber-50 border border-amber-200 text-xs text-amber-950">
-              Soft deletion hides this record from Maker views and public verification while keeping
-              it recoverable by Main Core Admin. Reserved numbers are never reused.
+              Archiving hides this certificate from Maker views and public QR verification while
+              preserving the full record and version history in Firestore. Main Core Admin can
+              restore archived certificates at any time. Reserved numbers are never reused.
             </div>
           )}
 
           {mode === 'permanent_delete' && (
-            <div className="p-3.5 rounded-lg bg-red-50 border border-red-200 text-xs text-red-900 space-y-2">
+            <div className="p-3.5 rounded-lg bg-red-50 border border-red-200 text-xs text-red-900 space-y-1.5">
               <p className="font-semibold">
-                Irreversible Operation — Automatic Pre-Delete Safety Backup Enabled
+                Owner-Only Irreversible Operation — Verified Safety Backup &amp; Integrity Gate Enforced
               </p>
               <p>
-                A verified safety snapshot will be created before permanently deleting this record.
-                Its certificate and scrapping numbers remain permanently reserved to prevent reuse.
+                Permanent deletion is only allowed when database integrity is verified healthy. The
+                system automatically creates and verifies a pre-delete safety backup snapshot before
+                removing the document. The certificate number ({certificate.certificateNumber}) and
+                scrapping number remain permanently locked against reuse.
               </p>
             </div>
           )}
@@ -325,20 +396,54 @@ export const ProtectedActionModal: React.FC<ProtectedActionModalProps> = ({
           </div>
 
           {mode === 'permanent_delete' && (
-            <div>
-              <label className="block text-xs font-medium text-slate-700 mb-1.5">
-                Type <span className="font-mono font-bold text-red-700">PERMANENT DELETE</span> to
-                confirm
-              </label>
-              <input
-                type="text"
-                required
-                value={confirmPhrase}
-                onChange={(e) => setConfirmPhrase(e.target.value)}
-                placeholder="PERMANENT DELETE"
-                className="w-full px-3 py-2 rounded-lg border border-red-300 text-sm font-mono focus:outline-none focus:ring-2 focus:ring-red-500"
-              />
-            </div>
+            <>
+              <div>
+                <label className="block text-xs font-medium text-slate-700 mb-1.5">
+                  Re-enter Exact Certificate Number{' '}
+                  <span className="font-mono font-bold text-[#0B1F3A]">
+                    {certificate.certificateNumber}
+                  </span>{' '}
+                  <span className="text-red-600">*</span>
+                </label>
+                <input
+                  type="text"
+                  required
+                  value={confirmCertificateNumber}
+                  onChange={(e) => setConfirmCertificateNumber(e.target.value.toUpperCase())}
+                  placeholder={certificate.certificateNumber}
+                  className="w-full px-3 py-2 rounded-lg border border-red-300 text-sm font-mono focus:outline-none focus:ring-2 focus:ring-red-500"
+                />
+              </div>
+
+              <div>
+                <label className="block text-xs font-medium text-slate-700 mb-1.5">
+                  Type <span className="font-mono font-bold text-red-700">PERMANENT DELETE</span> to
+                  confirm <span className="text-red-600">*</span>
+                </label>
+                <input
+                  type="text"
+                  required
+                  value={confirmPhrase}
+                  onChange={(e) => setConfirmPhrase(e.target.value)}
+                  placeholder="PERMANENT DELETE"
+                  className="w-full px-3 py-2 rounded-lg border border-red-300 text-sm font-mono focus:outline-none focus:ring-2 focus:ring-red-500"
+                />
+              </div>
+
+              <div>
+                <label className="block text-xs font-medium text-slate-700 mb-1.5">
+                  Fresh Main Core Admin Password <span className="text-red-600">*</span>
+                </label>
+                <input
+                  type="password"
+                  required
+                  value={mainAdminPassword}
+                  onChange={(e) => setMainAdminPassword(e.target.value)}
+                  placeholder="Re-enter Main Core Admin password"
+                  className="w-full px-3 py-2 rounded-lg border border-red-300 text-sm focus:outline-none focus:ring-2 focus:ring-red-500"
+                />
+              </div>
+            </>
           )}
 
           <div>

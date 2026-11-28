@@ -3,8 +3,8 @@ import { AlertCircle, Eye, EyeOff, Save, X } from 'lucide-react';
 import type { CertificateRecord, CreateCertificateInput, IdProofType } from '../shared/types';
 import {
   ALL_PRESET_MANUFACTURERS,
+  COMMON_MANUFACTURERS,
   OTHER_MANUFACTURER_VALUE,
-  VEHICLE_MANUFACTURER_GROUPS,
   formatChassisOrEngine,
 } from '../shared/vehicleData';
 import { api, ApiError } from '../lib/api';
@@ -63,14 +63,32 @@ export const MakerEditCertificateModal: React.FC<MakerEditCertificateModalProps>
     setSaving(true);
     try {
       const effectiveMake =
-        selectedMakeOption === OTHER_MANUFACTURER_VALUE ? customMake.trim() : selectedMakeOption;
+        selectedMakeOption === OTHER_MANUFACTURER_VALUE
+          ? customMake.trim()
+          : selectedMakeOption.trim();
+
+      if (
+        !effectiveMake ||
+        effectiveMake.length < 2 ||
+        effectiveMake === OTHER_MANUFACTURER_VALUE ||
+        (selectedMakeOption === OTHER_MANUFACTURER_VALUE &&
+          effectiveMake.toLowerCase() === 'other')
+      ) {
+        setError('Please enter a valid manufacturer name (at least 2 characters).');
+        return;
+      }
+
+      const cleanedAddress = ownerAddress.trim();
+      const cleanedIdNumber = idProofNumber.trim();
+      const cleanedIdType: IdProofType = cleanedIdNumber ? idProofType : '';
+
       const updates: Partial<CreateCertificateInput> = {
         issueDate,
         handoverDate,
         ownerName,
-        ownerAddress,
-        idProofType,
-        idProofNumber,
+        ownerAddress: cleanedAddress,
+        idProofType: cleanedIdType,
+        idProofNumber: cleanedIdNumber,
         vehicleRegNumber,
         make: effectiveMake,
         model,
@@ -231,29 +249,33 @@ export const MakerEditCertificateModal: React.FC<MakerEditCertificateModalProps>
                 className="w-full px-3 py-2 rounded-lg border border-slate-300 text-sm bg-white focus:outline-none focus:ring-2 focus:ring-[#059669]"
               >
                 <option value="">-- Select Manufacturer --</option>
-                {VEHICLE_MANUFACTURER_GROUPS.map((group) => (
-                  <optgroup key={group.category} label={group.category}>
-                    {group.brands.map((brand) => (
-                      <option key={brand} value={brand}>
-                        {brand}
-                      </option>
-                    ))}
-                  </optgroup>
+                {COMMON_MANUFACTURERS.map((brand) => (
+                  <option key={brand} value={brand}>
+                    {brand}
+                  </option>
                 ))}
-                <optgroup label="Other">
-                  <option value={OTHER_MANUFACTURER_VALUE}>Other (Type Manually)</option>
-                </optgroup>
+                <option value={OTHER_MANUFACTURER_VALUE}>Other</option>
               </select>
               {selectedMakeOption === OTHER_MANUFACTURER_VALUE && (
-                <input
-                  type="text"
-                  required
-                  minLength={2}
-                  value={customMake}
-                  onChange={(e) => setCustomMake(e.target.value)}
-                  placeholder="Enter custom manufacturer"
-                  className="mt-2 w-full px-3 py-2 rounded-lg border border-slate-300 text-sm focus:outline-none focus:ring-2 focus:ring-[#059669]"
-                />
+                <div className="mt-2">
+                  <label
+                    htmlFor="maker-edit-custom-manufacturer"
+                    className="block text-xs font-medium text-slate-700 mb-1"
+                  >
+                    Enter Manufacturer Name <span className="text-red-600">*</span>
+                  </label>
+                  <input
+                    id="maker-edit-custom-manufacturer"
+                    name="customManufacturerName"
+                    type="text"
+                    required
+                    minLength={2}
+                    value={customMake}
+                    onChange={(e) => setCustomMake(e.target.value)}
+                    placeholder="Enter Manufacturer Name"
+                    className="w-full px-3 py-2 rounded-lg border border-slate-300 text-sm focus:outline-none focus:ring-2 focus:ring-[#059669]"
+                  />
+                </div>
               )}
             </div>
 

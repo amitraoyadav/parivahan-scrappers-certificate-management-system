@@ -1,5 +1,7 @@
 export type UserRole = 'maker' | 'main_admin';
 
+export type CertificateBrand = 'parivahan' | 'scrap_route';
+
 export type CertificateStatus = 'ACTIVE' | 'CANCELLED' | 'SOFT_DELETED';
 
 export type DriveSyncState = 'NOT_CONFIGURED' | 'PENDING' | 'SYNCED' | 'FAILED';
@@ -12,35 +14,71 @@ export type IdProofType =
   | 'Passport'
   | 'Voter ID';
 
+export interface CertificateCoreFields {
+  ownerName: string;
+  ownerAddress?: string;
+  idProofType?: IdProofType;
+  idProofNumber?: string;
+  vehicleRegNumber: string;
+  make: string;
+  model: string;
+  manufactureYear: number;
+  chassisNumber: string;
+  engineNumber: string;
+  unhideChassisEngine?: boolean;
+  rtoAuthority?: string;
+  issueDate: string;
+  handoverDate: string;
+  facilityName: string;
+  facilityAddress: string;
+  remarks: string;
+}
+
+export interface OriginalCertificateSnapshot {
+  version: 1;
+  issuedAt: string;
+  issuedBy: string;
+  issuedByRole: UserRole;
+  brand: CertificateBrand;
+  certificateNumber: string;
+  scrappingRegNumber: string;
+  canonicalHash: string;
+  qrToken: string;
+  data: CertificateCoreFields;
+}
+
 export interface CertificateVersionSnapshot {
   version: number;
   editedAt: string;
   editedBy: string;
+  actorRole?: UserRole;
   reason: string;
+  changedFields?: string[];
   previousCanonicalHash: string;
-  previousData: {
-    ownerName: string;
-    ownerAddress?: string;
-    idProofType?: IdProofType;
-    idProofNumber?: string;
-    vehicleRegNumber: string;
-    make: string;
-    model: string;
-    manufactureYear: number;
-    chassisNumber: string;
-    engineNumber: string;
-    unhideChassisEngine?: boolean;
-    rtoAuthority?: string;
-    issueDate: string;
-    handoverDate: string;
-    facilityName: string;
-    facilityAddress: string;
-    remarks: string;
-  };
+  newCanonicalHash?: string;
+  previousData: CertificateCoreFields;
+}
+
+export interface CertificateVersionDocument {
+  id: string;
+  certificateId: string;
+  certificateNumber: string;
+  brand: CertificateBrand;
+  version: number;
+  recordedAt: string;
+  actor: string;
+  actorRole: UserRole;
+  event: 'ISSUED' | 'MODIFIED' | 'CANCELLED' | 'ARCHIVED' | 'RESTORED';
+  reason?: string;
+  changedFields: string[];
+  previousCanonicalHash?: string;
+  canonicalHash: string;
+  data: CertificateCoreFields;
 }
 
 export interface CertificateRecord {
   id: string;
+  brand?: CertificateBrand;
   certificateNumber: string;
   scrappingRegNumber: string;
   status: CertificateStatus;
@@ -87,6 +125,7 @@ export interface CertificateRecord {
   deletedAt?: string;
   deletedBy?: string;
   deleteReason?: string;
+  originalRecord?: OriginalCertificateSnapshot;
   versionHistory: CertificateVersionSnapshot[];
 
   // Optional Google Drive Backup Tracking
@@ -97,6 +136,7 @@ export interface CertificateRecord {
 }
 
 export interface CreateCertificateInput {
+  brand?: CertificateBrand;
   certificateNumber?: string;
   scrappingRegNumber?: string;
   issueDate: string;
@@ -122,6 +162,8 @@ export interface PublicVerificationResult {
   integrityMatch: boolean;
   tokenMatch: boolean | null;
   status?: CertificateStatus;
+  brand?: CertificateBrand;
+  brandDisplayName?: string;
   certificateNumber?: string;
   scrappingRegNumber?: string;
   ownerName?: string;
@@ -138,6 +180,9 @@ export interface PublicVerificationResult {
   canonicalHash?: string;
   recomputedHash?: string;
   version?: number;
+  originalIssuedAt?: string;
+  lastModifiedAt?: string;
+  versionHistoryCount?: number;
   cancelledAt?: string;
   cancelReason?: string;
   checkedAt: string;
@@ -157,16 +202,24 @@ export interface AuditLogEntry {
     | 'ADMIN_UNLOCK_FAILED'
     | 'LOGOUT'
     | 'CERTIFICATE_CREATED'
+    | 'CERTIFICATE_ISSUANCE_FAILED'
     | 'CERTIFICATE_EDITED'
     | 'CERTIFICATE_CANCELLED'
     | 'CERTIFICATE_SOFT_DELETED'
     | 'CERTIFICATE_RESTORED'
     | 'CERTIFICATE_PERMANENTLY_DELETED'
     | 'BACKUP_CREATED'
+    | 'BACKUP_FAILED'
     | 'BACKUP_DRY_RUN'
+    | 'BACKUP_STAGING_VERIFIED'
     | 'BACKUP_RESTORED'
+    | 'INTEGRITY_AUDIT_RUN'
+    | 'REGISTRY_EXPORTED'
     | 'SETTINGS_UPDATED'
     | 'PASSWORD_ROTATED'
+    | 'SCRAP_ROUTE_PIN_VERIFIED'
+    | 'SCRAP_ROUTE_PIN_FAILED'
+    | 'SCRAP_ROUTE_LOCKED'
     | 'DRIVE_SYNC_SUCCESS'
     | 'DRIVE_SYNC_FAILED';
   certificateId?: string;
@@ -203,6 +256,89 @@ export interface BackupDryRunResult {
   reservedNumbersPreserved: number;
   safeToRestore: boolean;
   warnings: string[];
+}
+
+export interface IntegrityDiscrepancy {
+  severity: 'CRITICAL' | 'WARNING';
+  code:
+    | 'DUPLICATE_CERTIFICATE_NUMBER'
+    | 'DUPLICATE_SCRAPPING_REG_NUMBER'
+    | 'BRAND_PREFIX_MISMATCH'
+    | 'MISSING_REQUIRED_FIELD'
+    | 'SHA256_HASH_MISMATCH'
+    | 'MISSING_RESERVED_CERT_NUMBER'
+    | 'MISSING_RESERVED_REG_NUMBER'
+    | 'MISSING_DRIVE_PDF'
+    | 'VERSION_HISTORY_MISMATCH'
+    | 'COUNT_AUDIT_DISCREPANCY'
+    | 'BACKUP_UNVERIFIED_OR_MISSING';
+  certificateId?: string;
+  certificateNumber?: string;
+  message: string;
+  details?: string;
+}
+
+export interface DatabaseIntegrityReport {
+  auditedAt: string;
+  readOnly: true;
+  healthy: boolean;
+  storageMode: 'firestore' | 'staging_memory' | 'firestore_unconfigured';
+  firestoreConnected: boolean;
+  firestoreProjectId: string | null;
+  firestoreDatabaseId: string | null;
+  counts: {
+    totalCertificates: number;
+    parivahanCertificates: number;
+    scrapRouteCertificates: number;
+    activeCertificates: number;
+    archivedCertificates: number;
+    cancelledCertificates: number;
+    reservedCertNumbers: number;
+    reservedRegNumbers: number;
+    failedIssuanceAttempts: number;
+    modifiedCertificates: number;
+    integrityMismatches: number;
+    missingDrivePdfs: number;
+  };
+  auditComparison: {
+    createdEventsInRecentAudit: number;
+    permanentDeleteEventsInRecentAudit: number;
+    latestBackupCertificateCount: number | null;
+    latestBackupId: string | null;
+  };
+  backupHealth: {
+    totalBackups: number;
+    lastSuccessfulBackupAt: string | null;
+    lastBackupVerified: boolean;
+    recentBackupFailures: number;
+    lastBackupFailureAt: string | null;
+    lastBackupFailureMessage: string | null;
+  };
+  lastIntegrityAuditAt: string;
+  discrepancies: IntegrityDiscrepancy[];
+  firebasePlanNotes: {
+    managedScheduledBackupsRequireBlaze: true;
+    pitrRequiresBlaze: true;
+    activeProtectionStrategy: string;
+  };
+}
+
+export interface StagingRestoreVerificationResult {
+  backupId: string;
+  verifiedAt: string;
+  stagingEnvironment: 'isolated_ephemeral_staging_store';
+  checksumValid: boolean;
+  stagingRestoredCount: number;
+  stagingParivahanCount: number;
+  stagingScrapRouteCount: number;
+  stagingActiveCount: number;
+  stagingArchivedCount: number;
+  stagingReservedCertCount: number;
+  stagingIntegrityHealthy: boolean;
+  stagingIntegrityMismatches: number;
+  safeForProductionRecovery: boolean;
+  warnings: string[];
+  discrepancies: IntegrityDiscrepancy[];
 }
 
 export interface DriveSyncLog {
@@ -243,9 +379,13 @@ export interface SystemSettings {
 
 export interface DashboardStats {
   totalCertificates: number;
+  parivahanCertificates: number;
+  scrapRouteCertificates: number;
   activeCertificates: number;
   cancelledCertificates: number;
   softDeletedCertificates: number;
+  modifiedCertificates: number;
+  failedIssuanceAttempts: number;
   issuedToday: number;
   issuedThisMonth: number;
   reservedCertNumbers: number;
@@ -265,6 +405,8 @@ export interface AuthStatusResponse {
   firestoreProjectId: string | null;
   firestoreDatabaseId: string | null;
   session: SessionInfo | null;
+  scrapRoutePinConfigured?: boolean;
+  scrapRouteAuthorized?: boolean;
   facilityName: string;
   publicDomain: string;
   authorizedSignatory: string;
@@ -278,9 +420,12 @@ export interface SessionInfo {
   issuedAt: number;
   expiresAt: number;
   sessionVersion: number;
+  rememberMe?: boolean;
+  scrapRouteAuthorizedUntil?: number;
 }
 
 export interface CandidateNumbers {
+  brand: CertificateBrand;
   certificateNumber: string;
   scrappingRegNumber: string;
   issueYearShort: string;

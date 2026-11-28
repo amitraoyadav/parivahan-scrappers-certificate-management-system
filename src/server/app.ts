@@ -2,10 +2,13 @@ import express, { type NextFunction, type Request, type Response } from 'express
 import cookieParser from 'cookie-parser';
 import type {
   AuthStatusResponse,
+  CertificateBrand,
   CertificateRecord,
+  CertificateVersionDocument,
   CreateCertificateInput,
   DashboardStats,
   IdProofType,
+  OriginalCertificateSnapshot,
   PublicVerificationResult,
   SessionInfo,
   SystemSettings,
@@ -13,6 +16,7 @@ import type {
 } from '../shared/types.js';
 import {
   computeCanonicalHash,
+  computeSha256,
   generateQrToken,
   generateRandomCertificateNumber,
   generateRandomScrappingRegNumber,
@@ -21,13 +25,22 @@ import {
   isValidCertificateNumberFormat,
   isValidScrappingRegFormat,
   maskSensitiveNumber,
+  resolveCertificateBrand,
+  signScrapRouteAuthToken,
   signSessionToken,
   timingSafeStringEqual,
   validateScryptHashFormat,
   verifyPassword,
+  verifyScrapRouteAuthToken,
   verifySessionTokenDetailed,
 } from './crypto.js';
 import { isDriveConfigured, syncCertificateToDriveInBackground } from './driveSync.js';
+import {
+  computeChangedCertificateFields,
+  extractCertificateCoreFields,
+  runReadOnlyIntegrityAudit,
+  verifyBackupInStaging,
+} from './integrity.js';
 import {
   checkRateLimit,
   clearAllAuthFailures,
@@ -42,6 +55,9 @@ import {
 } from './store.js';
 
 const SESSION_COOKIE_NAME = 'ps_session';
+const SCRAP_ROUTE_COOKIE_NAME = 'ps_sr_auth';
+const SCRAP_ROUTE_AUTH_TTL_SECONDS = 2 * 60 * 60; // 2 hours
+const REMEMBER_ME_TTL_SECONDS = 30 * 24 * 60 * 60; // 30 days
 
 const VALID_ID_PROOFS = new Set<IdProofType>([
   '',
@@ -117,6 +133,7 @@ function sanitizeDiagnosticDetail(detail: string | undefined): string | undefine
     .replace(/scrypt\$[^\s"'`]+/gi, '[REDACTED_HASH]')
     .replace(/Bearer\s+[A-Za-z0-9._-]+/gi, 'Bearer [REDACTED]')
     .replace(/ps_session=[^;\s]+/gi, 'ps_session=[REDACTED]')
+    .replace(/ps_sr_auth=[^;\s]+/gi, 'ps_sr_auth=[REDACTED]')
     .replace(/sess_[0-9a-f]{12,}/gi, 'sess_[REDACTED]')
     .replace(/-----BEGIN [A-Z ]+-----[\s\S]*?-----END [A-Z ]+-----/g, '[REDACTED_KEY]')
     .slice(0, 220);
@@ -283,6 +300,32 @@ function formatCooldownText(retryAfterSeconds: number): string {
   return `${Math.ceil(retryAfterSeconds / 60)} minute(s)`;
 }
 
+let cachedScrapRoutePin: { raw: string; hash: string } | null = null;
+
+function getConfiguredScrapRoutePinHash():
+  | { configured: false }
+  | { configured: true; valid: false; reason: string }
+  | { configured: true; valid: true; hash: string } {
+  const raw =
+    normalizeEnvCredentialValue(process.env.SCRAP_ROUTE_PIN) ||
+    normalizeEnvCredentialValue(process.env.SCRAP_ROUTE_PIN_HASH);
+  if (!raw) {
+    cachedScrapRoutePin = null;
+    return { configured: false };
+  }
+  if (raw.startsWith('scrypt$')) {
+    const check = validateScryptHashFormat(raw);
+    if (!check.valid) {
+      return { configured: true, valid: false, reason: check.reason };
+    }
+    return { configured: true, valid: true, hash: raw };
+  }
+  if (!cachedScrapRoutePin || cachedScrapRoutePin.raw !== raw) {
+    cachedScrapRoutePin = { raw, hash: hashPassword(raw) };
+  }
+  return { configured: true, valid: true, hash: cachedScrapRoutePin.hash };
+}
+
 function setSessionCookie(res: Response, token: string, maxAgeMs: number): void {
   res.cookie(SESSION_COOKIE_NAME, token, {
     httpOnly: true,
@@ -304,15 +347,73 @@ function clearSessionCookie(res: Response): void {
   });
 }
 
+function setScrapRouteCookie(res: Response, token: string, maxAgeMs: number): void {
+  res.cookie(SCRAP_ROUTE_COOKIE_NAME, token, {
+    httpOnly: true,
+    secure: true,
+    sameSite: 'none',
+    partitioned: true,
+    maxAge: maxAgeMs,
+    path: '/',
+  });
+}
+
+function clearScrapRouteCookie(res: Response): void {
+  res.clearCookie(SCRAP_ROUTE_COOKIE_NAME, {
+    httpOnly: true,
+    secure: true,
+    sameSite: 'none',
+    partitioned: true,
+    path: '/',
+  });
+}
+
+function isScrapRouteAuthorized(req: Request, session: SessionInfo): boolean {
+  if (
+    typeof session.scrapRouteAuthorizedUntil === 'number' &&
+    Date.now() < session.scrapRouteAuthorizedUntil
+  ) {
+    return true;
+  }
+
+  const candidates: string[] = [];
+  const headerToken = req.headers['x-scrap-route-auth'];
+  if (typeof headerToken === 'string' && headerToken.trim()) {
+    candidates.push(headerToken.trim());
+  }
+  const cookieToken = req.cookies?.[SCRAP_ROUTE_COOKIE_NAME];
+  if (typeof cookieToken === 'string' && cookieToken.trim()) {
+    candidates.push(cookieToken.trim());
+  }
+
+  for (const token of candidates) {
+    const check = verifyScrapRouteAuthToken(token, {
+      sid: session.sid ?? '',
+      username: session.username,
+      sessionVersion: session.sessionVersion,
+    });
+    if (check.ok) return true;
+  }
+  return false;
+}
+
 async function issueServerSession(
   store: RegistryStore,
   res: Response,
-  params: { username: string; role: UserRole; sessionVersion: number }
+  params: {
+    username: string;
+    role: UserRole;
+    sessionVersion: number;
+    ttlSeconds?: number;
+    rememberMe?: boolean;
+  }
 ): Promise<{ token: string; session: SessionInfo }> {
   const { token, session } = signSessionToken({
     username: params.username,
     role: params.role,
     sessionVersion: params.sessionVersion,
+    ttlSeconds: params.ttlSeconds,
+    rememberMe: params.rememberMe,
   });
 
   if (session.sid) {
@@ -324,6 +425,7 @@ async function issueServerSession(
       issuedAt: session.issuedAt,
       expiresAt: session.expiresAt,
       revoked: false,
+      rememberMe: Boolean(params.rememberMe),
     };
     await store.createSession(record);
   }
@@ -474,6 +576,15 @@ async function resolveSessionDetailed(req: Request): Promise<SessionResolutionRe
         };
         continue;
       }
+      if (stored.rememberMe !== undefined) {
+        session.rememberMe = stored.rememberMe;
+      }
+      if (
+        typeof stored.scrapRouteAuthorizedUntil === 'number' &&
+        stored.scrapRouteAuthorizedUntil > Date.now()
+      ) {
+        session.scrapRouteAuthorizedUntil = stored.scrapRouteAuthorizedUntil;
+      }
     }
 
     return { ok: true, session };
@@ -576,13 +687,31 @@ function sanitizeText(val: unknown, maxLen: number): string {
   return val.trim().replace(/\s+/g, ' ').slice(0, maxLen);
 }
 
+function parseBrandParam(raw: unknown): CertificateBrand | null {
+  if (raw === undefined || raw === null || raw === '') return 'parivahan';
+  if (raw === 'parivahan' || raw === 'scrap_route') return raw;
+  return null;
+}
+
 function validateCertificatePayload(
-  body: unknown
-): { ok: true; data: CreateCertificateInput } | { ok: false; error: string } {
+  body: unknown,
+  forcedBrand?: CertificateBrand
+): { ok: true; data: CreateCertificateInput & { brand: CertificateBrand } } | { ok: false; error: string } {
   if (!body || typeof body !== 'object') {
     return { ok: false, error: 'Invalid request payload.' };
   }
   const b = body as Record<string, unknown>;
+
+  let brand: CertificateBrand;
+  if (forcedBrand) {
+    brand = forcedBrand;
+  } else {
+    const parsedBrand = parseBrandParam(b.brand);
+    if (!parsedBrand) {
+      return { ok: false, error: 'Invalid certificate brand specified.' };
+    }
+    brand = parsedBrand;
+  }
 
   const issueDate = sanitizeText(b.issueDate, 20);
   const handoverDate = sanitizeText(b.handoverDate, 20);
@@ -633,16 +762,29 @@ function validateCertificatePayload(
   if (engineNumber.length < 5) {
     return { ok: false, error: 'Engine number must be at least 5 characters.' };
   }
-  if (certificateNumber && !isValidCertificateNumberFormat(certificateNumber)) {
-    return { ok: false, error: 'Invalid certificate number format. Expected PS/YY/R[7 digits].' };
+  if (certificateNumber && !isValidCertificateNumberFormat(certificateNumber, brand)) {
+    return {
+      ok: false,
+      error:
+        brand === 'scrap_route'
+          ? 'Invalid Scrap Route certificate number format. Expected SR/YY/R[7 digits].'
+          : 'Invalid certificate number format. Expected PS/YY/R[7 digits].',
+    };
   }
-  if (scrappingRegNumber && !isValidScrappingRegFormat(scrappingRegNumber)) {
-    return { ok: false, error: 'Invalid scrapping registration number format. Expected REG-C[6 digits].' };
+  if (scrappingRegNumber && !isValidScrappingRegFormat(scrappingRegNumber, brand)) {
+    return {
+      ok: false,
+      error:
+        brand === 'scrap_route'
+          ? 'Invalid Scrap Route scrapping registration number format. Expected SR-REG-[6 digits].'
+          : 'Invalid scrapping registration number format. Expected REG-C[6 digits].',
+    };
   }
 
   return {
     ok: true,
     data: {
+      brand,
       certificateNumber,
       scrappingRegNumber,
       issueDate,
@@ -664,21 +806,26 @@ function validateCertificatePayload(
   };
 }
 
-async function generateAvailableCandidateNumbers(issueDate?: string): Promise<{
+async function generateAvailableCandidateNumbers(
+  issueDate?: string,
+  brand: CertificateBrand = 'parivahan'
+): Promise<{
+  brand: CertificateBrand;
   certificateNumber: string;
   scrappingRegNumber: string;
   issueYearShort: string;
 }> {
   const store = getStore();
   for (let attempt = 0; attempt < 25; attempt++) {
-    const certGen = generateRandomCertificateNumber(issueDate);
-    const regNo = generateRandomScrappingRegNumber();
+    const certGen = generateRandomCertificateNumber(issueDate, brand);
+    const regNo = generateRandomScrappingRegNumber(brand);
     const [certTaken, regTaken] = await Promise.all([
       store.isCertNumberReserved(certGen.certificateNumber),
       store.isScrappingRegReserved(regNo),
     ]);
     if (!certTaken && !regTaken) {
       return {
+        brand,
         certificateNumber: certGen.certificateNumber,
         scrappingRegNumber: regNo,
         issueYearShort: certGen.issueYearShort,
@@ -796,6 +943,8 @@ export function createApiApp(): express.Express {
       publicDomain: settings.publicDomain,
       authorizedSignatory: settings.authorizedSignatory,
       signatoryDesignation: settings.signatoryDesignation,
+      scrapRoutePinConfigured: getConfiguredScrapRoutePinHash().configured,
+      scrapRouteAuthorized: session ? isScrapRouteAuthorized(req, session) : false,
     };
     res.json(payload);
   });
@@ -881,6 +1030,7 @@ export function createApiApp(): express.Express {
     const body = (req.body ?? {}) as Record<string, unknown>;
     const username = sanitizeText(body.username, 60);
     const password = typeof body.password === 'string' ? body.password : '';
+    const rememberMe = body.rememberMe === true;
 
     const rateKey = `maker:${ip}:${username.toLowerCase()}`;
     const limit = checkRateLimit(rateKey);
@@ -997,6 +1147,8 @@ export function createApiApp(): express.Express {
         username: expectedUsername,
         role: 'maker',
         sessionVersion,
+        ttlSeconds: rememberMe ? REMEMBER_ME_TTL_SECONDS : undefined,
+        rememberMe,
       });
       token = issued.token;
       session = issued.session;
@@ -1023,7 +1175,7 @@ export function createApiApp(): express.Express {
         actorRole: 'maker',
         action: 'LOGIN_SUCCESS',
         ipAddress: ip,
-        metadata: { authSource: 'firestore' },
+        metadata: { authSource: 'firestore', rememberMe },
       });
     } catch (err) {
       logAuthDiagnostic({
@@ -1184,6 +1336,7 @@ export function createApiApp(): express.Express {
     const store = getStore();
     const resolved = await resolveSessionDetailed(req);
     clearSessionCookie(res);
+    clearScrapRouteCookie(res);
     if (resolved.ok) {
       const session = resolved.session;
       if (session.sid) {
@@ -1213,6 +1366,135 @@ export function createApiApp(): express.Express {
       }
     }
     res.json({ success: true });
+  });
+
+  // Server-side Scrap Route Private PIN Verification (Salted Scrypt + Rate Limited)
+  router.post('/auth/scrap-route/verify-pin', requireAuth, async (req: AuthedRequest, res) => {
+    const store = getStore();
+    const session = req.session!;
+    const ip = getClientIp(req);
+    const rateKey = `scrap_route_pin:${ip}:${session.username.toLowerCase()}`;
+
+    const limit = checkRateLimit(rateKey);
+    if (!limit.allowed) {
+      res.status(429).json({
+        error: `Too many failed Scrap Route PIN attempts. Please wait ${formatCooldownText(limit.retryAfterSeconds)} before trying again.`,
+        retryAfterSeconds: limit.retryAfterSeconds,
+      });
+      return;
+    }
+
+    const pinConfig = getConfiguredScrapRoutePinHash();
+    if (!pinConfig.configured) {
+      res.status(503).json({
+        error: 'Scrap Route PIN is not configured on this server. Set SCRAP_ROUTE_PIN in server environment variables.',
+        code: 'SCRAP_ROUTE_PIN_UNCONFIGURED',
+      });
+      return;
+    }
+    if (!pinConfig.valid) {
+      res.status(500).json({
+        error: 'Scrap Route PIN configuration format is invalid. Please contact your administrator.',
+        code: 'SCRAP_ROUTE_PIN_INVALID_CONFIG',
+      });
+      return;
+    }
+
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const pin = typeof body.pin === 'string' ? body.pin.trim() : '';
+    if (!pin) {
+      res.status(400).json({ error: 'Please enter the Scrap Route PIN.' });
+      return;
+    }
+
+    const matches = verifyPassword(pin, pinConfig.hash);
+    if (!matches) {
+      const failState = recordAuthFailure(rateKey);
+      try {
+        await store.addAuditLog({
+          id: generateRecordId('aud'),
+          timestamp: new Date().toISOString(),
+          actor: session.username,
+          actorRole: session.role,
+          action: 'SCRAP_ROUTE_PIN_FAILED',
+          ipAddress: ip,
+          reason: 'Invalid Scrap Route PIN provided',
+        });
+      } catch {
+        // non-fatal
+      }
+      res.status(401).json({
+        error: failState.locked
+          ? `Scrap Route PIN verification paused for ${formatCooldownText(failState.retryAfterSeconds)} due to multiple failed attempts.`
+          : `Invalid Scrap Route PIN. (${failState.remainingAttempts} attempt(s) remaining)`,
+      });
+      return;
+    }
+
+    clearAuthFailures(rateKey);
+    const { token, expiresAt } = signScrapRouteAuthToken({
+      sid: session.sid ?? '',
+      username: session.username,
+      sessionVersion: session.sessionVersion,
+      ttlSeconds: SCRAP_ROUTE_AUTH_TTL_SECONDS,
+    });
+
+    if (session.sid) {
+      try {
+        await store.updateSessionScrapRouteAuth(session.sid, expiresAt);
+      } catch {
+        // HMAC-signed HttpOnly cookie + header token remains valid even if session doc update encounters a transient issue
+      }
+    }
+
+    setScrapRouteCookie(res, token, Math.max(1000, expiresAt - Date.now()));
+    try {
+      await store.addAuditLog({
+        id: generateRecordId('aud'),
+        timestamp: new Date().toISOString(),
+        actor: session.username,
+        actorRole: session.role,
+        action: 'SCRAP_ROUTE_PIN_VERIFIED',
+        ipAddress: ip,
+        metadata: { brand: 'scrap_route' },
+      });
+    } catch {
+      // non-fatal
+    }
+
+    res.json({
+      authorized: true,
+      expiresAt,
+      scrapRouteToken: token,
+    });
+  });
+
+  // Lock Scrap Route issuance mode without signing out of the Maker session
+  router.post('/auth/scrap-route/lock', requireAuth, async (req: AuthedRequest, res) => {
+    const store = getStore();
+    const session = req.session!;
+    clearScrapRouteCookie(res);
+    if (session.sid) {
+      try {
+        await store.updateSessionScrapRouteAuth(session.sid, null);
+      } catch {
+        // non-fatal
+      }
+    }
+    try {
+      await store.addAuditLog({
+        id: generateRecordId('aud'),
+        timestamp: new Date().toISOString(),
+        actor: session.username,
+        actorRole: session.role,
+        action: 'SCRAP_ROUTE_LOCKED',
+        ipAddress: getClientIp(req),
+        metadata: { brand: 'scrap_route' },
+      });
+    } catch {
+      // non-fatal
+    }
+    res.json({ authorized: false });
   });
 
   // Public QR & Certificate Number Verification (No Login Required, Strictly Masked PII)
@@ -1253,12 +1535,17 @@ export function createApiApp(): express.Express {
     const tokenMatch = qrToken ? timingSafeStringEqual(qrToken, cert.qrToken) : null;
     const isVerified = integrityMatch && cert.status === 'ACTIVE' && (tokenMatch === null || tokenMatch);
 
+    const brand = resolveCertificateBrand(cert);
+    const brandDisplayName = brand === 'scrap_route' ? 'SCRAP ROUTE' : 'Parivahan Scrappers';
+
     const result: PublicVerificationResult = {
       found: true,
       verified: isVerified,
       integrityMatch,
       tokenMatch,
       status: cert.status,
+      brand,
+      brandDisplayName,
       certificateNumber: cert.certificateNumber,
       scrappingRegNumber: cert.scrappingRegNumber,
       ownerName: cert.ownerName,
@@ -1275,6 +1562,9 @@ export function createApiApp(): express.Express {
       canonicalHash: cert.canonicalHash,
       recomputedHash,
       version: cert.version,
+      originalIssuedAt: cert.originalRecord?.issuedAt ?? cert.createdAt,
+      lastModifiedAt: cert.updatedAt,
+      versionHistoryCount: (cert.versionHistory ?? []).length,
       cancelledAt: cert.cancelledAt,
       cancelReason: cert.cancelReason,
       checkedAt,
@@ -1295,9 +1585,21 @@ export function createApiApp(): express.Express {
   // ==========================================================================
   const handleNextAvailableNumbers = async (req: AuthedRequest, res: Response) => {
     const issueDate = sanitizeText(req.query.issueDate, 20);
+    const parsedBrand = parseBrandParam(req.query.brand);
+    if (!parsedBrand) {
+      res.status(400).json({ error: 'Invalid certificate brand requested.' });
+      return;
+    }
+    if (parsedBrand === 'scrap_route' && !isScrapRouteAuthorized(req, req.session!)) {
+      res.status(403).json({
+        error: 'Scrap Route PIN verification is required before generating Scrap Route numbers.',
+        code: 'SCRAP_ROUTE_PIN_REQUIRED',
+      });
+      return;
+    }
     const ip = getClientIp(req);
     try {
-      const candidate = await generateAvailableCandidateNumbers(issueDate || undefined);
+      const candidate = await generateAvailableCandidateNumbers(issueDate || undefined, parsedBrand);
       res.json(candidate);
     } catch (err) {
       const detail = err instanceof Error ? err.message : 'next_number_generation_failed';
@@ -1405,50 +1707,59 @@ export function createApiApp(): express.Express {
     const rawUpdates = body.updates && typeof body.updates === 'object' ? (body.updates as Record<string, unknown>) : body;
     const reason = sanitizeText(body.reason, 300) || `Updated by ${req.session!.role === 'main_admin' ? 'Main Core Admin' : 'Certificate Maker'}`;
 
-    const validated = validateCertificatePayload({
-      ...existing,
-      ...rawUpdates,
-      // Always preserve immutable identifiers and existing rtoAuthority (no longer edited)
-      certificateNumber: existing.certificateNumber,
-      scrappingRegNumber: existing.scrappingRegNumber,
-      rtoAuthority: existing.rtoAuthority ?? '',
-    });
+    const existingBrand = resolveCertificateBrand(existing);
+    if (
+      rawUpdates.brand !== undefined &&
+      rawUpdates.brand !== null &&
+      rawUpdates.brand !== '' &&
+      rawUpdates.brand !== existingBrand
+    ) {
+      res.status(403).json({ error: 'Certificate brand identity is permanent and cannot be changed.' });
+      return;
+    }
+
+    const validated = validateCertificatePayload(
+      {
+        ...existing,
+        ...rawUpdates,
+        // Always preserve immutable identifiers, brand, and existing rtoAuthority
+        brand: existingBrand,
+        certificateNumber: existing.certificateNumber,
+        scrappingRegNumber: existing.scrappingRegNumber,
+        rtoAuthority: existing.rtoAuthority ?? '',
+      },
+      existingBrand
+    );
     if (!validated.ok) {
       res.status(400).json({ error: validated.error });
       return;
     }
 
     const now = new Date().toISOString();
-    const snapshot = {
-      version: existing.version,
-      editedAt: now,
-      editedBy: req.session!.username,
-      reason,
-      previousCanonicalHash: existing.canonicalHash,
-      previousData: {
-        ownerName: existing.ownerName,
-        ownerAddress: existing.ownerAddress,
-        idProofType: existing.idProofType,
-        idProofNumber: existing.idProofNumber,
-        vehicleRegNumber: existing.vehicleRegNumber,
-        make: existing.make,
-        model: existing.model,
-        manufactureYear: existing.manufactureYear,
-        chassisNumber: existing.chassisNumber,
-        engineNumber: existing.engineNumber,
-        unhideChassisEngine: existing.unhideChassisEngine,
-        rtoAuthority: existing.rtoAuthority ?? '',
-        issueDate: existing.issueDate,
-        handoverDate: existing.handoverDate,
-        facilityName: existing.facilityName,
-        facilityAddress: existing.facilityAddress,
-        remarks: existing.remarks,
-      },
+    const previousFields = extractCertificateCoreFields(existing);
+    const preservedOriginal: OriginalCertificateSnapshot = existing.originalRecord ?? {
+      version: 1,
+      issuedAt: existing.createdAt,
+      issuedBy: existing.createdBy,
+      issuedByRole: existing.createdByRole,
+      brand: existingBrand,
+      certificateNumber: existing.certificateNumber,
+      scrappingRegNumber: existing.scrappingRegNumber,
+      canonicalHash:
+        existing.versionHistory && existing.versionHistory.length > 0
+          ? existing.versionHistory[existing.versionHistory.length - 1].previousCanonicalHash
+          : existing.canonicalHash,
+      qrToken: existing.qrToken,
+      data:
+        existing.versionHistory && existing.versionHistory.length > 0
+          ? existing.versionHistory[existing.versionHistory.length - 1].previousData
+          : previousFields,
     };
 
     const updates = validated.data;
     const nextCertBase: Omit<CertificateRecord, 'canonicalHash'> = {
       ...existing,
+      brand: existingBrand,
       issueDate: updates.issueDate,
       handoverDate: updates.handoverDate,
       ownerName: updates.ownerName,
@@ -1467,15 +1778,57 @@ export function createApiApp(): express.Express {
       version: existing.version + 1,
       qrToken: generateQrToken(),
       updatedAt: now,
-      versionHistory: [snapshot, ...(existing.versionHistory ?? [])],
+      originalRecord: preservedOriginal,
+      versionHistory: existing.versionHistory ?? [],
+    };
+
+    const nextCanonicalHash = computeCanonicalHash(nextCertBase);
+    const nextFields = extractCertificateCoreFields({
+      ...nextCertBase,
+      canonicalHash: nextCanonicalHash,
+    });
+    const changedFields = computeChangedCertificateFields(previousFields, nextFields);
+
+    const snapshot = {
+      version: existing.version,
+      editedAt: now,
+      editedBy: req.session!.username,
+      actorRole: req.session!.role,
+      reason,
+      changedFields,
+      previousCanonicalHash: existing.canonicalHash,
+      newCanonicalHash: nextCanonicalHash,
+      previousData: previousFields,
     };
 
     const updated: CertificateRecord = {
       ...nextCertBase,
-      canonicalHash: computeCanonicalHash(nextCertBase),
+      versionHistory: [snapshot, ...(existing.versionHistory ?? [])],
+      canonicalHash: nextCanonicalHash,
     };
 
     await store.saveCertificate(updated);
+    const versionDoc: CertificateVersionDocument = {
+      id: `${updated.id}_v${updated.version}_${generateRecordId('ver')}`,
+      certificateId: updated.id,
+      certificateNumber: updated.certificateNumber,
+      brand: existingBrand,
+      version: updated.version,
+      recordedAt: now,
+      actor: req.session!.username,
+      actorRole: req.session!.role,
+      event: 'MODIFIED',
+      reason,
+      changedFields,
+      previousCanonicalHash: existing.canonicalHash,
+      canonicalHash: nextCanonicalHash,
+      data: nextFields,
+    };
+    try {
+      await store.appendCertificateVersion(versionDoc);
+    } catch {
+      // Embedded versionHistory on certificate remains complete even if secondary collection write retries
+    }
     await store.addAuditLog({
       id: generateRecordId('aud'),
       timestamp: now,
@@ -1487,25 +1840,38 @@ export function createApiApp(): express.Express {
       reason,
       ipAddress: getClientIp(req),
       metadata: {
+        brand: existingBrand,
         previousVersion: existing.version,
         newVersion: updated.version,
+        changedFieldsCount: changedFields.length,
+        changedFields: changedFields.join(', '),
       },
     });
 
     res.json({ certificate: updated });
   });
 
-  // Authenticated Maker Delete (soft-delete with active session, no password re-entry; preserves reserved numbers & audit log)
+  // Authenticated Maker Archive (STRICTLY reversible soft-archive only; permanent deletion is forbidden for Maker)
   router.delete('/certificates/:id', requireAuth, async (req: AuthedRequest, res) => {
     const store = getStore();
     const id = sanitizeText(req.params.id, 100);
+    const body = (req.body ?? {}) as Record<string, unknown>;
+
+    if (body.permanent === true) {
+      res.status(403).json({
+        error:
+          'Forbidden: Permanent deletion is strictly restricted to Main Core Admin owner authorization. Use Archive instead.',
+      });
+      return;
+    }
+
     const existing = await store.getCertificateById(id);
     if (!existing) {
       res.status(404).json({ error: 'Certificate not found.' });
       return;
     }
     if (existing.status === 'SOFT_DELETED') {
-      res.status(400).json({ error: 'Certificate has already been deleted.' });
+      res.status(400).json({ error: 'Certificate has already been archived.' });
       return;
     }
 
@@ -1514,18 +1880,18 @@ export function createApiApp(): express.Express {
       const isAllowed = recentFive.some((c) => c.id === existing.id);
       if (!isAllowed) {
         res.status(403).json({
-          error: 'Forbidden: Certificate Maker deletion is restricted to the latest five active certificates.',
+          error: 'Forbidden: Certificate Maker archiving is restricted to the latest five active certificates.',
         });
         return;
       }
     }
 
-    const body = (req.body ?? {}) as Record<string, unknown>;
     const reason =
       sanitizeText(body.reason, 300) ||
-      `Deleted by authenticated ${req.session!.role === 'main_admin' ? 'Main Core Admin' : 'Certificate Maker'}`;
+      `Archived by authenticated ${req.session!.role === 'main_admin' ? 'Main Core Admin' : 'Certificate Maker'}`;
 
     const now = new Date().toISOString();
+    const existingBrand = resolveCertificateBrand(existing);
     const softDeletedBase: Omit<CertificateRecord, 'canonicalHash'> = {
       ...existing,
       status: 'SOFT_DELETED',
@@ -1540,6 +1906,26 @@ export function createApiApp(): express.Express {
     };
 
     await store.saveCertificate(updated);
+    try {
+      await store.appendCertificateVersion({
+        id: `${updated.id}_archive_${generateRecordId('ver')}`,
+        certificateId: updated.id,
+        certificateNumber: updated.certificateNumber,
+        brand: existingBrand,
+        version: updated.version,
+        recordedAt: now,
+        actor: req.session!.username,
+        actorRole: req.session!.role,
+        event: 'ARCHIVED',
+        reason,
+        changedFields: ['status'],
+        previousCanonicalHash: existing.canonicalHash,
+        canonicalHash: updated.canonicalHash,
+        data: extractCertificateCoreFields(updated),
+      });
+    } catch {
+      // non-fatal
+    }
     await store.addAuditLog({
       id: generateRecordId('aud'),
       timestamp: now,
@@ -1550,10 +1936,18 @@ export function createApiApp(): express.Express {
       certificateNumber: updated.certificateNumber,
       reason,
       ipAddress: getClientIp(req),
+      metadata: {
+        brand: existingBrand,
+        archived: true,
+        permanent: false,
+        reservedNumbersRetained: true,
+      },
     });
 
     res.json({
       success: true,
+      archived: true,
+      permanent: false,
       deletedId: updated.id,
       certificateNumber: updated.certificateNumber,
       deletedAt: now,
@@ -1566,7 +1960,22 @@ export function createApiApp(): express.Express {
     const startMs = Date.now();
     const store = getStore();
     const ip = getClientIp(req);
-    const validated = validateCertificatePayload(req.body);
+
+    const requestedBrand = parseBrandParam((req.body as Record<string, unknown>)?.brand);
+    if (!requestedBrand) {
+      res.status(400).json({ error: 'Invalid certificate brand specified.' });
+      return;
+    }
+
+    if (requestedBrand === 'scrap_route' && !isScrapRouteAuthorized(req, req.session!)) {
+      res.status(403).json({
+        error: 'Scrap Route PIN verification is required to issue Scrap Route certificates.',
+        code: 'SCRAP_ROUTE_PIN_REQUIRED',
+      });
+      return;
+    }
+
+    const validated = validateCertificatePayload(req.body, requestedBrand);
     if (!validated.ok) {
       res.status(400).json({ error: validated.error });
       return;
@@ -1618,7 +2027,7 @@ export function createApiApp(): express.Express {
     for (let attempt = 0; attempt < 8; attempt++) {
       if (!candidateCertNo || !candidateRegNo || attempt > 0) {
         try {
-          const fresh = await generateAvailableCandidateNumbers(input.issueDate);
+          const fresh = await generateAvailableCandidateNumbers(input.issueDate, requestedBrand);
           candidateCertNo = fresh.certificateNumber;
           candidateRegNo = fresh.scrappingRegNumber;
         } catch (err) {
@@ -1629,8 +2038,22 @@ export function createApiApp(): express.Express {
             role: req.session?.role,
             detail: err instanceof Error ? err.message : 'Candidate number allocation failed',
           });
+          try {
+            await store.addAuditLog({
+              id: generateRecordId('aud'),
+              timestamp: new Date().toISOString(),
+              actor: req.session!.username,
+              actorRole: req.session!.role,
+              action: 'CERTIFICATE_ISSUANCE_FAILED',
+              ipAddress: ip,
+              reason: 'Number reservation failed before issuance; no fallback number invented',
+              metadata: { brand: requestedBrand, stage: 'number_reservation' },
+            });
+          } catch {
+            // non-fatal
+          }
           res.status(503).json({
-            error: 'Unable to reserve a unique certificate number. Please retry.',
+            error: 'Unable to reserve a unique certificate number. Issuance stopped safely — please retry.',
             code: 'CERTIFICATE_RESERVATION_FAILURE',
           });
           return;
@@ -1641,6 +2064,7 @@ export function createApiApp(): express.Express {
       const qrToken = generateQrToken();
       const baseCert: Omit<CertificateRecord, 'canonicalHash'> = {
         id: certId,
+        brand: requestedBrand,
         certificateNumber: candidateCertNo,
         scrappingRegNumber: candidateRegNo,
         status: 'ACTIVE',
@@ -1659,7 +2083,7 @@ export function createApiApp(): express.Express {
         engineNumber: input.engineNumber,
         unhideChassisEngine: input.unhideChassisEngine === true,
         rtoAuthority: input.rtoAuthority ?? '',
-        facilityName: settings.facilityName,
+        facilityName: requestedBrand === 'scrap_route' ? 'Scrap Route' : settings.facilityName,
         facilityRvsfCode: settings.facilityRvsfCode,
         facilityAddress: settings.facilityAddress,
         remarks: input.remarks ?? '',
@@ -1672,15 +2096,48 @@ export function createApiApp(): express.Express {
         driveSyncStatus: driveReady ? 'PENDING' : 'NOT_CONFIGURED',
       };
 
+      const canonicalHash = computeCanonicalHash(baseCert);
+      const initialFields = extractCertificateCoreFields({ ...baseCert, canonicalHash });
+      const originalRecord: OriginalCertificateSnapshot = {
+        version: 1,
+        issuedAt: now,
+        issuedBy: req.session!.username,
+        issuedByRole: req.session!.role,
+        brand: requestedBrand,
+        certificateNumber: candidateCertNo,
+        scrappingRegNumber: candidateRegNo,
+        canonicalHash,
+        qrToken,
+        data: initialFields,
+      };
+
       const certificate: CertificateRecord = {
         ...baseCert,
-        canonicalHash: computeCanonicalHash(baseCert),
+        originalRecord,
+        canonicalHash,
+      };
+
+      const initialVersionDoc: CertificateVersionDocument = {
+        id: `${certificate.id}_v1`,
+        certificateId: certificate.id,
+        certificateNumber: certificate.certificateNumber,
+        brand: requestedBrand,
+        version: 1,
+        recordedAt: now,
+        actor: req.session!.username,
+        actorRole: req.session!.role,
+        event: 'ISSUED',
+        reason: 'Original certificate issuance',
+        changedFields: [],
+        canonicalHash,
+        data: initialFields,
       };
 
       try {
         const committed = await store.createCertificateAtomic({
           certificate,
           idempotencyKey,
+          initialVersionDoc,
           auditLog: {
             id: generateRecordId('aud'),
             timestamp: now,
@@ -1691,20 +2148,32 @@ export function createApiApp(): express.Express {
             certificateNumber: certificate.certificateNumber,
             ipAddress: ip,
             metadata: {
+              brand: requestedBrand,
               scrappingRegNumber: certificate.scrappingRegNumber,
               vehicleRegNumber: certificate.vehicleRegNumber,
             },
           },
         });
 
+        // Post-write durability read-back check before confirming issuance to client
+        const verifiedReadBack = await store.getCertificateById(committed.id);
+        if (
+          !verifiedReadBack ||
+          verifiedReadBack.certificateNumber !== committed.certificateNumber ||
+          verifiedReadBack.canonicalHash !== committed.canonicalHash
+        ) {
+          throw new Error('Post-write database read-back verification failed for newly issued certificate.');
+        }
+
         // Fire-and-forget optional Google Drive sync (never blocks issuance response)
         if (driveReady) {
-          void syncCertificateToDriveInBackground(store, committed, 1);
+          void syncCertificateToDriveInBackground(store, verifiedReadBack, 1);
         }
 
         res.status(201).json({
-          certificate: committed,
+          certificate: verifiedReadBack,
           idempotentReplay: false,
+          verifiedReadBack: true,
           persistenceMs: Date.now() - startMs,
         });
         return;
@@ -1728,6 +2197,21 @@ export function createApiApp(): express.Express {
           role: req.session?.role,
           detail: err instanceof Error ? err.message : 'Atomic Firestore certificate save failed',
         });
+        try {
+          await store.addAuditLog({
+            id: generateRecordId('aud'),
+            timestamp: new Date().toISOString(),
+            actor: req.session!.username,
+            actorRole: req.session!.role,
+            action: 'CERTIFICATE_ISSUANCE_FAILED',
+            certificateNumber: candidateCertNo,
+            ipAddress: ip,
+            reason: 'Atomic Firestore persistence or read-back verification failed',
+            metadata: { brand: requestedBrand, stage: 'atomic_commit' },
+          });
+        } catch {
+          // non-fatal
+        }
         res.status(503).json({
           error: 'Failed to save certificate to Firestore. Please retry — idempotency prevents duplicates.',
           code: 'CERTIFICATE_SAVE_FAILURE',
@@ -1743,6 +2227,20 @@ export function createApiApp(): express.Express {
       role: req.session?.role,
       detail: 'exhausted_8_collision_retries',
     });
+    try {
+      await store.addAuditLog({
+        id: generateRecordId('aud'),
+        timestamp: new Date().toISOString(),
+        actor: req.session!.username,
+        actorRole: req.session!.role,
+        action: 'CERTIFICATE_ISSUANCE_FAILED',
+        ipAddress: ip,
+        reason: 'Exhausted 8 atomic number collision retries; no fallback number invented',
+        metadata: { brand: requestedBrand, stage: 'collision_exhausted' },
+      });
+    } catch {
+      // non-fatal
+    }
     res.status(503).json({
       error: 'Unable to reserve unique certificate numbers due to high concurrency. Please try again.',
       code: 'CERTIFICATE_RESERVATION_FAILURE',
@@ -1760,26 +2258,44 @@ export function createApiApp(): express.Express {
   // ==========================================================================
   router.get('/admin/stats', requireMainAdmin, async (_req, res) => {
     const store = getStore();
-    const [certs, reserved, backups] = await Promise.all([
+    const [certs, reserved, backups, auditLogs] = await Promise.all([
       store.getAllCertificates(),
       store.getReservedCounts(),
       store.listBackups(),
+      store.getAuditLogs(500),
     ]);
 
     const todayPrefix = new Date().toISOString().slice(0, 10);
     const monthPrefix = new Date().toISOString().slice(0, 7);
 
+    const parivahanCertificates = certs.filter(
+      (c) => resolveCertificateBrand(c) === 'parivahan'
+    ).length;
+    const scrapRouteCertificates = certs.filter(
+      (c) => resolveCertificateBrand(c) === 'scrap_route'
+    ).length;
+    const modifiedCertificates = certs.filter(
+      (c) => c.version > 1 || (c.versionHistory && c.versionHistory.length > 0)
+    ).length;
+    const failedIssuanceAttempts = auditLogs.filter(
+      (l) => l.action === 'CERTIFICATE_ISSUANCE_FAILED'
+    ).length;
+
     const stats: DashboardStats = {
       totalCertificates: certs.length,
+      parivahanCertificates,
+      scrapRouteCertificates,
       activeCertificates: certs.filter((c) => c.status === 'ACTIVE').length,
       cancelledCertificates: certs.filter((c) => c.status === 'CANCELLED').length,
       softDeletedCertificates: certs.filter((c) => c.status === 'SOFT_DELETED').length,
+      modifiedCertificates,
+      failedIssuanceAttempts,
       issuedToday: certs.filter((c) => c.createdAt.startsWith(todayPrefix)).length,
       issuedThisMonth: certs.filter((c) => c.createdAt.startsWith(monthPrefix)).length,
       reservedCertNumbers: reserved.certCount,
       reservedRegNumbers: reserved.regCount,
       totalBackups: backups.length,
-      lastBackupAt: backups[0]?.createdAt ?? null,
+      lastBackupAt: backups.find((b) => b.verified)?.createdAt ?? backups[0]?.createdAt ?? null,
       driveSyncedCount: certs.filter((c) => c.driveSyncStatus === 'SYNCED').length,
       driveFailedCount: certs.filter((c) => c.driveSyncStatus === 'FAILED').length,
       storageMode: store.mode,
@@ -1837,48 +2353,62 @@ export function createApiApp(): express.Express {
       return;
     }
 
-    const validated = validateCertificatePayload({
-      ...existing,
-      ...(body.updates && typeof body.updates === 'object' ? body.updates : {}),
-      certificateNumber: existing.certificateNumber,
-      scrappingRegNumber: existing.scrappingRegNumber,
-    });
+    const existingBrand = resolveCertificateBrand(existing);
+    const adminRawUpdates =
+      body.updates && typeof body.updates === 'object'
+        ? (body.updates as Record<string, unknown>)
+        : {};
+    const requestedAdminBrand = adminRawUpdates.brand ?? body.brand;
+    if (
+      requestedAdminBrand !== undefined &&
+      requestedAdminBrand !== null &&
+      requestedAdminBrand !== '' &&
+      requestedAdminBrand !== existingBrand
+    ) {
+      res.status(403).json({ error: 'Certificate brand identity is permanent and cannot be changed.' });
+      return;
+    }
+
+    const validated = validateCertificatePayload(
+      {
+        ...existing,
+        ...adminRawUpdates,
+        brand: existingBrand,
+        certificateNumber: existing.certificateNumber,
+        scrappingRegNumber: existing.scrappingRegNumber,
+      },
+      existingBrand
+    );
     if (!validated.ok) {
       res.status(400).json({ error: validated.error });
       return;
     }
 
     const now = new Date().toISOString();
-    const snapshot = {
-      version: existing.version,
-      editedAt: now,
-      editedBy: req.session!.username,
-      reason,
-      previousCanonicalHash: existing.canonicalHash,
-      previousData: {
-        ownerName: existing.ownerName,
-        ownerAddress: existing.ownerAddress,
-        idProofType: existing.idProofType,
-        idProofNumber: existing.idProofNumber,
-        vehicleRegNumber: existing.vehicleRegNumber,
-        make: existing.make,
-        model: existing.model,
-        manufactureYear: existing.manufactureYear,
-        chassisNumber: existing.chassisNumber,
-        engineNumber: existing.engineNumber,
-        unhideChassisEngine: existing.unhideChassisEngine,
-        rtoAuthority: existing.rtoAuthority,
-        issueDate: existing.issueDate,
-        handoverDate: existing.handoverDate,
-        facilityName: existing.facilityName,
-        facilityAddress: existing.facilityAddress,
-        remarks: existing.remarks,
-      },
+    const previousFields = extractCertificateCoreFields(existing);
+    const preservedOriginal: OriginalCertificateSnapshot = existing.originalRecord ?? {
+      version: 1,
+      issuedAt: existing.createdAt,
+      issuedBy: existing.createdBy,
+      issuedByRole: existing.createdByRole,
+      brand: existingBrand,
+      certificateNumber: existing.certificateNumber,
+      scrappingRegNumber: existing.scrappingRegNumber,
+      canonicalHash:
+        existing.versionHistory && existing.versionHistory.length > 0
+          ? existing.versionHistory[existing.versionHistory.length - 1].previousCanonicalHash
+          : existing.canonicalHash,
+      qrToken: existing.qrToken,
+      data:
+        existing.versionHistory && existing.versionHistory.length > 0
+          ? existing.versionHistory[existing.versionHistory.length - 1].previousData
+          : previousFields,
     };
 
     const updates = validated.data;
     const nextCertBase: Omit<CertificateRecord, 'canonicalHash'> = {
       ...existing,
+      brand: existingBrand,
       issueDate: updates.issueDate,
       handoverDate: updates.handoverDate,
       ownerName: updates.ownerName,
@@ -1897,15 +2427,56 @@ export function createApiApp(): express.Express {
       version: existing.version + 1,
       qrToken: generateQrToken(),
       updatedAt: now,
-      versionHistory: [snapshot, ...(existing.versionHistory ?? [])],
+      originalRecord: preservedOriginal,
+      versionHistory: existing.versionHistory ?? [],
+    };
+
+    const nextCanonicalHash = computeCanonicalHash(nextCertBase);
+    const nextFields = extractCertificateCoreFields({
+      ...nextCertBase,
+      canonicalHash: nextCanonicalHash,
+    });
+    const changedFields = computeChangedCertificateFields(previousFields, nextFields);
+
+    const snapshot = {
+      version: existing.version,
+      editedAt: now,
+      editedBy: req.session!.username,
+      actorRole: req.session!.role,
+      reason,
+      changedFields,
+      previousCanonicalHash: existing.canonicalHash,
+      newCanonicalHash: nextCanonicalHash,
+      previousData: previousFields,
     };
 
     const updated: CertificateRecord = {
       ...nextCertBase,
-      canonicalHash: computeCanonicalHash(nextCertBase),
+      versionHistory: [snapshot, ...(existing.versionHistory ?? [])],
+      canonicalHash: nextCanonicalHash,
     };
 
     await store.saveCertificate(updated);
+    try {
+      await store.appendCertificateVersion({
+        id: `${updated.id}_v${updated.version}_${generateRecordId('ver')}`,
+        certificateId: updated.id,
+        certificateNumber: updated.certificateNumber,
+        brand: existingBrand,
+        version: updated.version,
+        recordedAt: now,
+        actor: req.session!.username,
+        actorRole: req.session!.role,
+        event: 'MODIFIED',
+        reason,
+        changedFields,
+        previousCanonicalHash: existing.canonicalHash,
+        canonicalHash: nextCanonicalHash,
+        data: nextFields,
+      });
+    } catch {
+      // Embedded versionHistory remains complete
+    }
     await store.addAuditLog({
       id: generateRecordId('aud'),
       timestamp: now,
@@ -1917,12 +2488,57 @@ export function createApiApp(): express.Express {
       reason,
       ipAddress: getClientIp(req),
       metadata: {
+        brand: existingBrand,
         previousVersion: existing.version,
         newVersion: updated.version,
+        changedFieldsCount: changedFields.length,
+        changedFields: changedFields.join(', '),
       },
     });
 
     res.json({ certificate: updated });
+  });
+
+  // Owner-Only Full Immutable Version History & Original Record Viewer
+  router.get('/admin/certificates/:id/history', requireMainAdmin, async (req, res) => {
+    const store = getStore();
+    const id = sanitizeText(req.params.id, 100);
+    const cert = await store.getCertificateById(id);
+    if (!cert) {
+      res.status(404).json({ error: 'Certificate not found.' });
+      return;
+    }
+    let appendOnlyVersions: CertificateVersionDocument[] = [];
+    try {
+      appendOnlyVersions = await store.getCertificateVersions(cert.id);
+    } catch {
+      appendOnlyVersions = [];
+    }
+    const existingBrand = resolveCertificateBrand(cert);
+    const originalRecord: OriginalCertificateSnapshot = cert.originalRecord ?? {
+      version: 1,
+      issuedAt: cert.createdAt,
+      issuedBy: cert.createdBy,
+      issuedByRole: cert.createdByRole,
+      brand: existingBrand,
+      certificateNumber: cert.certificateNumber,
+      scrappingRegNumber: cert.scrappingRegNumber,
+      canonicalHash:
+        cert.versionHistory && cert.versionHistory.length > 0
+          ? cert.versionHistory[cert.versionHistory.length - 1].previousCanonicalHash
+          : cert.canonicalHash,
+      qrToken: cert.qrToken,
+      data:
+        cert.versionHistory && cert.versionHistory.length > 0
+          ? cert.versionHistory[cert.versionHistory.length - 1].previousData
+          : extractCertificateCoreFields(cert),
+    };
+    res.json({
+      certificate: cert,
+      originalRecord,
+      versionHistory: cert.versionHistory ?? [],
+      appendOnlyVersions,
+    });
   });
 
   // Protected Cancel (mandatory reason + protected password; reserved numbers remain locked forever)
@@ -1965,6 +2581,26 @@ export function createApiApp(): express.Express {
     };
 
     await store.saveCertificate(updated);
+    try {
+      await store.appendCertificateVersion({
+        id: `${updated.id}_cancel_${generateRecordId('ver')}`,
+        certificateId: updated.id,
+        certificateNumber: updated.certificateNumber,
+        brand: resolveCertificateBrand(updated),
+        version: updated.version,
+        recordedAt: now,
+        actor: req.session!.username,
+        actorRole: req.session!.role,
+        event: 'CANCELLED',
+        reason,
+        changedFields: ['status'],
+        previousCanonicalHash: existing.canonicalHash,
+        canonicalHash: updated.canonicalHash,
+        data: extractCertificateCoreFields(updated),
+      });
+    } catch {
+      // non-fatal
+    }
     await store.addAuditLog({
       id: generateRecordId('aud'),
       timestamp: now,
@@ -1980,15 +2616,26 @@ export function createApiApp(): express.Express {
     res.json({ certificate: updated });
   });
 
-  // Protected Delete (Soft Delete by default; Permanent Delete requires explicit phrase + safety backup)
+  // Protected Archive & Owner-Authorized Permanent Deletion
+  // Default: Archive (SOFT_DELETED), permanently retained and restorable.
+  // Permanent Deletion: Requires fresh Main Core Admin password + Protected Delete password +
+  // explicit certificate number confirmation + PERMANENT DELETE phrase + healthy audit/backup gate + safety backup.
   router.delete('/admin/certificates/:id', requireMainAdmin, async (req: AuthedRequest, res) => {
     const store = getStore();
     const id = sanitizeText(req.params.id, 100);
     const body = (req.body ?? {}) as Record<string, unknown>;
+
+    if (Array.isArray(body.ids) || body.bulk === true) {
+      res.status(400).json({ error: 'Bulk deletion is strictly prohibited.' });
+      return;
+    }
+
     const deletePassword = typeof body.deletePassword === 'string' ? body.deletePassword : '';
+    const mainAdminPassword = typeof body.mainAdminPassword === 'string' ? body.mainAdminPassword : '';
     const reason = sanitizeText(body.reason, 300);
     const permanent = body.permanent === true;
     const confirmPhrase = sanitizeText(body.confirmPhrase, 60);
+    const confirmCertificateNumber = sanitizeText(body.confirmCertificateNumber, 40).toUpperCase();
 
     if (!reason || reason.length < 5) {
       res.status(400).json({ error: 'A mandatory deletion reason (at least 5 characters) is required.' });
@@ -2008,8 +2655,35 @@ export function createApiApp(): express.Express {
     }
 
     const now = new Date().toISOString();
+    const existingBrand = resolveCertificateBrand(existing);
 
     if (permanent) {
+      // 1. Fresh Main Core Admin owner authentication required for permanent deletion
+      const credRes = await resolveAuthoritativeCredentials(store);
+      if (
+        !credRes.ok ||
+        !credRes.creds ||
+        !mainAdminPassword ||
+        !verifyPassword(mainAdminPassword, credRes.creds.mainAdminPasswordHash)
+      ) {
+        res.status(403).json({
+          error:
+            'Permanent deletion requires fresh Main Core Admin password verification in addition to the protected deletion password.',
+        });
+        return;
+      }
+
+      // 2. Explicit certificate-number confirmation + exact confirmation phrase required
+      if (
+        !confirmCertificateNumber ||
+        confirmCertificateNumber !== existing.certificateNumber.toUpperCase()
+      ) {
+        res.status(400).json({
+          error: `Permanent deletion requires typing the exact certificate number (${existing.certificateNumber}) to confirm.`,
+        });
+        return;
+      }
+
       if (confirmPhrase !== 'PERMANENT DELETE') {
         res.status(400).json({
           error: 'Permanent deletion requires typing exact confirmation phrase: PERMANENT DELETE',
@@ -2017,8 +2691,33 @@ export function createApiApp(): express.Express {
         return;
       }
 
-      // Recovery safeguard: create a verified pre-delete safety snapshot before permanent removal
-      const safetyBackup = await store.createBackup(req.session!.username, 'PRE_RESTORE_SAFETY');
+      // 3. Health & Integrity Gate: Prevent permanent deletion if database or integrity checks are unhealthy
+      const preDeleteAudit = await runReadOnlyIntegrityAudit(store);
+      if (!preDeleteAudit.healthy) {
+        res.status(409).json({
+          error:
+            'Permanent deletion is blocked because database health or integrity audit checks detected critical issues. Resolve integrity alerts first.',
+          code: 'INTEGRITY_HEALTH_GATE_BLOCKED',
+        });
+        return;
+      }
+
+      // 4. Recovery safeguard: create & verify a pre-delete safety snapshot BEFORE permanent removal
+      let safetyBackup;
+      try {
+        safetyBackup = await store.createBackup(req.session!.username, 'PRE_RESTORE_SAFETY');
+        if (!safetyBackup.verified) {
+          throw new Error('Safety backup could not be verified');
+        }
+      } catch {
+        res.status(503).json({
+          error:
+            'Permanent deletion aborted because the mandatory pre-deletion safety backup failed. Existing record has been preserved.',
+          code: 'BACKUP_HEALTH_GATE_BLOCKED',
+        });
+        return;
+      }
+
       await store.permanentlyDeleteCertificate(existing.id);
       await store.addAuditLog({
         id: generateRecordId('aud'),
@@ -2031,6 +2730,10 @@ export function createApiApp(): express.Express {
         reason,
         ipAddress: getClientIp(req),
         metadata: {
+          brand: existingBrand,
+          ownerName: existing.ownerName,
+          vehicleRegNumber: existing.vehicleRegNumber,
+          deletedCanonicalHash: existing.canonicalHash,
           safetyBackupId: safetyBackup.id,
           reservedNumbersRetained: true,
         },
@@ -2045,7 +2748,7 @@ export function createApiApp(): express.Express {
       return;
     }
 
-    // Default: Soft Delete (reversible, hidden from Maker recent list and public verify)
+    // Default: Archive (SOFT_DELETED — permanently stored in Firestore archive, restorable anytime, never auto-deleted)
     const softDeletedBase: Omit<CertificateRecord, 'canonicalHash'> = {
       ...existing,
       status: 'SOFT_DELETED',
@@ -2060,6 +2763,26 @@ export function createApiApp(): express.Express {
     };
 
     await store.saveCertificate(updated);
+    try {
+      await store.appendCertificateVersion({
+        id: `${updated.id}_archive_${generateRecordId('ver')}`,
+        certificateId: updated.id,
+        certificateNumber: updated.certificateNumber,
+        brand: existingBrand,
+        version: updated.version,
+        recordedAt: now,
+        actor: req.session!.username,
+        actorRole: req.session!.role,
+        event: 'ARCHIVED',
+        reason,
+        changedFields: ['status'],
+        previousCanonicalHash: existing.canonicalHash,
+        canonicalHash: updated.canonicalHash,
+        data: extractCertificateCoreFields(updated),
+      });
+    } catch {
+      // non-fatal
+    }
     await store.addAuditLog({
       id: generateRecordId('aud'),
       timestamp: now,
@@ -2070,9 +2793,15 @@ export function createApiApp(): express.Express {
       certificateNumber: updated.certificateNumber,
       reason,
       ipAddress: getClientIp(req),
+      metadata: {
+        brand: existingBrand,
+        archived: true,
+        permanent: false,
+        reservedNumbersRetained: true,
+      },
     });
 
-    res.json({ deleted: true, permanent: false, certificate: updated });
+    res.json({ deleted: true, archived: true, permanent: false, certificate: updated });
   });
 
   router.post('/admin/certificates/:id/restore', requireMainAdmin, async (req: AuthedRequest, res) => {
@@ -2114,6 +2843,26 @@ export function createApiApp(): express.Express {
     };
 
     await store.saveCertificate(updated);
+    try {
+      await store.appendCertificateVersion({
+        id: `${updated.id}_restore_${generateRecordId('ver')}`,
+        certificateId: updated.id,
+        certificateNumber: updated.certificateNumber,
+        brand: resolveCertificateBrand(updated),
+        version: updated.version,
+        recordedAt: now,
+        actor: req.session!.username,
+        actorRole: req.session!.role,
+        event: 'RESTORED',
+        reason,
+        changedFields: ['status'],
+        previousCanonicalHash: existing.canonicalHash,
+        canonicalHash: updated.canonicalHash,
+        data: extractCertificateCoreFields(updated),
+      });
+    } catch {
+      // non-fatal
+    }
     await store.addAuditLog({
       id: generateRecordId('aud'),
       timestamp: now,
@@ -2127,6 +2876,86 @@ export function createApiApp(): express.Express {
     });
 
     res.json({ certificate: updated });
+  });
+
+  // Read-Only Database Integrity & Backup Monitor (Main Core Admin / Owner Only)
+  router.get('/admin/integrity-monitor', requireMainAdmin, async (req: AuthedRequest, res) => {
+    const store = getStore();
+    const report = await runReadOnlyIntegrityAudit(store);
+    try {
+      await store.addAuditLog({
+        id: generateRecordId('aud'),
+        timestamp: report.auditedAt,
+        actor: req.session!.username,
+        actorRole: req.session!.role,
+        action: 'INTEGRITY_AUDIT_RUN',
+        ipAddress: getClientIp(req),
+        metadata: {
+          readOnly: true,
+          healthy: report.healthy,
+          totalCertificates: report.counts.totalCertificates,
+          parivahanCertificates: report.counts.parivahanCertificates,
+          scrapRouteCertificates: report.counts.scrapRouteCertificates,
+          integrityMismatches: report.counts.integrityMismatches,
+          discrepancyCount: report.discrepancies.length,
+        },
+      });
+    } catch {
+      // non-fatal
+    }
+    res.json({ report });
+  });
+
+  // Owner-Only Full Authoritative Registry JSON Export
+  router.get('/admin/export', requireMainAdmin, async (req: AuthedRequest, res) => {
+    const store = getStore();
+    const [certificates, reserved, settings] = await Promise.all([
+      store.getAllCertificates(),
+      store.getAllReservedNumbers(),
+      store.getSettings(),
+    ]);
+    const exportedAt = new Date().toISOString();
+    const payload = {
+      schemaVersion: 2,
+      exportedAt,
+      exportedBy: req.session!.username,
+      storageMode: store.mode,
+      counts: {
+        totalCertificates: certificates.length,
+        parivahanCertificates: certificates.filter((c) => resolveCertificateBrand(c) === 'parivahan')
+          .length,
+        scrapRouteCertificates: certificates.filter(
+          (c) => resolveCertificateBrand(c) === 'scrap_route'
+        ).length,
+        reservedCertNumbers: reserved.certNumbers.length,
+        reservedRegNumbers: reserved.regNumbers.length,
+      },
+      certificates,
+      reservedCertNumbers: reserved.certNumbers,
+      reservedRegNumbers: reserved.regNumbers,
+      settings,
+    };
+    const json = JSON.stringify(payload, null, 2);
+    const sha256 = computeSha256(json);
+    await store.addAuditLog({
+      id: generateRecordId('aud'),
+      timestamp: exportedAt,
+      actor: req.session!.username,
+      actorRole: req.session!.role,
+      action: 'REGISTRY_EXPORTED',
+      ipAddress: getClientIp(req),
+      metadata: {
+        certificateCount: certificates.length,
+        sha256Checksum: sha256,
+      },
+    });
+    res.setHeader('Content-Type', 'application/json; charset=utf-8');
+    res.setHeader(
+      'Content-Disposition',
+      `attachment; filename="certificate_registry_export_${exportedAt.slice(0, 10)}.json"`
+    );
+    res.setHeader('X-Export-SHA256', sha256);
+    res.send(json);
   });
 
   // Audit Logs
@@ -2143,21 +2972,39 @@ export function createApiApp(): express.Express {
 
   router.post('/admin/backups/create', requireMainAdmin, async (req: AuthedRequest, res) => {
     const store = getStore();
-    const snapshot = await store.createBackup(req.session!.username, 'MANUAL');
-    await store.addAuditLog({
-      id: generateRecordId('aud'),
-      timestamp: snapshot.createdAt,
-      actor: req.session!.username,
-      actorRole: req.session!.role,
-      action: 'BACKUP_CREATED',
-      ipAddress: getClientIp(req),
-      metadata: {
-        backupId: snapshot.id,
-        certificateCount: snapshot.certificateCount,
-        sha256Checksum: snapshot.sha256Checksum,
-      },
-    });
-    res.status(201).json({ backup: snapshot });
+    try {
+      const snapshot = await store.createBackup(req.session!.username, 'MANUAL');
+      await store.addAuditLog({
+        id: generateRecordId('aud'),
+        timestamp: snapshot.createdAt,
+        actor: req.session!.username,
+        actorRole: req.session!.role,
+        action: 'BACKUP_CREATED',
+        ipAddress: getClientIp(req),
+        metadata: {
+          backupId: snapshot.id,
+          certificateCount: snapshot.certificateCount,
+          verified: snapshot.verified,
+          sha256Checksum: snapshot.sha256Checksum,
+        },
+      });
+      res.status(201).json({ backup: snapshot });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Manual backup failed';
+      await store.addAuditLog({
+        id: generateRecordId('aud'),
+        timestamp: new Date().toISOString(),
+        actor: req.session!.username,
+        actorRole: req.session!.role,
+        action: 'BACKUP_FAILED',
+        ipAddress: getClientIp(req),
+        reason: msg,
+        metadata: { trigger: 'MANUAL' },
+      });
+      res.status(503).json({
+        error: `Backup failed: ${msg}. Previous verified backups have been preserved.`,
+      });
+    }
   });
 
   router.get('/admin/backups/:id/download', requireMainAdmin, async (req, res) => {
@@ -2186,6 +3033,29 @@ export function createApiApp(): express.Express {
     res.json({ dryRun: result });
   });
 
+  // Isolated Staging Restore Verification (restores into a separate staging database first & audits integrity)
+  router.post('/admin/backups/:id/staging-verify', requireMainAdmin, async (req: AuthedRequest, res) => {
+    const store = getStore();
+    const id = sanitizeText(req.params.id, 100);
+    const stagingResult = await verifyBackupInStaging(store, id);
+    await store.addAuditLog({
+      id: generateRecordId('aud'),
+      timestamp: stagingResult.verifiedAt,
+      actor: req.session!.username,
+      actorRole: req.session!.role,
+      action: 'BACKUP_STAGING_VERIFIED',
+      ipAddress: getClientIp(req),
+      metadata: {
+        backupId: id,
+        checksumValid: stagingResult.checksumValid,
+        stagingRestoredCount: stagingResult.stagingRestoredCount,
+        stagingIntegrityHealthy: stagingResult.stagingIntegrityHealthy,
+        safeForProductionRecovery: stagingResult.safeForProductionRecovery,
+      },
+    });
+    res.json({ stagingResult });
+  });
+
   router.post('/admin/backups/:id/restore', requireMainAdmin, async (req: AuthedRequest, res) => {
     const store = getStore();
     const id = sanitizeText(req.params.id, 100);
@@ -2204,6 +3074,17 @@ export function createApiApp(): express.Express {
       return;
     }
 
+    // Automatically verify backup integrity inside an isolated staging store BEFORE mutating production
+    const stagingCheck = await verifyBackupInStaging(store, id);
+    if (!stagingCheck.safeForProductionRecovery) {
+      res.status(409).json({
+        error:
+          'Production restore blocked: isolated staging verification detected checksum or integrity discrepancies. Production database was NOT modified.',
+        stagingResult: stagingCheck,
+      });
+      return;
+    }
+
     const result = await store.restoreBackup(id, req.session!.username);
     await store.addAuditLog({
       id: generateRecordId('aud'),
@@ -2216,13 +3097,14 @@ export function createApiApp(): express.Express {
         backupId: id,
         restoredCount: result.restoredCount,
         safetyBackupId: result.safetyBackupId,
+        stagingVerified: true,
       },
     });
 
-    res.json({ success: true, ...result });
+    res.json({ success: true, ...result, stagingResult: stagingCheck });
   });
 
-  // Scheduled Cron Backup Route (Protected via CRON_SECRET)
+  // Scheduled Cron Backup Route (Protected via CRON_SECRET, verifies integrity & alerts owner on failure)
   router.all('/cron/backup', async (req, res) => {
     const configuredSecret = process.env.CRON_SECRET?.trim();
     if (!configuredSecret) {
@@ -2235,8 +3117,52 @@ export function createApiApp(): express.Express {
       res.status(401).json({ error: 'Unauthorized cron trigger.' });
       return;
     }
-    const snapshot = await getStore().createBackup('cron-scheduler', 'SCHEDULED');
-    res.json({ success: true, backup: snapshot });
+    const store = getStore();
+    try {
+      const snapshot = await store.createBackup('cron-scheduler', 'SCHEDULED');
+      await store.addAuditLog({
+        id: generateRecordId('aud'),
+        timestamp: snapshot.createdAt,
+        actor: 'cron-scheduler',
+        actorRole: 'system',
+        action: 'BACKUP_CREATED',
+        metadata: {
+          trigger: 'SCHEDULED',
+          backupId: snapshot.id,
+          certificateCount: snapshot.certificateCount,
+          verified: snapshot.verified,
+          sha256Checksum: snapshot.sha256Checksum,
+        },
+      });
+      res.json({ success: true, backup: snapshot });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Scheduled backup failed';
+      try {
+        await store.addAuditLog({
+          id: generateRecordId('aud'),
+          timestamp: new Date().toISOString(),
+          actor: 'cron-scheduler',
+          actorRole: 'system',
+          action: 'BACKUP_FAILED',
+          reason: msg,
+          metadata: { trigger: 'SCHEDULED' },
+        });
+        await store.addSystemError({
+          id: generateRecordId('err'),
+          timestamp: new Date().toISOString(),
+          route: '/api/cron/backup',
+          method: req.method,
+          code: 'BACKUP_FAILED',
+          message: `Scheduled daily backup failed (previous good backups preserved): ${msg}`,
+        });
+      } catch {
+        // avoid cascading failure
+      }
+      res.status(503).json({
+        success: false,
+        error: `Scheduled backup failed: ${msg}. Previous verified backups remain preserved.`,
+      });
+    }
   });
 
   // Settings & Password Rotation

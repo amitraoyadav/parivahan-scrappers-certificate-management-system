@@ -7,22 +7,27 @@ import {
   Eye,
   EyeOff,
   FilePlus2,
+  KeyRound,
+  Lock,
   RefreshCw,
+  ShieldCheck,
 } from 'lucide-react';
 import type {
   CandidateNumbers,
+  CertificateBrand,
   CertificateRecord,
   CreateCertificateInput,
   IdProofType,
 } from '../shared/types';
 import {
+  COMMON_MANUFACTURERS,
   OTHER_MANUFACTURER_VALUE,
-  VEHICLE_MANUFACTURER_GROUPS,
   formatChassisOrEngine,
 } from '../shared/vehicleData';
 import { api, ApiError } from '../lib/api';
 import {
   downloadCertificatePdf,
+  getCertificateBrand,
   openAndDownloadCertificatePdf,
   type PdfBrandingOptions,
 } from '../lib/pdfGenerator';
@@ -31,6 +36,8 @@ interface CreateCertificateFormProps {
   onCertificateCreated: (cert: CertificateRecord) => void;
   onPreviewCertificate: (cert: CertificateRecord) => void;
   onSessionExpired?: () => void;
+  initialScrapRouteAuthorized?: boolean;
+  scrapRoutePinConfigured?: boolean;
   pdfBranding?: PdfBrandingOptions;
 }
 
@@ -78,8 +85,19 @@ export const CreateCertificateForm: React.FC<CreateCertificateFormProps> = ({
   onCertificateCreated,
   onPreviewCertificate,
   onSessionExpired,
+  initialScrapRouteAuthorized = false,
+  scrapRoutePinConfigured = true,
   pdfBranding,
 }) => {
+  const [selectedBrand, setSelectedBrand] = useState<CertificateBrand>('parivahan');
+  const [scrapRouteAuthorized, setScrapRouteAuthorized] = useState<boolean>(
+    initialScrapRouteAuthorized
+  );
+  const [pinInput, setPinInput] = useState('');
+  const [verifyingPin, setVerifyingPin] = useState(false);
+  const [pinError, setPinError] = useState<string | null>(null);
+  const [lockingScrapRoute, setLockingScrapRoute] = useState(false);
+
   const [form, setForm] = useState<CreateCertificateInput>(createInitialForm);
   const [selectedMakeOption, setSelectedMakeOption] = useState<string>('');
   const [customMake, setCustomMake] = useState<string>('');
@@ -105,6 +123,12 @@ export const CreateCertificateForm: React.FC<CreateCertificateFormProps> = ({
   const lastBlobUrlRef = useRef<string | null>(null);
 
   useEffect(() => {
+    if (initialScrapRouteAuthorized) {
+      setScrapRouteAuthorized(true);
+    }
+  }, [initialScrapRouteAuthorized]);
+
+  useEffect(() => {
     return () => {
       if (lastBlobUrlRef.current) {
         URL.revokeObjectURL(lastBlobUrlRef.current);
@@ -112,32 +136,108 @@ export const CreateCertificateForm: React.FC<CreateCertificateFormProps> = ({
     };
   }, []);
 
-  const loadCandidates = useCallback(async (issueDate?: string) => {
-    setLoadingCandidates(true);
+  const isScrapRouteLocked = selectedBrand === 'scrap_route' && !scrapRouteAuthorized;
+
+  const loadCandidates = useCallback(
+    async (issueDate?: string, brand: CertificateBrand = selectedBrand) => {
+      if (brand === 'scrap_route' && !scrapRouteAuthorized) {
+        setCandidates(null);
+        setCandidateError(null);
+        return;
+      }
+      setLoadingCandidates(true);
+      setCandidateError(null);
+      try {
+        const next = await api.getCandidateNumbers(issueDate, brand);
+        setCandidates(next);
+        setSessionExpired(false);
+      } catch (err) {
+        if (err instanceof ApiError && err.status === 401) {
+          setSessionExpired(true);
+          setCandidateError('Session expired. Please sign in again.');
+        } else if (
+          err instanceof ApiError &&
+          err.status === 403 &&
+          err.code === 'SCRAP_ROUTE_PIN_REQUIRED'
+        ) {
+          setScrapRouteAuthorized(false);
+          setCandidates(null);
+          setPinError('Scrap Route PIN authorization expired. Please verify your PIN again.');
+        } else {
+          setCandidateError(
+            err instanceof ApiError
+              ? err.message
+              : 'Unable to load next available numbers. Click Retry.'
+          );
+        }
+      } finally {
+        setLoadingCandidates(false);
+      }
+    },
+    [selectedBrand, scrapRouteAuthorized]
+  );
+
+  useEffect(() => {
+    if (isScrapRouteLocked) {
+      setCandidates(null);
+      setCandidateError(null);
+      return;
+    }
+    void loadCandidates(form.issueDate, selectedBrand);
+  }, [loadCandidates, form.issueDate, selectedBrand, isScrapRouteLocked]);
+
+  const handleSelectBrand = (brand: CertificateBrand) => {
+    if (brand === selectedBrand) return;
+    setSelectedBrand(brand);
+    setError(null);
+    setPinError(null);
     setCandidateError(null);
+    setCandidates(null);
+    idempotencyKeyRef.current = createIdempotencyKey();
+  };
+
+  const handleVerifyScrapRoutePin = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (verifyingPin) return;
+    setPinError(null);
+    setVerifyingPin(true);
     try {
-      const next = await api.getCandidateNumbers(issueDate);
-      setCandidates(next);
-      setSessionExpired(false);
+      const res = await api.verifyScrapRoutePin(pinInput);
+      if (res.authorized) {
+        setScrapRouteAuthorized(true);
+        setPinInput('');
+        setPinError(null);
+      }
     } catch (err) {
       if (err instanceof ApiError && err.status === 401) {
-        setSessionExpired(true);
-        setCandidateError('Session expired. Please sign in again.');
+        setPinError(err.message);
       } else {
-        setCandidateError(
+        setPinError(
           err instanceof ApiError
             ? err.message
-            : 'Unable to load next available numbers. Click Retry.'
+            : 'Unable to verify Scrap Route PIN. Please try again.'
         );
       }
     } finally {
-      setLoadingCandidates(false);
+      setVerifyingPin(false);
     }
-  }, []);
+  };
 
-  useEffect(() => {
-    void loadCandidates(form.issueDate);
-  }, [loadCandidates, form.issueDate]);
+  const handleLockScrapRoute = async () => {
+    if (lockingScrapRoute) return;
+    setLockingScrapRoute(true);
+    try {
+      await api.lockScrapRoute();
+    } catch {
+      // ignore network error and lock client UI regardless
+    } finally {
+      setScrapRouteAuthorized(false);
+      setCandidates(null);
+      setPinInput('');
+      setPinError(null);
+      setLockingScrapRoute(false);
+    }
+  };
 
   const updateField = <K extends keyof CreateCertificateInput>(
     key: K,
@@ -166,14 +266,38 @@ export const CreateCertificateForm: React.FC<CreateCertificateFormProps> = ({
 
     try {
       const effectiveMake =
-        selectedMakeOption === OTHER_MANUFACTURER_VALUE ? customMake.trim() : form.make.trim();
+        selectedMakeOption === OTHER_MANUFACTURER_VALUE
+          ? customMake.trim()
+          : selectedMakeOption.trim();
+
+      if (
+        !effectiveMake ||
+        effectiveMake.length < 2 ||
+        effectiveMake === OTHER_MANUFACTURER_VALUE ||
+        (selectedMakeOption === OTHER_MANUFACTURER_VALUE &&
+          effectiveMake.toLowerCase() === 'other')
+      ) {
+        setError('Please enter a valid manufacturer name (at least 2 characters).');
+        return;
+      }
+
+      const cleanedAddress = (form.ownerAddress ?? '').trim();
+      const cleanedIdNumber = (form.idProofNumber ?? '').trim();
+      const cleanedIdType: IdProofType = cleanedIdNumber ? (form.idProofType ?? '') : '';
+
+      const matchedCandidates =
+        candidates && candidates.brand === selectedBrand ? candidates : null;
 
       const result = await api.createCertificate(
         {
           ...form,
+          brand: selectedBrand,
+          ownerAddress: cleanedAddress,
+          idProofType: cleanedIdType,
+          idProofNumber: cleanedIdNumber,
           make: effectiveMake,
-          certificateNumber: candidates?.certificateNumber,
-          scrappingRegNumber: candidates?.scrappingRegNumber,
+          certificateNumber: matchedCandidates?.certificateNumber,
+          scrappingRegNumber: matchedCandidates?.scrappingRegNumber,
         },
         idempotencyKeyRef.current
       );
@@ -218,11 +342,19 @@ export const CreateCertificateForm: React.FC<CreateCertificateFormProps> = ({
       setForm(resetForm);
       setSelectedMakeOption('');
       setCustomMake('');
-      void loadCandidates(resetForm.issueDate);
+      void loadCandidates(resetForm.issueDate, selectedBrand);
     } catch (err) {
       if (err instanceof ApiError && err.status === 401) {
         setSessionExpired(true);
         setError('Your session has expired or is no longer valid. Please sign in again to issue certificates.');
+      } else if (
+        err instanceof ApiError &&
+        err.status === 403 &&
+        err.code === 'SCRAP_ROUTE_PIN_REQUIRED'
+      ) {
+        setScrapRouteAuthorized(false);
+        setCandidates(null);
+        setPinError('Scrap Route PIN verification is required before issuing Scrap Route certificates.');
       } else {
         setError(
           err instanceof ApiError
@@ -237,64 +369,148 @@ export const CreateCertificateForm: React.FC<CreateCertificateFormProps> = ({
   };
 
   const isUnhidden = form.unhideChassisEngine === true;
+  const isScrapRoute = selectedBrand === 'scrap_route';
+  const lastIssuedBrand = lastIssued ? getCertificateBrand(lastIssued.certificate) : 'parivahan';
 
   return (
     <div className="bg-white border border-slate-200 rounded-xl p-6 sm:p-8">
+      {/* Two-Brand Certificate Type Selector */}
+      <div className="mb-6">
+        <div className="flex flex-wrap items-center justify-between gap-2 mb-2.5">
+          <span className="text-xs font-bold uppercase tracking-wider text-slate-500">
+            Select Certificate Brand
+          </span>
+          {isScrapRoute && scrapRouteAuthorized && (
+            <button
+              type="button"
+              onClick={() => void handleLockScrapRoute()}
+              disabled={lockingScrapRoute}
+              className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md border border-slate-300 bg-white hover:bg-slate-50 text-xs font-semibold text-slate-700 cursor-pointer disabled:opacity-50"
+            >
+              <Lock className="w-3.5 h-3.5 text-slate-500" />
+              {lockingScrapRoute ? 'Locking...' : 'Lock Scrap Route'}
+            </button>
+          )}
+        </div>
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+          <button
+            type="button"
+            onClick={() => handleSelectBrand('parivahan')}
+            className={`text-left p-4 rounded-xl border-2 transition-all cursor-pointer ${
+              !isScrapRoute
+                ? 'border-[#0B1F3A] bg-slate-50/80 shadow-xs'
+                : 'border-slate-200 bg-white hover:border-slate-300'
+            }`}
+          >
+            <div className="flex items-center justify-between gap-2">
+              <span className="font-display font-bold text-sm text-[#0B1F3A]">
+                Parivahan Scrappers Certificate
+              </span>
+              <span className="text-[10px] font-bold uppercase tracking-wider px-2 py-0.5 rounded bg-blue-50 text-[#0B1F3A] border border-blue-200">
+                Default
+              </span>
+            </div>
+            <p className="text-xs text-slate-600 mt-1">
+              Standard issuance · Numbers <span className="font-mono font-semibold">PS/YY/R...</span> · No PIN required
+            </p>
+          </button>
+
+          <button
+            type="button"
+            onClick={() => handleSelectBrand('scrap_route')}
+            className={`text-left p-4 rounded-xl border-2 transition-all cursor-pointer ${
+              isScrapRoute
+                ? 'border-[#065F46] bg-emerald-50/60 shadow-xs'
+                : 'border-slate-200 bg-white hover:border-slate-300'
+            }`}
+          >
+            <div className="flex items-center justify-between gap-2">
+              <span className="font-display font-bold text-sm text-[#065F46]">
+                Scrap Route Certificate
+              </span>
+              {scrapRouteAuthorized ? (
+                <span className="inline-flex items-center gap-1 text-[10px] font-bold uppercase tracking-wider px-2 py-0.5 rounded bg-emerald-100 text-emerald-900 border border-emerald-200">
+                  <ShieldCheck className="w-3 h-3" />
+                  Unlocked
+                </span>
+              ) : (
+                <span className="inline-flex items-center gap-1 text-[10px] font-bold uppercase tracking-wider px-2 py-0.5 rounded bg-amber-50 text-amber-900 border border-amber-200">
+                  <Lock className="w-3 h-3" />
+                  PIN Protected
+                </span>
+              )}
+            </div>
+            <p className="text-xs text-slate-600 mt-1">
+              Dedicated Scrap Route branding · Numbers{' '}
+              <span className="font-mono font-semibold">SR/YY/R...</span> · Private PIN required
+            </p>
+          </button>
+        </div>
+      </div>
+
       <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4 pb-6 border-b border-slate-200">
         <div>
           <h2 className="font-display text-xl font-bold text-[#0B1F3A]">
-            Make New Scrapping Certificate
+            {isScrapRoute
+              ? 'Make New Scrap Route Certificate'
+              : 'Make New Parivahan Scrappers Certificate'}
           </h2>
           <p className="text-sm text-slate-600 mt-1">
-            Numbers are generated cryptographically and reserved atomically upon issuance.
+            {isScrapRoute
+              ? 'Separate Scrap Route numbering pool and standalone Scrap Route PDF template.'
+              : 'Numbers are generated cryptographically and reserved atomically upon issuance.'}
           </p>
         </div>
 
         {/* Cryptographic Candidate Preview + Non-Consuming Refresh */}
-        <div className="flex items-center gap-3 bg-slate-50 border border-slate-200 rounded-lg px-4 py-2.5">
-          <div className="text-xs">
-            <div className="text-slate-500">Next Available Numbers</div>
-            <div className="font-mono font-semibold text-[#0B1F3A] mt-0.5 tabular-nums">
-              {loadingCandidates && !candidates ? (
-                <span>Generating...</span>
-              ) : candidateError && !candidates ? (
-                <span className="font-sans font-medium text-red-700">{candidateError}</span>
-              ) : candidates ? (
-                <>
-                  <span>{candidates.certificateNumber}</span>
-                  <span className="mx-2 text-slate-300">/</span>
-                  <span className="text-[#059669]">{candidates.scrappingRegNumber}</span>
-                </>
-              ) : (
-                <span className="font-sans font-medium text-amber-800">Numbers unavailable</span>
+        {!isScrapRouteLocked && (
+          <div className="flex items-center gap-3 bg-slate-50 border border-slate-200 rounded-lg px-4 py-2.5">
+            <div className="text-xs">
+              <div className="text-slate-500">
+                {isScrapRoute ? 'Next Scrap Route Numbers' : 'Next Available Numbers'}
+              </div>
+              <div className="font-mono font-semibold text-[#0B1F3A] mt-0.5 tabular-nums">
+                {loadingCandidates && !candidates ? (
+                  <span>Generating...</span>
+                ) : candidateError && !candidates ? (
+                  <span className="font-sans font-medium text-red-700">{candidateError}</span>
+                ) : candidates ? (
+                  <>
+                    <span>{candidates.certificateNumber}</span>
+                    <span className="mx-2 text-slate-300">/</span>
+                    <span className="text-[#059669]">{candidates.scrappingRegNumber}</span>
+                  </>
+                ) : (
+                  <span className="font-sans font-medium text-amber-800">Numbers unavailable</span>
+                )}
+              </div>
+              {candidateError && candidates && (
+                <p className="text-[11px] font-sans text-red-700 mt-0.5">{candidateError}</p>
               )}
             </div>
-            {candidateError && candidates && (
-              <p className="text-[11px] font-sans text-red-700 mt-0.5">{candidateError}</p>
+            {candidateError ? (
+              <button
+                type="button"
+                onClick={() => void loadCandidates(form.issueDate, selectedBrand)}
+                disabled={loadingCandidates || submitting}
+                className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-md border border-red-300 bg-white hover:bg-red-50 text-xs font-semibold text-red-700 transition-colors disabled:opacity-50 cursor-pointer whitespace-nowrap"
+              >
+                <RefreshCw className={`w-3.5 h-3.5 ${loadingCandidates ? 'animate-spin' : ''}`} />
+                Retry
+              </button>
+            ) : (
+              <button
+                type="button"
+                onClick={() => void loadCandidates(form.issueDate, selectedBrand)}
+                disabled={loadingCandidates || submitting}
+                title="Generate new available random candidates without consuming them"
+                className="p-2 rounded-md border border-slate-300 bg-white hover:bg-slate-100 text-slate-700 transition-colors disabled:opacity-50 cursor-pointer"
+              >
+                <RefreshCw className={`w-4 h-4 ${loadingCandidates ? 'animate-spin' : ''}`} />
+              </button>
             )}
           </div>
-          {candidateError ? (
-            <button
-              type="button"
-              onClick={() => void loadCandidates(form.issueDate)}
-              disabled={loadingCandidates || submitting}
-              className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-md border border-red-300 bg-white hover:bg-red-50 text-xs font-semibold text-red-700 transition-colors disabled:opacity-50 cursor-pointer whitespace-nowrap"
-            >
-              <RefreshCw className={`w-3.5 h-3.5 ${loadingCandidates ? 'animate-spin' : ''}`} />
-              Retry
-            </button>
-          ) : (
-            <button
-              type="button"
-              onClick={() => void loadCandidates(form.issueDate)}
-              disabled={loadingCandidates || submitting}
-              title="Generate new available random candidates without consuming them"
-              className="p-2 rounded-md border border-slate-300 bg-white hover:bg-slate-100 text-slate-700 transition-colors disabled:opacity-50 cursor-pointer"
-            >
-              <RefreshCw className={`w-4 h-4 ${loadingCandidates ? 'animate-spin' : ''}`} />
-            </button>
-          )}
-        </div>
+        )}
       </div>
 
       {/* Confirmed Issuance Banner with Automatic PDF Status & Fallbacks */}
@@ -306,7 +522,7 @@ export const CreateCertificateForm: React.FC<CreateCertificateFormProps> = ({
               <p className="font-semibold text-emerald-950">
                 {lastIssued.pdfFailed
                   ? 'Certificate Saved — Click Download PDF to Retry PDF Export'
-                  : `Certificate Issued & PDF Generated (${lastIssued.pdfFileName ?? 'Official PDF'})`}
+                  : `${lastIssuedBrand === 'scrap_route' ? 'Scrap Route' : 'Parivahan Scrappers'} Certificate Issued & PDF Generated (${lastIssued.pdfFileName ?? 'Official PDF'})`}
               </p>
               <p className="text-emerald-900 mt-0.5 font-mono text-xs tabular-nums">
                 {lastIssued.certificate.certificateNumber} · {lastIssued.certificate.scrappingRegNumber} ·{' '}
@@ -382,6 +598,77 @@ export const CreateCertificateForm: React.FC<CreateCertificateFormProps> = ({
         </div>
       )}
 
+      {isScrapRouteLocked ? (
+        <div className="mt-6 max-w-lg mx-auto rounded-xl border border-emerald-200 bg-emerald-50/40 p-6">
+          <div className="flex items-start gap-3">
+            <div className="w-10 h-10 rounded-lg bg-[#065F46] text-white flex items-center justify-center shrink-0">
+              <KeyRound className="w-5 h-5" />
+            </div>
+            <div>
+              <h3 className="font-display font-bold text-base text-[#0B1F3A]">
+                Scrap Route Private PIN Required
+              </h3>
+              <p className="text-xs text-slate-600 mt-1 leading-relaxed">
+                Enter the private Scrap Route PIN to unlock Scrap Route certificate issuance
+                (<span className="font-mono">SR/YY/R...</span>). Verification is checked securely on
+                the server without signing you out.
+              </p>
+            </div>
+          </div>
+
+          {!scrapRoutePinConfigured && (
+            <div className="mt-4 p-3 rounded-lg bg-amber-50 border border-amber-200 text-amber-900 text-xs">
+              <strong>Server Setup Needed:</strong> Configure <code className="font-mono">SCRAP_ROUTE_PIN</code> in your server / Vercel environment variables before unlocking Scrap Route issuance.
+            </div>
+          )}
+
+          {pinError && (
+            <div
+              role="alert"
+              className="mt-4 p-3 rounded-lg bg-red-50 border border-red-200 text-red-800 text-xs flex items-start gap-2"
+            >
+              <AlertCircle className="w-4 h-4 shrink-0 mt-0.5 text-red-600" />
+              <span>{pinError}</span>
+            </div>
+          )}
+
+          <form onSubmit={handleVerifyScrapRoutePin} className="mt-4 space-y-3">
+            <div>
+              <label className="block text-xs font-medium text-slate-700 mb-1.5">
+                Scrap Route Private PIN
+              </label>
+              <input
+                type="password"
+                required
+                autoFocus
+                autoComplete="off"
+                value={pinInput}
+                onChange={(e) => setPinInput(e.target.value)}
+                placeholder="Enter private Scrap Route PIN"
+                className="w-full px-3.5 py-2.5 rounded-lg border border-slate-300 bg-white text-sm font-mono focus:outline-none focus:ring-2 focus:ring-[#065F46] focus:border-[#065F46]"
+              />
+            </div>
+
+            <div className="flex flex-wrap items-center justify-between gap-2 pt-1">
+              <button
+                type="button"
+                onClick={() => handleSelectBrand('parivahan')}
+                className="px-3.5 py-2 rounded-lg border border-slate-300 bg-white hover:bg-slate-50 text-xs font-semibold text-slate-700 cursor-pointer"
+              >
+                Back to Parivahan Scrappers
+              </button>
+              <button
+                type="submit"
+                disabled={verifyingPin || !pinInput.trim()}
+                className="inline-flex items-center gap-1.5 px-4 py-2 rounded-lg bg-[#065F46] hover:bg-[#064E3B] text-white text-xs font-semibold transition-colors disabled:opacity-50 cursor-pointer"
+              >
+                <ShieldCheck className="w-4 h-4" />
+                {verifyingPin ? 'Verifying PIN...' : 'Unlock Scrap Route Mode'}
+              </button>
+            </div>
+          </form>
+        </div>
+      ) : (
       <form onSubmit={handleSubmit} className="mt-6 space-y-8">
         {/* Section 1: Issuance & Handover Dates */}
         <div>
@@ -513,33 +800,37 @@ export const CreateCertificateForm: React.FC<CreateCertificateFormProps> = ({
                 onChange={(e) => handleMakeDropdownChange(e.target.value)}
                 className="w-full px-3 py-2 rounded-lg border border-slate-300 text-sm bg-white focus:outline-none focus:ring-2 focus:ring-[#059669]"
               >
-                <option value="">-- Select Manufacturer (Bikes, Scooty, Cars...) --</option>
-                {VEHICLE_MANUFACTURER_GROUPS.map((group) => (
-                  <optgroup key={group.category} label={group.category}>
-                    {group.brands.map((brand) => (
-                      <option key={brand} value={brand}>
-                        {brand}
-                      </option>
-                    ))}
-                  </optgroup>
+                <option value="">-- Select Manufacturer --</option>
+                {COMMON_MANUFACTURERS.map((brand) => (
+                  <option key={brand} value={brand}>
+                    {brand}
+                  </option>
                 ))}
-                <optgroup label="Other">
-                  <option value={OTHER_MANUFACTURER_VALUE}>Other (Type Manually)</option>
-                </optgroup>
+                <option value={OTHER_MANUFACTURER_VALUE}>Other</option>
               </select>
               {selectedMakeOption === OTHER_MANUFACTURER_VALUE && (
-                <input
-                  type="text"
-                  required
-                  minLength={2}
-                  value={customMake}
-                  onChange={(e) => {
-                    setCustomMake(e.target.value);
-                    updateField('make', e.target.value);
-                  }}
-                  placeholder="Enter custom manufacturer name"
-                  className="mt-2 w-full px-3 py-2 rounded-lg border border-slate-300 text-sm focus:outline-none focus:ring-2 focus:ring-[#059669]"
-                />
+                <div className="mt-2">
+                  <label
+                    htmlFor="create-custom-manufacturer"
+                    className="block text-xs font-medium text-slate-700 mb-1"
+                  >
+                    Enter Manufacturer Name <span className="text-red-600">*</span>
+                  </label>
+                  <input
+                    id="create-custom-manufacturer"
+                    name="customManufacturerName"
+                    type="text"
+                    required
+                    minLength={2}
+                    value={customMake}
+                    onChange={(e) => {
+                      setCustomMake(e.target.value);
+                      updateField('make', e.target.value);
+                    }}
+                    placeholder="Enter Manufacturer Name"
+                    className="w-full px-3 py-2 rounded-lg border border-slate-300 text-sm focus:outline-none focus:ring-2 focus:ring-[#059669]"
+                  />
+                </div>
               )}
             </div>
 
@@ -669,13 +960,22 @@ export const CreateCertificateForm: React.FC<CreateCertificateFormProps> = ({
           <button
             type="submit"
             disabled={submitting}
-            className="w-full sm:w-auto inline-flex items-center justify-center gap-2 px-6 py-2.5 rounded-lg bg-[#059669] hover:bg-[#047857] text-white font-semibold text-sm transition-colors disabled:opacity-50 whitespace-nowrap shrink-0 cursor-pointer"
+            className={`w-full sm:w-auto inline-flex items-center justify-center gap-2 px-6 py-2.5 rounded-lg text-white font-semibold text-sm transition-colors disabled:opacity-50 whitespace-nowrap shrink-0 cursor-pointer ${
+              isScrapRoute
+                ? 'bg-[#065F46] hover:bg-[#064E3B]'
+                : 'bg-[#059669] hover:bg-[#047857]'
+            }`}
           >
             <FilePlus2 className="w-4 h-4" />
-            {submitting ? 'Committing Certificate...' : 'Issue Official Certificate'}
+            {submitting
+              ? 'Committing Certificate...'
+              : isScrapRoute
+                ? 'Issue Scrap Route Certificate'
+                : 'Issue Parivahan Certificate'}
           </button>
         </div>
       </form>
+      )}
     </div>
   );
 };

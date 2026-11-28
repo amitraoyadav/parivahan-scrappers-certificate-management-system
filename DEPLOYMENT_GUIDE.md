@@ -84,6 +84,7 @@ Create a **new Vercel project** connected to `parivahan-certificate-fresh`, then
 | `ADMIN_SESSION_SECRET` | High-entropy random 64-char hex string (`openssl rand -hex 32`) |
 | `CRON_SECRET` | Random secret authorizing Vercel daily backup cron (`/api/cron/backup`) |
 | `PUBLIC_APP_URL` | Your new production URL (e.g. `https://parivahan-fresh.vercel.app`) |
+| `SCRAP_ROUTE_PIN` | Private server-side PIN required to unlock Scrap Route certificate issuance (plain or salted `scrypt$...` hash via `npm run hash:password`) |
 | `GOOGLE_DRIVE_FOLDER_ID` | *(Optional)* Dedicated new Google Drive folder ID for background PDF/JSON archival |
 | `GOOGLE_DRIVE_CLIENT_EMAIL` | *(Optional)* Service account email with access to the new Drive folder |
 | `GOOGLE_DRIVE_PRIVATE_KEY` | *(Optional)* Service account private key for Drive sync |

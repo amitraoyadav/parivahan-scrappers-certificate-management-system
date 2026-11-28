@@ -2,6 +2,8 @@ import React, { useCallback, useEffect, useState } from 'react';
 import {
   Activity,
   AlertCircle,
+  AlertTriangle,
+  Archive,
   Ban,
   CheckCircle2,
   ClipboardList,
@@ -10,29 +12,41 @@ import {
   Edit3,
   Eye,
   FilePlus2,
+  FlaskConical,
   FolderSync,
+  History,
   KeyRound,
   RefreshCw,
   RotateCcw,
   Search,
   Settings,
+  ShieldAlert,
   ShieldCheck,
-  Trash2,
+  X,
 } from 'lucide-react';
 import type {
   AuditLogEntry,
   BackupDryRunResult,
   BackupSnapshot,
   CertificateRecord,
+  CertificateVersionDocument,
+  CertificateVersionSnapshot,
   DashboardStats,
+  DatabaseIntegrityReport,
   DriveSyncLog,
+  OriginalCertificateSnapshot,
   SessionInfo,
+  StagingRestoreVerificationResult,
   SystemErrorLog,
   SystemSettings,
 } from '../shared/types';
 import { api, ApiError } from '../lib/api';
 import { formatChassisOrEngine } from '../shared/vehicleData';
-import { downloadCertificatePdf, type PdfBrandingOptions } from '../lib/pdfGenerator';
+import {
+  downloadCertificatePdf,
+  getCertificateBrand,
+  type PdfBrandingOptions,
+} from '../lib/pdfGenerator';
 import { CreateCertificateForm } from './CreateCertificateForm';
 import { ProtectedActionModal, type ProtectedActionMode } from './ProtectedActionModal';
 
@@ -41,35 +55,59 @@ interface AdminDashboardProps {
   onSessionUpdated: (session: SessionInfo) => void;
   onPreviewCertificate: (cert: CertificateRecord) => void;
   onOpenPublicVerify: (cert: CertificateRecord) => void;
+  initialScrapRouteAuthorized?: boolean;
+  scrapRoutePinConfigured?: boolean;
   pdfBranding?: PdfBrandingOptions;
 }
 
-type AdminTab = 'registry' | 'issue' | 'audit' | 'backups' | 'settings';
+type AdminTab = 'registry' | 'issue' | 'integrity' | 'audit' | 'backups' | 'settings';
 
 export const AdminDashboard: React.FC<AdminDashboardProps> = ({
   onSessionUpdated,
   onPreviewCertificate,
+  initialScrapRouteAuthorized = false,
+  scrapRoutePinConfigured = true,
   pdfBranding,
 }) => {
   const [activeTab, setActiveTab] = useState<AdminTab>('registry');
 
-  // Registry & Stats
+  // Registry & Stats + Continuous Sync State
   const [stats, setStats] = useState<DashboardStats | null>(null);
   const [certificates, setCertificates] = useState<CertificateRecord[]>([]);
   const [searchQuery, setSearchQuery] = useState('');
   const [statusFilter, setStatusFilter] = useState<'ALL' | 'ACTIVE' | 'CANCELLED' | 'SOFT_DELETED'>('ALL');
   const [loadingRegistry, setLoadingRegistry] = useState(true);
+  const [hasLoadedRegistry, setHasLoadedRegistry] = useState(false);
+  const [syncStatus, setSyncStatus] = useState<'idle' | 'syncing' | 'synced' | 'error'>('idle');
+  const [lastSyncedAt, setLastSyncedAt] = useState<string | null>(null);
+  const [syncError, setSyncError] = useState<string | null>(null);
 
   // Protected Action Modal
   const [actionCert, setActionCert] = useState<CertificateRecord | null>(null);
   const [actionMode, setActionMode] = useState<ProtectedActionMode | null>(null);
 
+  // Immutable Version History Modal
+  const [historyLoading, setHistoryLoading] = useState(false);
+  const [historyError, setHistoryError] = useState<string | null>(null);
+  const [historyPayload, setHistoryPayload] = useState<{
+    certificate: CertificateRecord;
+    originalRecord: OriginalCertificateSnapshot;
+    versionHistory: CertificateVersionSnapshot[];
+    appendOnlyVersions: CertificateVersionDocument[];
+  } | null>(null);
+
+  // Database Integrity & Backup Monitor
+  const [integrityReport, setIntegrityReport] = useState<DatabaseIntegrityReport | null>(null);
+  const [loadingIntegrity, setLoadingIntegrity] = useState(false);
+  const [exportingRegistry, setExportingRegistry] = useState(false);
+
   // Audit Logs
   const [auditLogs, setAuditLogs] = useState<AuditLogEntry[]>([]);
 
-  // Backups
+  // Backups & Staging Verification
   const [backups, setBackups] = useState<BackupSnapshot[]>([]);
   const [dryRunResult, setDryRunResult] = useState<BackupDryRunResult | null>(null);
+  const [stagingResult, setStagingResult] = useState<StagingRestoreVerificationResult | null>(null);
   const [restoreTargetId, setRestoreTargetId] = useState<string | null>(null);
   const [restoreConfirmPhrase, setRestoreConfirmPhrase] = useState('');
   const [restorePassword, setRestorePassword] = useState('');
@@ -108,31 +146,58 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
   // Feedback
   const [banner, setBanner] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
 
-  const loadRegistryAndStats = useCallback(async () => {
-    setLoadingRegistry(true);
+  const loadRegistryAndStats = useCallback(
+    async (opts?: { silent?: boolean }) => {
+      if (!opts?.silent) {
+        setLoadingRegistry(true);
+      }
+      setSyncStatus('syncing');
+      try {
+        const [statsRes, certsRes] = await Promise.all([
+          api.getAdminStats(),
+          api.getAdminCertificates({ search: searchQuery, status: statusFilter }),
+        ]);
+        setStats(statsRes);
+        setCertificates(certsRes.certificates);
+        setHasLoadedRegistry(true);
+        setSyncStatus('synced');
+        setLastSyncedAt(new Date().toISOString());
+        setSyncError(null);
+      } catch (err) {
+        // NEVER wipe cached certificates or stats to zero on sync failure
+        setSyncStatus('error');
+        const detail = err instanceof ApiError ? ` (${err.message})` : '';
+        setSyncError(`SYNC ERROR — EXISTING DATABASE RECORDS HAVE BEEN PRESERVED.${detail}`);
+      } finally {
+        if (!opts?.silent) {
+          setLoadingRegistry(false);
+        }
+      }
+    },
+    [searchQuery, statusFilter]
+  );
+
+  const loadIntegrityMonitor = useCallback(async () => {
+    setLoadingIntegrity(true);
     try {
-      const [statsRes, certsRes] = await Promise.all([
-        api.getAdminStats(),
-        api.getAdminCertificates({ search: searchQuery, status: statusFilter }),
-      ]);
-      setStats(statsRes);
-      setCertificates(certsRes.certificates);
+      const res = await api.getIntegrityMonitor();
+      setIntegrityReport(res.report);
     } catch (err) {
       setBanner({
         type: 'error',
-        text: err instanceof ApiError ? err.message : 'Failed to load registry.',
+        text: err instanceof ApiError ? err.message : 'Unable to run read-only integrity audit.',
       });
     } finally {
-      setLoadingRegistry(false);
+      setLoadingIntegrity(false);
     }
-  }, [searchQuery, statusFilter]);
+  }, []);
 
   const loadAuditLogs = useCallback(async () => {
     try {
       const res = await api.getAuditLogs();
       setAuditLogs(res.logs);
     } catch {
-      // handled silently
+      // preserve previously loaded logs
     }
   }, []);
 
@@ -141,7 +206,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
       const res = await api.getBackups();
       setBackups(res.backups);
     } catch {
-      // handled silently
+      // preserve previously loaded backups
     }
   }, []);
 
@@ -158,7 +223,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
       setDriveEnvConfigured(settingsRes.driveEnvConfigured);
       setHealthInfo(healthRes);
     } catch {
-      // handled silently
+      // preserve previously loaded settings/health
     }
   }, []);
 
@@ -166,11 +231,85 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
     void loadRegistryAndStats();
   }, [loadRegistryAndStats]);
 
+  // Continuous background database sync (30s interval when visible + window focus)
   useEffect(() => {
+    const interval = window.setInterval(() => {
+      if (document.visibilityState === 'visible') {
+        void loadRegistryAndStats({ silent: true });
+      }
+    }, 30_000);
+
+    const onFocus = () => {
+      void loadRegistryAndStats({ silent: true });
+    };
+    window.addEventListener('focus', onFocus);
+
+    return () => {
+      window.clearInterval(interval);
+      window.removeEventListener('focus', onFocus);
+    };
+  }, [loadRegistryAndStats]);
+
+  useEffect(() => {
+    if (activeTab === 'integrity') void loadIntegrityMonitor();
     if (activeTab === 'audit') void loadAuditLogs();
     if (activeTab === 'backups') void loadBackups();
     if (activeTab === 'settings') void loadSettingsAndHealth();
-  }, [activeTab, loadAuditLogs, loadBackups, loadSettingsAndHealth]);
+  }, [activeTab, loadIntegrityMonitor, loadAuditLogs, loadBackups, loadSettingsAndHealth]);
+
+  const handleOpenHistory = async (cert: CertificateRecord) => {
+    setHistoryError(null);
+    setHistoryLoading(true);
+    try {
+      const data = await api.getCertificateHistory(cert.id);
+      setHistoryPayload(data);
+    } catch (err) {
+      setHistoryError(
+        err instanceof ApiError ? err.message : 'Unable to load certificate version history.'
+      );
+      setBanner({
+        type: 'error',
+        text: err instanceof ApiError ? err.message : 'Unable to load certificate version history.',
+      });
+    } finally {
+      setHistoryLoading(false);
+    }
+  };
+
+  const handleExportRegistry = async () => {
+    setBanner(null);
+    setExportingRegistry(true);
+    try {
+      await api.exportFullRegistryJson();
+      setBanner({
+        type: 'success',
+        text: 'Owner-authorized full registry JSON export downloaded and recorded in audit logs.',
+      });
+    } catch (err) {
+      setBanner({
+        type: 'error',
+        text: err instanceof ApiError ? err.message : 'Registry export failed.',
+      });
+    } finally {
+      setExportingRegistry(false);
+    }
+  };
+
+  const handleStagingVerify = async (id: string) => {
+    setBanner(null);
+    setBackupBusy(true);
+    try {
+      const res = await api.verifyBackupInStaging(id);
+      setStagingResult(res.stagingResult);
+    } catch (err) {
+      setBanner({
+        type: 'error',
+        text: err instanceof ApiError ? err.message : 'Isolated staging verification failed.',
+      });
+    } finally {
+      setBackupBusy(false);
+    }
+  };
 
   const handleCreateBackup = async () => {
     setBanner(null);
@@ -297,6 +436,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
   const navItems: Array<{ id: AdminTab; label: string; icon: React.ReactNode }> = [
     { id: 'registry', label: 'Full Registry', icon: <ShieldCheck className="w-4 h-4" /> },
     { id: 'issue', label: 'Make Certificate', icon: <FilePlus2 className="w-4 h-4" /> },
+    { id: 'integrity', label: 'Integrity & Backup', icon: <ShieldAlert className="w-4 h-4" /> },
     { id: 'audit', label: 'Audit Logs', icon: <ClipboardList className="w-4 h-4" /> },
     { id: 'backups', label: 'Backups & Restore', icon: <Database className="w-4 h-4" /> },
     { id: 'settings', label: 'Settings & Health', icon: <Settings className="w-4 h-4" /> },
@@ -305,7 +445,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
   return (
     <div className="max-w-7xl mx-auto px-4 sm:px-6 py-6">
       {/* Sub-Navigation Bar */}
-      <div className="flex flex-wrap items-center justify-between gap-4 mb-6">
+      <div className="flex flex-wrap items-center justify-between gap-4 mb-5">
         <div className="flex items-center gap-1 p-1 bg-white border border-slate-200 rounded-lg overflow-x-auto">
           {navItems.map((item) => (
             <button
@@ -327,20 +467,59 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
           ))}
         </div>
 
-        <button
-          type="button"
-          onClick={() => {
-            void loadRegistryAndStats();
-            if (activeTab === 'audit') void loadAuditLogs();
-            if (activeTab === 'backups') void loadBackups();
-            if (activeTab === 'settings') void loadSettingsAndHealth();
-          }}
-          className="inline-flex items-center gap-1.5 px-3 py-2 rounded-lg border border-slate-300 bg-white hover:bg-slate-50 text-xs font-semibold text-slate-700 cursor-pointer whitespace-nowrap"
-        >
-          <RefreshCw className="w-3.5 h-3.5" />
-          Refresh Data
-        </button>
+        <div className="flex items-center gap-3 shrink-0">
+          <span className="inline-flex items-center gap-1.5 text-xs font-medium text-slate-600">
+            {syncStatus === 'error' ? (
+              <AlertTriangle className="w-3.5 h-3.5 text-red-600" />
+            ) : syncStatus === 'syncing' ? (
+              <RefreshCw className="w-3.5 h-3.5 text-[#0B1F3A] animate-spin" />
+            ) : (
+              <CheckCircle2 className="w-3.5 h-3.5 text-[#059669]" />
+            )}
+            {syncStatus === 'error'
+              ? 'Sync Error'
+              : syncStatus === 'syncing'
+                ? 'Syncing...'
+                : lastSyncedAt
+                  ? `Synced · ${new Date(lastSyncedAt).toLocaleTimeString()}`
+                  : 'Connected'}
+          </span>
+          <button
+            type="button"
+            onClick={() => {
+              void loadRegistryAndStats();
+              if (activeTab === 'integrity') void loadIntegrityMonitor();
+              if (activeTab === 'audit') void loadAuditLogs();
+              if (activeTab === 'backups') void loadBackups();
+              if (activeTab === 'settings') void loadSettingsAndHealth();
+            }}
+            className="inline-flex items-center gap-1.5 px-3 py-2 rounded-lg border border-slate-300 bg-white hover:bg-slate-50 text-xs font-semibold text-slate-700 cursor-pointer whitespace-nowrap"
+          >
+            <RefreshCw className="w-3.5 h-3.5" />
+            Refresh Data
+          </button>
+        </div>
       </div>
+
+      {syncError && (
+        <div
+          role="alert"
+          className="mb-5 p-4 rounded-xl bg-red-50 border border-red-300 text-red-950 text-sm flex flex-col sm:flex-row sm:items-center justify-between gap-3"
+        >
+          <div className="flex items-start gap-2.5 font-semibold">
+            <AlertTriangle className="w-5 h-5 shrink-0 text-red-600 mt-0.5" />
+            <span>{syncError}</span>
+          </div>
+          <button
+            type="button"
+            onClick={() => void loadRegistryAndStats()}
+            className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg bg-white border border-red-300 hover:bg-red-100 text-xs font-semibold text-red-800 whitespace-nowrap shrink-0 cursor-pointer"
+          >
+            <RefreshCw className="w-3.5 h-3.5" />
+            Retry Database Sync
+          </button>
+        </div>
+      )}
 
       {banner && (
         <div
@@ -386,13 +565,13 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
             </div>
 
             <div className="bg-white border border-slate-200 rounded-xl p-5">
-              <p className="text-xs font-medium text-slate-500">Cancelled / Soft-Deleted</p>
+              <p className="text-xs font-medium text-slate-500">Cancelled / Archived</p>
               <p className="font-mono text-2xl font-bold text-slate-900 mt-1 tabular-nums">
                 {stats?.cancelledCertificates ?? 0}{' '}
                 <span className="text-slate-300 font-normal">/</span>{' '}
                 {stats?.softDeletedCertificates ?? 0}
               </p>
-              <p className="text-xs text-slate-500 mt-1">Numbers permanently retired</p>
+              <p className="text-xs text-slate-500 mt-1">Archived records remain restorable</p>
             </div>
 
             <div className="bg-white border border-slate-200 rounded-xl p-5">
@@ -435,28 +614,38 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                     {st === 'ALL'
                       ? 'All'
                       : st === 'SOFT_DELETED'
-                        ? 'Soft-Deleted'
+                        ? 'Archived'
                         : st.charAt(0) + st.slice(1).toLowerCase()}
                   </button>
                 ))}
               </div>
             </div>
 
-            {loadingRegistry ? (
+            {loadingRegistry && !hasLoadedRegistry ? (
               <div className="p-10 text-center text-sm text-slate-500">
-                Loading full certificate registry...
+                Synchronizing full certificate registry from Firestore...
               </div>
-            ) : certificates.length === 0 ? (
+            ) : certificates.length === 0 && syncError ? (
+              <div className="p-12 text-center">
+                <p className="font-semibold text-sm text-red-800">
+                  SYNC ERROR — EXISTING DATABASE RECORDS HAVE BEEN PRESERVED.
+                </p>
+                <p className="text-xs text-slate-600 mt-1 max-w-md mx-auto">
+                  The registry could not be refreshed from Firestore right now. No database records
+                  have been altered or removed. Click Retry Database Sync above to reconnect.
+                </p>
+              </div>
+            ) : certificates.length === 0 && hasLoadedRegistry ? (
               <div className="p-12 text-center">
                 <p className="font-semibold text-sm text-slate-900">
                   {searchQuery || statusFilter !== 'ALL'
                     ? 'No certificates match the current search or filter.'
-                    : 'Fresh Registry — 0 Certificates Issued'}
+                    : 'No Certificates Found in This Registry Yet'}
                 </p>
                 <p className="text-xs text-slate-500 mt-1">
                   {searchQuery || statusFilter !== 'ALL'
                     ? 'Try clearing the search query or switching status filter.'
-                    : 'No historical records were imported. Issue a new certificate to begin.'}
+                    : 'Issue a new certificate to begin recording permanently in Firestore.'}
                 </p>
               </div>
             ) : (
@@ -473,11 +662,24 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-slate-200">
-                    {certificates.map((cert) => (
+                    {certificates.map((cert) => {
+                      const isSr = getCertificateBrand(cert) === 'scrap_route';
+                      return (
                       <tr key={cert.id} className="hover:bg-slate-50/70">
                         <td className="py-3.5 px-5">
-                          <div className="font-mono font-semibold text-[#0B1F3A] tabular-nums">
-                            {cert.certificateNumber}
+                          <div className="flex items-center gap-2">
+                            <span className="font-mono font-semibold text-[#0B1F3A] tabular-nums">
+                              {cert.certificateNumber}
+                            </span>
+                            <span
+                              className={`text-[10px] font-bold uppercase tracking-wider px-1.5 py-0.5 rounded border ${
+                                isSr
+                                  ? 'bg-emerald-50 text-emerald-900 border-emerald-200'
+                                  : 'bg-blue-50 text-[#0B1F3A] border-blue-200'
+                              }`}
+                            >
+                              {isSr ? 'Scrap Route' : 'Parivahan'}
+                            </span>
                           </div>
                           <div className="font-mono text-xs text-slate-500 tabular-nums">
                             {cert.scrappingRegNumber}
@@ -513,10 +715,10 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                                 ? 'text-[#059669]'
                                 : cert.status === 'CANCELLED'
                                   ? 'text-amber-700'
-                                  : 'text-red-700'
+                                  : 'text-slate-600'
                             }`}
                           >
-                            {cert.status}
+                            {cert.status === 'SOFT_DELETED' ? 'ARCHIVED' : cert.status}
                           </span>
                         </td>
                         <td className="py-3.5 px-5 text-right">
@@ -536,6 +738,14 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                               className="p-1.5 rounded-md border border-slate-300 bg-white hover:bg-slate-100 text-[#0B1F3A] cursor-pointer"
                             >
                               <Download className="w-3.5 h-3.5" />
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => void handleOpenHistory(cert)}
+                              title="View Immutable Version History"
+                              className="p-1.5 rounded-md border border-slate-300 bg-white hover:bg-slate-100 text-slate-700 cursor-pointer"
+                            >
+                              <History className="w-3.5 h-3.5" />
                             </button>
                             <button
                               type="button"
@@ -568,10 +778,10 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                                   setActionCert(cert);
                                   setActionMode('soft_delete');
                                 }}
-                                title="Protected Soft Delete"
-                                className="p-1.5 rounded-md border border-red-200 bg-red-50 hover:bg-red-100 text-red-700 cursor-pointer"
+                                title="Archive Certificate (Reversible)"
+                                className="p-1.5 rounded-md border border-amber-200 bg-amber-50 hover:bg-amber-100 text-amber-800 cursor-pointer"
                               >
-                                <Trash2 className="w-3.5 h-3.5" />
+                                <Archive className="w-3.5 h-3.5" />
                               </button>
                             ) : (
                               <>
@@ -581,7 +791,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                                     setActionCert(cert);
                                     setActionMode('restore');
                                   }}
-                                  title="Restore Soft-Deleted Record"
+                                  title="Restore Archived Certificate"
                                   className="p-1.5 rounded-md border border-emerald-300 bg-emerald-50 hover:bg-emerald-100 text-emerald-800 cursor-pointer"
                                 >
                                   <RotateCcw className="w-3.5 h-3.5" />
@@ -592,7 +802,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                                     setActionCert(cert);
                                     setActionMode('permanent_delete');
                                   }}
-                                  title="Permanent Delete (Explicit Confirmation)"
+                                  title="Owner-Authorized Permanent Delete"
                                   className="px-2 py-1 rounded-md bg-red-700 hover:bg-red-800 text-[11px] font-semibold text-white cursor-pointer"
                                 >
                                   Purge
@@ -602,7 +812,8 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                           </div>
                         </td>
                       </tr>
-                    ))}
+                      );
+                    })}
                   </tbody>
                 </table>
               </div>
@@ -620,8 +831,254 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
             void loadRegistryAndStats();
           }}
           onPreviewCertificate={onPreviewCertificate}
+          initialScrapRouteAuthorized={initialScrapRouteAuthorized}
+          scrapRoutePinConfigured={scrapRoutePinConfigured}
           pdfBranding={pdfBranding}
         />
+      )}
+
+      {/* ==================================================================== */}
+      {/* TAB 2B: DATABASE INTEGRITY & BACKUP MONITOR (READ-ONLY) */}
+      {/* ==================================================================== */}
+      {activeTab === 'integrity' && (
+        <div className="space-y-6">
+          <div className="bg-white border border-slate-200 rounded-xl p-6 flex flex-col lg:flex-row lg:items-center justify-between gap-4">
+            <div>
+              <div className="flex items-center gap-2">
+                <ShieldCheck className="w-5 h-5 text-[#059669]" />
+                <h2 className="font-display font-bold text-base text-[#0B1F3A] tracking-tight">
+                  DATABASE INTEGRITY &amp; BACKUP MONITOR
+                </h2>
+              </div>
+              <p className="text-xs text-slate-600 mt-1 max-w-2xl leading-relaxed">
+                Strictly read-only diagnostic monitor for Main Core Admin. Audits SHA-256 canonical
+                hashes, brand prefixes, reserved number pools, version histories, and backup health
+                without automatically modifying, repairing, or deleting any database record.
+              </p>
+            </div>
+            <div className="flex flex-wrap items-center gap-2.5 shrink-0">
+              <button
+                type="button"
+                onClick={() => void handleExportRegistry()}
+                disabled={exportingRegistry}
+                className="inline-flex items-center gap-2 px-4 py-2 rounded-lg border border-slate-300 bg-white hover:bg-slate-50 text-xs sm:text-sm font-semibold text-[#0B1F3A] disabled:opacity-50 cursor-pointer"
+              >
+                <Download className="w-4 h-4" />
+                {exportingRegistry ? 'Exporting JSON...' : 'Export Full Registry JSON'}
+              </button>
+              <button
+                type="button"
+                onClick={() => void loadIntegrityMonitor()}
+                disabled={loadingIntegrity}
+                className="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-[#0B1F3A] hover:bg-[#132f57] text-white text-xs sm:text-sm font-semibold disabled:opacity-50 cursor-pointer"
+              >
+                <RefreshCw className={`w-4 h-4 ${loadingIntegrity ? 'animate-spin' : ''}`} />
+                {loadingIntegrity ? 'Auditing...' : 'Run Read-Only Integrity Audit'}
+              </button>
+            </div>
+          </div>
+
+          {integrityReport ? (
+            <>
+              {/* Backup Failure Alert Banner */}
+              {integrityReport.backupHealth.recentBackupFailures > 0 && (
+                <div
+                  role="alert"
+                  className="p-4 rounded-xl bg-red-50 border border-red-300 text-red-950 text-xs sm:text-sm space-y-1"
+                >
+                  <p className="font-bold flex items-center gap-2 text-red-800">
+                    <AlertTriangle className="w-4 h-4 shrink-0" />
+                    Backup Failure Alert ({integrityReport.backupHealth.recentBackupFailures} failure
+                    event(s) logged)
+                  </p>
+                  <p className="text-red-900">
+                    Last failure:{' '}
+                    {integrityReport.backupHealth.lastBackupFailureAt
+                      ? new Date(integrityReport.backupHealth.lastBackupFailureAt).toLocaleString()
+                      : 'Recorded'}{' '}
+                    — {integrityReport.backupHealth.lastBackupFailureMessage || 'Check server logs.'}{' '}
+                    Previous verified backups were preserved untouched.
+                  </p>
+                </div>
+              )}
+
+              {/* 11 Required Metrics Grid */}
+              <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-4">
+                <div className="bg-white border border-slate-200 rounded-xl p-4">
+                  <p className="text-xs text-slate-500">Total Parivahan Certificates</p>
+                  <p className="font-mono text-2xl font-bold text-[#0B1F3A] mt-1 tabular-nums">
+                    {integrityReport.counts.parivahanCertificates}
+                  </p>
+                </div>
+                <div className="bg-white border border-slate-200 rounded-xl p-4">
+                  <p className="text-xs text-slate-500">Total Scrap Route Certificates</p>
+                  <p className="font-mono text-2xl font-bold text-[#065F46] mt-1 tabular-nums">
+                    {integrityReport.counts.scrapRouteCertificates}
+                  </p>
+                </div>
+                <div className="bg-white border border-slate-200 rounded-xl p-4">
+                  <p className="text-xs text-slate-500">Total Active Certificates</p>
+                  <p className="font-mono text-2xl font-bold text-[#059669] mt-1 tabular-nums">
+                    {integrityReport.counts.activeCertificates}
+                  </p>
+                </div>
+                <div className="bg-white border border-slate-200 rounded-xl p-4">
+                  <p className="text-xs text-slate-500">Total Archived Certificates</p>
+                  <p className="font-mono text-2xl font-bold text-slate-800 mt-1 tabular-nums">
+                    {integrityReport.counts.archivedCertificates}
+                  </p>
+                </div>
+                <div className="bg-white border border-slate-200 rounded-xl p-4">
+                  <p className="text-xs text-slate-500">Total Reserved Certificate Numbers</p>
+                  <p className="font-mono text-2xl font-bold text-[#0B1F3A] mt-1 tabular-nums">
+                    {integrityReport.counts.reservedCertNumbers}
+                  </p>
+                </div>
+                <div className="bg-white border border-slate-200 rounded-xl p-4">
+                  <p className="text-xs text-slate-500">Total Failed Issuance Attempts</p>
+                  <p className="font-mono text-2xl font-bold text-amber-700 mt-1 tabular-nums">
+                    {integrityReport.counts.failedIssuanceAttempts}
+                  </p>
+                </div>
+                <div className="bg-white border border-slate-200 rounded-xl p-4">
+                  <p className="text-xs text-slate-500">Total Modified Certificates</p>
+                  <p className="font-mono text-2xl font-bold text-[#0B1F3A] mt-1 tabular-nums">
+                    {integrityReport.counts.modifiedCertificates}
+                  </p>
+                </div>
+                <div className="bg-white border border-slate-200 rounded-xl p-4">
+                  <p className="text-xs text-slate-500">Total Integrity Mismatches</p>
+                  <p
+                    className={`font-mono text-2xl font-bold mt-1 tabular-nums ${
+                      integrityReport.counts.integrityMismatches === 0
+                        ? 'text-[#059669]'
+                        : 'text-red-700'
+                    }`}
+                  >
+                    {integrityReport.counts.integrityMismatches}
+                  </p>
+                </div>
+                <div className="bg-white border border-slate-200 rounded-xl p-4">
+                  <p className="text-xs text-slate-500">Last Successful Backup</p>
+                  <p className="font-mono text-xs font-semibold text-[#0B1F3A] mt-1.5">
+                    {integrityReport.backupHealth.lastSuccessfulBackupAt
+                      ? new Date(integrityReport.backupHealth.lastSuccessfulBackupAt).toLocaleString()
+                      : 'None recorded yet'}
+                  </p>
+                  <p className="text-[11px] text-slate-500 mt-0.5">
+                    {integrityReport.backupHealth.totalBackups} verified snapshot(s)
+                  </p>
+                </div>
+                <div className="bg-white border border-slate-200 rounded-xl p-4">
+                  <p className="text-xs text-slate-500">Last Successful Synchronization</p>
+                  <p className="font-mono text-xs font-semibold text-[#0B1F3A] mt-1.5">
+                    {lastSyncedAt ? new Date(lastSyncedAt).toLocaleString() : 'Pending'}
+                  </p>
+                  <p className="text-[11px] text-slate-500 mt-0.5">
+                    Status: {syncStatus.toUpperCase()}
+                  </p>
+                </div>
+                <div className="bg-white border border-slate-200 rounded-xl p-4 md:col-span-2">
+                  <p className="text-xs text-slate-500">Last Integrity Audit</p>
+                  <p className="font-mono text-xs font-semibold text-[#0B1F3A] mt-1.5">
+                    {new Date(integrityReport.lastIntegrityAuditAt).toLocaleString()}
+                  </p>
+                  <p className="text-[11px] mt-0.5 font-semibold text-slate-600">
+                    Overall Status:{' '}
+                    <span className={integrityReport.healthy ? 'text-[#059669]' : 'text-red-700'}>
+                      {integrityReport.healthy
+                        ? 'HEALTHY — ZERO CRITICAL DISCREPANCIES'
+                        : 'ATTENTION REQUIRED — DISCREPANCIES DETECTED'}
+                    </span>
+                  </p>
+                </div>
+              </div>
+
+              {/* Discrepancy Report Table (Read-Only) */}
+              <div className="bg-white border border-slate-200 rounded-xl overflow-hidden">
+                <div className="px-6 py-4 border-b border-slate-200 flex items-center justify-between gap-2">
+                  <div>
+                    <h3 className="font-display font-bold text-sm text-[#0B1F3A]">
+                      Read-Only Discrepancy Report
+                    </h3>
+                    <p className="text-xs text-slate-500 mt-0.5">
+                      Findings are reported for owner review only. This audit never modifies,
+                      auto-repairs, or deletes any certificate record.
+                    </p>
+                  </div>
+                  <span className="font-mono text-xs text-slate-600 tabular-nums">
+                    {integrityReport.discrepancies.length} finding(s)
+                  </span>
+                </div>
+                {integrityReport.discrepancies.length === 0 ? (
+                  <div className="p-8 text-center text-sm text-emerald-800 bg-emerald-50/40">
+                    All certificate hashes, brand prefixes, reserved numbers, version histories,
+                    and backup checks passed with zero discrepancies.
+                  </div>
+                ) : (
+                  <div className="overflow-x-auto">
+                    <table className="w-full text-left border-collapse text-xs">
+                      <thead>
+                        <tr className="border-b border-slate-200 bg-slate-50 font-semibold text-slate-600">
+                          <th className="py-3 px-5">Severity</th>
+                          <th className="py-3 px-4">Code</th>
+                          <th className="py-3 px-4">Certificate</th>
+                          <th className="py-3 px-5">Finding &amp; Details</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-slate-200">
+                        {integrityReport.discrepancies.map((d, idx) => (
+                          <tr key={`${d.code}_${d.certificateId ?? idx}`}>
+                            <td className="py-3 px-5">
+                              <span
+                                className={`font-bold px-2 py-0.5 rounded text-[11px] ${
+                                  d.severity === 'CRITICAL'
+                                    ? 'bg-red-100 text-red-800'
+                                    : 'bg-amber-100 text-amber-800'
+                                }`}
+                              >
+                                {d.severity}
+                              </span>
+                            </td>
+                            <td className="py-3 px-4 font-mono text-slate-800">{d.code}</td>
+                            <td className="py-3 px-4 font-mono text-[#0B1F3A]">
+                              {d.certificateNumber || '-'}
+                            </td>
+                            <td className="py-3 px-5 text-slate-700">
+                              <div>{d.message}</div>
+                              {d.details && (
+                                <div className="text-[11px] text-slate-500 mt-0.5">{d.details}</div>
+                              )}
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+              </div>
+
+              {/* Transparent Firebase Plan & Backup Strategy Card */}
+              <div className="bg-slate-50 border border-slate-200 rounded-xl p-5 text-xs text-slate-700 space-y-2">
+                <p className="font-semibold text-[#0B1F3A]">
+                  Firebase Plan Transparency &amp; Active Protection Strategy
+                </p>
+                <p>{integrityReport.firebasePlanNotes.activeProtectionStrategy}</p>
+                <p className="text-slate-500">
+                  Note: Google Cloud Firestore Managed Scheduled Backups and Point-in-Time Recovery
+                  (PITR) require the Firebase Blaze (pay-as-you-go) plan and are never upgraded
+                  automatically without explicit owner authorization.
+                </p>
+              </div>
+            </>
+          ) : (
+            <div className="bg-white border border-slate-200 rounded-xl p-10 text-center text-sm text-slate-500">
+              {loadingIntegrity
+                ? 'Running read-only Firestore integrity audit...'
+                : 'Click "Run Read-Only Integrity Audit" to inspect database health.'}
+            </div>
+          )}
+        </div>
       )}
 
       {/* ==================================================================== */}
@@ -820,6 +1277,90 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
             </div>
           )}
 
+          {/* Isolated Staging Restore Verification Result Card */}
+          {stagingResult && (
+            <div className="bg-white border border-slate-300 rounded-xl p-6 space-y-4">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div>
+                  <h3 className="font-display font-bold text-base text-[#0B1F3A]">
+                    Isolated Staging Restore Verification — {stagingResult.backupId}
+                  </h3>
+                  <p className="text-xs text-slate-500 mt-0.5">
+                    Restored into an isolated ephemeral staging store without modifying any
+                    production Firestore records.
+                  </p>
+                </div>
+                <span
+                  className={`px-3 py-1 rounded-full text-xs font-bold ${
+                    stagingResult.safeForProductionRecovery
+                      ? 'bg-emerald-100 text-emerald-800'
+                      : 'bg-red-100 text-red-800'
+                  }`}
+                >
+                  {stagingResult.safeForProductionRecovery
+                    ? 'SAFE FOR PRODUCTION RECOVERY'
+                    : 'BLOCKED — INTEGRITY ISSUES DETECTED'}
+                </span>
+              </div>
+
+              <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 text-xs">
+                <div className="p-3 bg-slate-50 border border-slate-200 rounded-lg">
+                  <div className="text-slate-500">Checksum</div>
+                  <div
+                    className={`font-semibold mt-1 ${
+                      stagingResult.checksumValid ? 'text-[#059669]' : 'text-red-700'
+                    }`}
+                  >
+                    {stagingResult.checksumValid ? 'SHA-256 VERIFIED' : 'MISMATCH'}
+                  </div>
+                </div>
+                <div className="p-3 bg-slate-50 border border-slate-200 rounded-lg">
+                  <div className="text-slate-500">Staging Restored</div>
+                  <div className="font-mono font-bold text-[#0B1F3A] mt-1 tabular-nums">
+                    {stagingResult.stagingRestoredCount} total ({stagingResult.stagingParivahanCount}{' '}
+                    PS / {stagingResult.stagingScrapRouteCount} SR)
+                  </div>
+                </div>
+                <div className="p-3 bg-slate-50 border border-slate-200 rounded-lg">
+                  <div className="text-slate-500">Active / Archived</div>
+                  <div className="font-mono font-bold text-slate-900 mt-1 tabular-nums">
+                    {stagingResult.stagingActiveCount} / {stagingResult.stagingArchivedCount}
+                  </div>
+                </div>
+                <div className="p-3 bg-slate-50 border border-slate-200 rounded-lg">
+                  <div className="text-slate-500">Staging Integrity</div>
+                  <div
+                    className={`font-semibold mt-1 ${
+                      stagingResult.stagingIntegrityHealthy ? 'text-[#059669]' : 'text-red-700'
+                    }`}
+                  >
+                    {stagingResult.stagingIntegrityHealthy
+                      ? '0 Mismatches'
+                      : `${stagingResult.stagingIntegrityMismatches} Mismatch(es)`}
+                  </div>
+                </div>
+              </div>
+
+              {stagingResult.warnings.length > 0 && (
+                <div className="p-3 rounded-lg bg-amber-50 border border-amber-200 text-xs text-amber-900 space-y-1">
+                  {stagingResult.warnings.map((w, idx) => (
+                    <p key={idx}>{w}</p>
+                  ))}
+                </div>
+              )}
+
+              <div className="flex justify-end">
+                <button
+                  type="button"
+                  onClick={() => setStagingResult(null)}
+                  className="px-3 py-1.5 rounded-lg border border-slate-300 text-xs font-semibold text-slate-700 cursor-pointer"
+                >
+                  Close Staging Report
+                </button>
+              </div>
+            </div>
+          )}
+
           {/* Snapshots Table */}
           <div className="bg-white border border-slate-200 rounded-xl overflow-hidden">
             <div className="overflow-x-auto">
@@ -852,7 +1393,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                         {(b.sizeBytes / 1024).toFixed(1)} KB
                       </td>
                       <td className="py-3 px-5 text-right">
-                        <div className="inline-flex items-center gap-2">
+                        <div className="inline-flex items-center gap-2 flex-wrap justify-end">
                           <button
                             type="button"
                             onClick={() => void api.downloadBackupJson(b.id)}
@@ -861,6 +1402,15 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                           >
                             <Download className="w-3 h-3" />
                             JSON
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => void handleStagingVerify(b.id)}
+                            disabled={backupBusy}
+                            className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-md border border-emerald-300 bg-emerald-50 hover:bg-emerald-100 font-semibold text-emerald-900 cursor-pointer"
+                          >
+                            <FlaskConical className="w-3 h-3" />
+                            Verify in Staging
                           </button>
                           <button
                             type="button"
@@ -1262,7 +1812,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
         </div>
       )}
 
-      {/* Protected Edit / Cancel / Delete / Restore Modal */}
+      {/* Protected Edit / Cancel / Archive / Permanent Delete / Restore Modal */}
       <ProtectedActionModal
         key={`${actionCert?.id ?? 'none'}_${actionMode ?? 'none'}`}
         certificate={actionCert}
@@ -1276,6 +1826,176 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
           await Promise.all([loadRegistryAndStats(), loadAuditLogs()]);
         }}
       />
+
+      {/* Immutable Certificate Version History Modal */}
+      {(historyPayload || historyLoading) && (
+        <div
+          className="fixed inset-0 z-50 bg-slate-900/60 flex items-center justify-center p-4 overflow-y-auto"
+          role="dialog"
+          aria-modal="true"
+        >
+          <div className="bg-white rounded-xl border border-slate-200 w-full max-w-3xl max-h-[90vh] overflow-y-auto shadow-2xl">
+            <div className="px-6 py-4 bg-[#0B1F3A] text-white flex items-center justify-between sticky top-0 z-10">
+              <div className="flex items-center gap-2.5">
+                <History className="w-5 h-5 text-emerald-400" />
+                <div>
+                  <h3 className="font-display font-bold text-base">
+                    Immutable Certificate Version History
+                  </h3>
+                  {historyPayload && (
+                    <p className="text-xs font-mono text-slate-300">
+                      {historyPayload.certificate.certificateNumber} · Current v
+                      {historyPayload.certificate.version} · Status:{' '}
+                      {historyPayload.certificate.status === 'SOFT_DELETED'
+                        ? 'ARCHIVED'
+                        : historyPayload.certificate.status}
+                    </p>
+                  )}
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => {
+                  setHistoryPayload(null);
+                  setHistoryError(null);
+                }}
+                className="p-1.5 rounded-lg text-slate-300 hover:bg-white/10 cursor-pointer"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <div className="p-6 space-y-5 text-xs">
+              {historyLoading ? (
+                <div className="py-10 text-center text-slate-500">
+                  Loading immutable version records from Firestore...
+                </div>
+              ) : historyError ? (
+                <div className="p-4 rounded-lg bg-red-50 border border-red-200 text-red-800">
+                  {historyError}
+                </div>
+              ) : historyPayload ? (
+                <>
+                  {/* Immutable Version 1 Original Issuance Card */}
+                  <div className="rounded-xl border border-emerald-200 bg-emerald-50/50 p-4 space-y-2.5">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <span className="font-bold text-[#065F46] uppercase tracking-wider text-[11px]">
+                        Immutable Original Record (Version 1)
+                      </span>
+                      <span className="font-mono text-slate-600">
+                        Issued {new Date(historyPayload.originalRecord.issuedAt).toLocaleString()} by{' '}
+                        {historyPayload.originalRecord.issuedBy}
+                      </span>
+                    </div>
+                    <div className="grid grid-cols-1 sm:grid-cols-3 gap-2 text-slate-800">
+                      <div>
+                        <span className="text-slate-500">Owner:</span>{' '}
+                        <span className="font-semibold">
+                          {historyPayload.originalRecord.data.ownerName}
+                        </span>
+                      </div>
+                      <div>
+                        <span className="text-slate-500">Vehicle RC:</span>{' '}
+                        <span className="font-mono font-semibold">
+                          {historyPayload.originalRecord.data.vehicleRegNumber}
+                        </span>
+                      </div>
+                      <div>
+                        <span className="text-slate-500">Make/Model:</span>{' '}
+                        <span>
+                          {historyPayload.originalRecord.data.make}{' '}
+                          {historyPayload.originalRecord.data.model} (
+                          {historyPayload.originalRecord.data.manufactureYear})
+                        </span>
+                      </div>
+                    </div>
+                    <div className="font-mono text-[11px] text-slate-600 break-all">
+                      Original SHA-256: {historyPayload.originalRecord.canonicalHash}
+                    </div>
+                  </div>
+
+                  {/* Embedded Version Diffs */}
+                  <div className="space-y-2.5">
+                    <h4 className="font-display font-bold text-sm text-[#0B1F3A]">
+                      Modification Snapshots ({historyPayload.versionHistory.length})
+                    </h4>
+                    {historyPayload.versionHistory.length === 0 ? (
+                      <p className="text-slate-500 p-3 rounded-lg bg-slate-50 border border-slate-200">
+                        No modifications have been made since original issuance (Version 1 remains
+                        current).
+                      </p>
+                    ) : (
+                      historyPayload.versionHistory.map((snap, idx) => (
+                        <div
+                          key={`${snap.version}_${snap.editedAt}_${idx}`}
+                          className="rounded-lg border border-slate-200 bg-white p-4 space-y-1.5"
+                        >
+                          <div className="flex flex-wrap items-center justify-between gap-2">
+                            <span className="font-mono font-bold text-[#0B1F3A]">
+                              Archived v{snap.version} → Updated
+                            </span>
+                            <span className="text-slate-500 font-mono">
+                              {new Date(snap.editedAt).toLocaleString()} · {snap.editedBy}
+                              {snap.actorRole ? ` (${snap.actorRole})` : ''}
+                            </span>
+                          </div>
+                          <p className="text-slate-700">
+                            <span className="font-semibold">Reason:</span> {snap.reason}
+                          </p>
+                          {snap.changedFields && snap.changedFields.length > 0 && (
+                            <p className="text-slate-700">
+                              <span className="font-semibold">Changed Fields:</span>{' '}
+                              <span className="font-mono text-[#0B1F3A]">
+                                {snap.changedFields.join(', ')}
+                              </span>
+                            </p>
+                          )}
+                          <div className="font-mono text-[11px] text-slate-500 break-all">
+                            Prev Hash: {snap.previousCanonicalHash}
+                            {snap.newCanonicalHash ? ` → New Hash: ${snap.newCanonicalHash}` : ''}
+                          </div>
+                        </div>
+                      ))
+                    )}
+                  </div>
+
+                  {/* Append-Only Version Collection Events */}
+                  {historyPayload.appendOnlyVersions.length > 0 && (
+                    <div className="space-y-2">
+                      <h4 className="font-display font-bold text-sm text-[#0B1F3A]">
+                        Append-Only Lifecycle Ledger ({historyPayload.appendOnlyVersions.length})
+                      </h4>
+                      <div className="divide-y divide-slate-200 rounded-lg border border-slate-200 overflow-hidden">
+                        {historyPayload.appendOnlyVersions.map((ev) => (
+                          <div
+                            key={ev.id}
+                            className="p-3 bg-slate-50/70 flex flex-col sm:flex-row sm:items-center justify-between gap-2"
+                          >
+                            <div>
+                              <span className="font-mono font-bold text-[#0B1F3A] mr-2">
+                                v{ev.version} · {ev.event}
+                              </span>
+                              <span className="text-slate-600">
+                                by {ev.actor} ({ev.actorRole})
+                              </span>
+                              {ev.reason && (
+                                <div className="text-slate-500 mt-0.5">Reason: {ev.reason}</div>
+                              )}
+                            </div>
+                            <span className="font-mono text-[11px] text-slate-500 whitespace-nowrap">
+                              {new Date(ev.recordedAt).toLocaleString()}
+                            </span>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                </>
+              ) : null}
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 };

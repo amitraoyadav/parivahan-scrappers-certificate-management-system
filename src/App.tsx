@@ -10,7 +10,7 @@ import {
   X,
 } from 'lucide-react';
 import type { AuthStatusResponse, CertificateRecord, SessionInfo } from './shared/types';
-import { api, ApiError, setMemoryToken } from './lib/api';
+import { api, ApiError, setMemoryScrapRouteToken, setMemoryToken } from './lib/api';
 import { AdminDashboard } from './components/AdminDashboard';
 import { CertificatePreviewModal } from './components/CertificatePreviewModal';
 import { CreateCertificateForm } from './components/CreateCertificateForm';
@@ -43,6 +43,10 @@ export default function App() {
   // Maker workspace state
   const [recentCertificates, setRecentCertificates] = useState<CertificateRecord[]>([]);
   const [loadingRecent, setLoadingRecent] = useState(false);
+  const [hasLoadedRecent, setHasLoadedRecent] = useState(false);
+  const [makerSyncStatus, setMakerSyncStatus] = useState<'idle' | 'syncing' | 'synced' | 'error'>('idle');
+  const [makerLastSyncedAt, setMakerLastSyncedAt] = useState<string | null>(null);
+  const [makerSyncError, setMakerSyncError] = useState<string | null>(null);
   const [makerNotice, setMakerNotice] = useState<string | null>(null);
   const [sessionExpiredNotice, setSessionExpiredNotice] = useState<string | null>(null);
 
@@ -68,15 +72,27 @@ export default function App() {
     }
   }, []);
 
-  const loadRecentForMaker = useCallback(async () => {
-    setLoadingRecent(true);
+  const loadRecentForMaker = useCallback(async (opts?: { silent?: boolean }) => {
+    if (!opts?.silent) {
+      setLoadingRecent(true);
+    }
+    setMakerSyncStatus('syncing');
     try {
       const res = await api.getRecentCertificates();
       setRecentCertificates(res.certificates);
-    } catch {
-      setRecentCertificates([]);
+      setHasLoadedRecent(true);
+      setMakerSyncStatus('synced');
+      setMakerLastSyncedAt(new Date().toISOString());
+      setMakerSyncError(null);
+    } catch (err) {
+      // NEVER wipe existing cached records to zero on transient network/DB errors
+      setMakerSyncStatus('error');
+      const detail = err instanceof ApiError ? ` (${err.message})` : '';
+      setMakerSyncError(`SYNC ERROR — EXISTING DATABASE RECORDS HAVE BEEN PRESERVED.${detail}`);
     } finally {
-      setLoadingRecent(false);
+      if (!opts?.silent) {
+        setLoadingRecent(false);
+      }
     }
   }, []);
 
@@ -88,9 +104,24 @@ export default function App() {
   }, [loadAuthStatus]);
 
   useEffect(() => {
-    if (session?.role === 'maker') {
-      void loadRecentForMaker();
-    }
+    if (session?.role !== 'maker') return;
+    void loadRecentForMaker();
+
+    const interval = window.setInterval(() => {
+      if (document.visibilityState === 'visible') {
+        void loadRecentForMaker({ silent: true });
+      }
+    }, 30_000);
+
+    const onFocus = () => {
+      void loadRecentForMaker({ silent: true });
+    };
+    window.addEventListener('focus', onFocus);
+
+    return () => {
+      window.clearInterval(interval);
+      window.removeEventListener('focus', onFocus);
+    };
   }, [session, loadRecentForMaker]);
 
   const navigateToVerify = (certNumber = '', token = '') => {
@@ -109,8 +140,13 @@ export default function App() {
 
   const handleSessionExpired = useCallback(() => {
     setMemoryToken(null);
+    setMemoryScrapRouteToken(null);
     setSession(null);
     setRecentCertificates([]);
+    setHasLoadedRecent(false);
+    setMakerSyncStatus('idle');
+    setMakerLastSyncedAt(null);
+    setMakerSyncError(null);
     setSessionExpiredNotice('Your session expired or was invalidated. Please sign in again.');
     void loadAuthStatus();
   }, [loadAuthStatus]);
@@ -119,6 +155,10 @@ export default function App() {
     await api.logout();
     setSession(null);
     setRecentCertificates([]);
+    setHasLoadedRecent(false);
+    setMakerSyncStatus('idle');
+    setMakerLastSyncedAt(null);
+    setMakerSyncError(null);
     setSessionExpiredNotice(null);
     await loadAuthStatus();
   };
@@ -132,7 +172,7 @@ export default function App() {
       setEditingCert(null);
     }
     setMakerNotice(
-      `Certificate ${cert.certificateNumber} has been deleted from active records. Its certificate number remains permanently reserved.`
+      `Certificate ${cert.certificateNumber} has been archived from active records. Its full record remains preserved in Firestore for Main Core Admin restoration and its certificate number remains permanently reserved.`
     );
     await loadRecentForMaker();
   };
@@ -298,6 +338,8 @@ export default function App() {
               }}
               onPreviewCertificate={(cert) => setPreviewCert(cert)}
               onSessionExpired={handleSessionExpired}
+              initialScrapRouteAuthorized={authStatus.scrapRouteAuthorized}
+              scrapRoutePinConfigured={authStatus.scrapRoutePinConfigured}
               pdfBranding={{
                 customDomain: authStatus.publicDomain,
                 authorizedSignatory: authStatus.authorizedSignatory,
@@ -308,6 +350,11 @@ export default function App() {
             <RecentCertificatesPanel
               certificates={recentCertificates}
               loading={loadingRecent}
+              hasLoadedOnce={hasLoadedRecent}
+              syncStatus={makerSyncStatus}
+              lastSyncedAt={makerLastSyncedAt}
+              syncError={makerSyncError}
+              onRetrySync={() => void loadRecentForMaker()}
               onPreview={(cert) => setPreviewCert(cert)}
               onEdit={(cert) => setEditingCert(cert)}
               onDelete={handleMakerDelete}
@@ -325,6 +372,8 @@ export default function App() {
             onSessionUpdated={(next) => setSession(next)}
             onPreviewCertificate={(cert) => setPreviewCert(cert)}
             onOpenPublicVerify={(cert) => navigateToVerify(cert.certificateNumber, cert.qrToken)}
+            initialScrapRouteAuthorized={authStatus.scrapRouteAuthorized}
+            scrapRoutePinConfigured={authStatus.scrapRoutePinConfigured}
             pdfBranding={{
               customDomain: authStatus.publicDomain,
               authorizedSignatory: authStatus.authorizedSignatory,

@@ -1,20 +1,31 @@
 import React, { useState } from 'react';
 import {
   AlertTriangle,
+  Archive,
+  CheckCircle2,
   Download,
   ExternalLink,
   Eye,
   FileText,
   Pencil,
-  Trash2,
+  RefreshCw,
   X,
 } from 'lucide-react';
 import type { CertificateRecord } from '../shared/types';
-import { downloadCertificatePdf, type PdfBrandingOptions } from '../lib/pdfGenerator';
+import {
+  downloadCertificatePdf,
+  getCertificateBrand,
+  type PdfBrandingOptions,
+} from '../lib/pdfGenerator';
 
 interface RecentCertificatesPanelProps {
   certificates: CertificateRecord[];
   loading: boolean;
+  hasLoadedOnce?: boolean;
+  syncStatus?: 'idle' | 'syncing' | 'synced' | 'error';
+  lastSyncedAt?: string | null;
+  syncError?: string | null;
+  onRetrySync?: () => void;
   onPreview: (cert: CertificateRecord) => void;
   onEdit: (cert: CertificateRecord) => void;
   onDelete: (cert: CertificateRecord) => Promise<void>;
@@ -25,6 +36,11 @@ interface RecentCertificatesPanelProps {
 export const RecentCertificatesPanel: React.FC<RecentCertificatesPanelProps> = ({
   certificates,
   loading,
+  hasLoadedOnce = true,
+  syncStatus = 'idle',
+  lastSyncedAt = null,
+  syncError = null,
+  onRetrySync,
   onPreview,
   onEdit,
   onDelete,
@@ -43,7 +59,7 @@ export const RecentCertificatesPanel: React.FC<RecentCertificatesPanelProps> = (
       await onDelete(confirmDeleteCert);
       setConfirmDeleteCert(null);
     } catch (err) {
-      setDeleteError(err instanceof Error ? err.message : 'Unable to delete certificate.');
+      setDeleteError(err instanceof Error ? err.message : 'Unable to archive certificate.');
     } finally {
       setDeleting(false);
     }
@@ -59,25 +75,76 @@ export const RecentCertificatesPanel: React.FC<RecentCertificatesPanelProps> = (
             </h2>
             <p className="text-xs text-slate-500 mt-0.5">
               Certificate Maker visibility is restricted to the 5 most recently issued records. You
-              can preview, download, edit, or delete recent certificates directly.
+              can preview, download, edit, or archive recent certificates. Permanent deletion is
+              restricted to Main Core Admin.
             </p>
           </div>
-          <span className="text-xs font-mono text-slate-500 tabular-nums">
-            Showing {certificates.length} / 5 max
-          </span>
+          <div className="flex items-center gap-3 shrink-0">
+            <span className="inline-flex items-center gap-1.5 text-xs font-medium text-slate-600">
+              {syncStatus === 'error' ? (
+                <AlertTriangle className="w-3.5 h-3.5 text-red-600" />
+              ) : syncStatus === 'syncing' ? (
+                <RefreshCw className="w-3.5 h-3.5 text-[#0B1F3A] animate-spin" />
+              ) : (
+                <CheckCircle2 className="w-3.5 h-3.5 text-[#059669]" />
+              )}
+              {syncStatus === 'error'
+                ? 'Sync Error'
+                : syncStatus === 'syncing'
+                  ? 'Syncing...'
+                  : lastSyncedAt
+                    ? `Synced · ${new Date(lastSyncedAt).toLocaleTimeString()}`
+                    : 'Database Connected'}
+            </span>
+            <span className="text-xs font-mono text-slate-500 tabular-nums">
+              Showing {certificates.length} / 5 max
+            </span>
+          </div>
         </div>
 
-        {loading ? (
-          <div className="p-8 text-center text-sm text-slate-500">Loading recent certificates...</div>
-        ) : certificates.length === 0 ? (
+        {syncError && (
+          <div
+            role="alert"
+            className="px-6 py-3.5 bg-red-50 border-b border-red-200 flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs text-red-900"
+          >
+            <div className="flex items-start gap-2 font-semibold">
+              <AlertTriangle className="w-4 h-4 shrink-0 text-red-600 mt-0.5" />
+              <span>{syncError}</span>
+            </div>
+            {onRetrySync && (
+              <button
+                type="button"
+                onClick={onRetrySync}
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md bg-white border border-red-300 hover:bg-red-100 text-red-800 font-semibold whitespace-nowrap shrink-0 cursor-pointer"
+              >
+                <RefreshCw className="w-3.5 h-3.5" />
+                Retry Sync
+              </button>
+            )}
+          </div>
+        )}
+
+        {loading && !hasLoadedOnce ? (
+          <div className="p-8 text-center text-sm text-slate-500">Synchronizing recent certificates from Firestore...</div>
+        ) : certificates.length === 0 && syncError ? (
+          <div className="p-10 text-center">
+            <p className="font-semibold text-sm text-red-800">
+              SYNC ERROR — EXISTING DATABASE RECORDS HAVE BEEN PRESERVED.
+            </p>
+            <p className="text-xs text-slate-600 mt-1 max-w-md mx-auto">
+              Unable to reach the database right now. Your existing certificates have not been
+              modified or deleted. Click Retry Sync to reconnect.
+            </p>
+          </div>
+        ) : certificates.length === 0 && hasLoadedOnce ? (
           <div className="p-10 text-center">
             <div className="w-10 h-10 rounded-lg bg-slate-100 text-slate-500 mx-auto flex items-center justify-center mb-3">
               <FileText className="w-5 h-5" />
             </div>
-            <p className="font-medium text-sm text-slate-900">No Certificates Issued Yet</p>
+            <p className="font-medium text-sm text-slate-900">No Active Certificates Yet</p>
             <p className="text-xs text-slate-500 mt-1 max-w-md mx-auto">
-              This fresh registry starts at zero records. Complete the form above to issue your first
-              vehicle scrapping certificate.
+              Complete the form above to issue a vehicle scrapping certificate. Every issued record
+              is permanently persisted in Firestore.
             </p>
           </div>
         ) : (
@@ -94,11 +161,24 @@ export const RecentCertificatesPanel: React.FC<RecentCertificatesPanelProps> = (
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-200">
-                {certificates.map((cert) => (
+                {certificates.map((cert) => {
+                  const isSr = getCertificateBrand(cert) === 'scrap_route';
+                  return (
                   <tr key={cert.id} className="hover:bg-slate-50/70 transition-colors">
                     <td className="py-3.5 px-6">
-                      <div className="font-mono font-semibold text-[#0B1F3A] tabular-nums">
-                        {cert.certificateNumber}
+                      <div className="flex items-center gap-2">
+                        <span className="font-mono font-semibold text-[#0B1F3A] tabular-nums">
+                          {cert.certificateNumber}
+                        </span>
+                        <span
+                          className={`text-[10px] font-bold uppercase tracking-wider px-1.5 py-0.5 rounded border ${
+                            isSr
+                              ? 'bg-emerald-50 text-emerald-900 border-emerald-200'
+                              : 'bg-blue-50 text-[#0B1F3A] border-blue-200'
+                          }`}
+                        >
+                          {isSr ? 'Scrap Route' : 'Parivahan'}
+                        </span>
                       </div>
                       <div className="font-mono text-xs text-slate-500 tabular-nums">
                         {cert.scrappingRegNumber}
@@ -170,10 +250,10 @@ export const RecentCertificatesPanel: React.FC<RecentCertificatesPanelProps> = (
                               setDeleteError(null);
                               setConfirmDeleteCert(cert);
                             }}
-                            className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-md border border-red-200 bg-red-50 hover:bg-red-100 text-xs font-medium text-red-700 cursor-pointer whitespace-nowrap"
+                            className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-md border border-amber-200 bg-amber-50 hover:bg-amber-100 text-xs font-medium text-amber-800 cursor-pointer whitespace-nowrap"
                           >
-                            <Trash2 className="w-3.5 h-3.5" />
-                            Delete
+                            <Archive className="w-3.5 h-3.5" />
+                            Archive
                           </button>
                         )}
                         <button
@@ -187,14 +267,15 @@ export const RecentCertificatesPanel: React.FC<RecentCertificatesPanelProps> = (
                       </div>
                     </td>
                   </tr>
-                ))}
+                  );
+                })}
               </tbody>
             </table>
           </div>
         )}
       </section>
 
-      {/* Clean Delete Confirmation Modal (No Password Re-entry Required for Authenticated Maker) */}
+      {/* Reversible Archive Confirmation Modal (Maker cannot permanently delete) */}
       {confirmDeleteCert && (
         <div
           className="fixed inset-0 z-50 bg-slate-900/60 flex items-center justify-center p-4"
@@ -203,18 +284,18 @@ export const RecentCertificatesPanel: React.FC<RecentCertificatesPanelProps> = (
           aria-labelledby="maker-delete-title"
         >
           <div className="bg-white rounded-xl border border-slate-200 w-full max-w-md shadow-2xl overflow-hidden">
-            <div className="px-5 py-4 bg-red-700 text-white flex items-center justify-between">
+            <div className="px-5 py-4 bg-amber-700 text-white flex items-center justify-between">
               <div className="flex items-center gap-2">
-                <AlertTriangle className="w-5 h-5 text-red-100" />
+                <Archive className="w-5 h-5 text-amber-100" />
                 <h3 id="maker-delete-title" className="font-display font-bold text-base">
-                  Delete Certificate?
+                  Archive Certificate?
                 </h3>
               </div>
               <button
                 type="button"
                 disabled={deleting}
                 onClick={() => setConfirmDeleteCert(null)}
-                className="p-1 rounded-md text-red-100 hover:bg-white/15 cursor-pointer disabled:opacity-50"
+                className="p-1 rounded-md text-amber-100 hover:bg-white/15 cursor-pointer disabled:opacity-50"
               >
                 <X className="w-4 h-4" />
               </button>
@@ -222,9 +303,10 @@ export const RecentCertificatesPanel: React.FC<RecentCertificatesPanelProps> = (
 
             <div className="p-5 space-y-4">
               <p className="text-sm text-slate-700 leading-relaxed">
-                Are you sure you want to delete this certificate from active records? It will no
-                longer appear as verified on public QR checks, while its certificate number remains
-                permanently reserved and logged in the audit trail.
+                Archiving removes this certificate from active Maker views and public QR
+                verification without deleting any database data. The complete record and version
+                history remain preserved in Firestore, its certificate number remains permanently
+                reserved, and Main Core Admin can restore it at any time.
               </p>
 
               <div className="rounded-lg bg-slate-50 border border-slate-200 px-3.5 py-3 text-xs space-y-1">
@@ -265,10 +347,10 @@ export const RecentCertificatesPanel: React.FC<RecentCertificatesPanelProps> = (
                   type="button"
                   disabled={deleting}
                   onClick={() => void handleConfirmDelete()}
-                  className="inline-flex items-center gap-1.5 px-4 py-2 rounded-lg bg-red-600 hover:bg-red-700 text-white text-sm font-semibold cursor-pointer disabled:opacity-50"
+                  className="inline-flex items-center gap-1.5 px-4 py-2 rounded-lg bg-amber-700 hover:bg-amber-800 text-white text-sm font-semibold cursor-pointer disabled:opacity-50"
                 >
-                  <Trash2 className="w-4 h-4" />
-                  {deleting ? 'Deleting...' : 'Delete Certificate'}
+                  <Archive className="w-4 h-4" />
+                  {deleting ? 'Archiving...' : 'Archive Certificate'}
                 </button>
               </div>
             </div>

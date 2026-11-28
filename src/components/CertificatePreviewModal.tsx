@@ -4,14 +4,16 @@ import type { CertificateRecord } from '../shared/types';
 import { formatChassisOrEngine } from '../shared/vehicleData';
 import {
   COMPANY_ADDRESS_LINE,
+  COMPANY_BOTTOM_SUBTITLE,
   COMPANY_HEADER_NAME,
   COMPANY_PHONE_LINE,
-  COMPANY_SUBTITLE,
   COMPANY_WEBSITE_LINE,
+  SCRAP_ROUTE_HEADER_NAME,
   buildVerificationUrl,
   downloadCertificatePdf,
   formatDisplayDate,
   generateQrDataUrl,
+  getCertificateBrand,
   type PdfBrandingOptions,
 } from '../lib/pdfGenerator';
 
@@ -59,11 +61,26 @@ export const CertificatePreviewModal: React.FC<CertificatePreviewModalProps> = (
     }
   };
 
+  const brand = getCertificateBrand(certificate);
+  const isScrapRoute = brand === 'scrap_route';
+  const brandHeaderName = isScrapRoute ? SCRAP_ROUTE_HEADER_NAME : COMPANY_HEADER_NAME;
+  const brandProseName = isScrapRoute ? 'Scrap Route' : 'Parivahan Scrappers';
+
+  const borderTone = isScrapRoute ? 'border-[#142230]' : 'border-[#0D2847]';
+  const primaryTextTone = isScrapRoute ? 'text-[#142230]' : 'text-[#0D2847]';
+  const sectionBgTone = isScrapRoute
+    ? 'bg-[#E3F1EA] border-[#B3D4C6] text-[#065F46]'
+    : 'bg-[#DCE8F5] border-[#B4CBE5] text-[#143E6D]';
+  const tableBorderTone = isScrapRoute ? 'border-[#B3D4C6]' : 'border-[#B4CBE5]';
+  const termBadgeBg = isScrapRoute ? 'bg-[#142230]' : 'bg-[#0D2847]';
+
   const displayChassis = formatChassisOrEngine(certificate.chassisNumber, unhideChassisEngine);
   const displayEngine = formatChassisOrEngine(certificate.engineNumber, unhideChassisEngine);
-  const idProofDisplay = certificate.idProofNumber
-    ? `${certificate.idProofType ? `${certificate.idProofType}: ` : ''}${certificate.idProofNumber}`
-    : 'Not Provided';
+  const trimmedAddress = (certificate.ownerAddress ?? '').trim();
+  const trimmedIdNumber = (certificate.idProofNumber ?? '').trim();
+  const idProofDisplay = trimmedIdNumber
+    ? `${certificate.idProofType ? `${certificate.idProofType}: ` : ''}${trimmedIdNumber}`
+    : '';
 
   return (
     <div
@@ -75,9 +92,20 @@ export const CertificatePreviewModal: React.FC<CertificatePreviewModalProps> = (
         {/* Modal Header */}
         <div className="px-6 py-4 border-b border-slate-200 flex flex-wrap items-center justify-between gap-4 bg-slate-50">
           <div>
-            <h3 className="font-display font-bold text-base text-[#0D2847]">
-              Certificate Preview — {certificate.certificateNumber}
-            </h3>
+            <div className="flex items-center gap-2">
+              <h3 className="font-display font-bold text-base text-[#0D2847]">
+                Certificate Preview — {certificate.certificateNumber}
+              </h3>
+              <span
+                className={`inline-flex items-center px-2 py-0.5 rounded text-[10px] font-bold uppercase tracking-wider ${
+                  isScrapRoute
+                    ? 'bg-emerald-100 text-emerald-900 border border-emerald-200'
+                    : 'bg-blue-100 text-[#0D2847] border border-blue-200'
+                }`}
+              >
+                {brandHeaderName}
+              </span>
+            </div>
             <p className="text-xs text-slate-500 font-mono">
               {certificate.scrappingRegNumber} · Version {certificate.version} · {certificate.status}
             </p>
@@ -140,9 +168,9 @@ export const CertificatePreviewModal: React.FC<CertificatePreviewModalProps> = (
         {/* Exact Official A4 Certificate Visual Preview */}
         <div className="p-4 sm:p-6 overflow-y-auto bg-slate-200/70">
           <div className="bg-white mx-auto max-w-[780px] p-3 shadow-md">
-            {/* Double-Line Navy Outer Border */}
-            <div className="border-[2.5px] border-[#0D2847] p-[4px]">
-              <div className="border border-[#0D2847] px-5 sm:px-7 py-5 relative overflow-hidden bg-white">
+            {/* Double-Line Outer Border */}
+            <div className={`border-[2.5px] ${borderTone} p-[4px]`}>
+              <div className={`border ${borderTone} px-5 sm:px-7 py-5 relative overflow-hidden bg-white`}>
                 {/* Subtle Circular Watermark */}
                 <svg
                   viewBox="0 0 400 400"
@@ -167,7 +195,7 @@ export const CertificatePreviewModal: React.FC<CertificatePreviewModalProps> = (
                   <circle cx="200" cy="200" r="128" fill="none" stroke="#94A3B8" strokeWidth="1" />
                   <text fill="#94A3B8" fontSize="22" fontWeight="700" fontFamily="Georgia, serif" letterSpacing="4">
                     <textPath href="#wmTopArc" startOffset="50%" textAnchor="middle">
-                      PARIVAHAN SCRAPPERS
+                      {brandHeaderName}
                     </textPath>
                   </text>
                   <text fill="#94A3B8" fontSize="14" fontWeight="700" fontFamily="Georgia, serif" letterSpacing="2">
@@ -188,31 +216,30 @@ export const CertificatePreviewModal: React.FC<CertificatePreviewModalProps> = (
 
                 <div className="relative z-10">
                   {/* Top Header */}
-                  <div className="flex flex-col sm:flex-row sm:items-stretch justify-between gap-4 pb-3 border-b-2 border-[#0D2847]">
+                  <div className={`flex flex-col sm:flex-row sm:items-stretch justify-between gap-4 pb-3 border-b-2 ${borderTone}`}>
                     <div>
-                      <h4 className="font-serif font-bold text-2xl sm:text-[28px] leading-tight text-[#0D2847] tracking-tight">
-                        {COMPANY_HEADER_NAME}
+                      <h4 className={`font-serif font-bold text-2xl sm:text-[28px] leading-tight ${primaryTextTone} tracking-tight`}>
+                        {brandHeaderName}
                       </h4>
-                      <p className="font-serif font-bold text-sm text-[#1D293D] mt-0.5">
-                        {COMPANY_SUBTITLE}
-                      </p>
-                      <div className="mt-2 space-y-1 text-xs text-[#1D293D]">
+                      <div className="mt-2.5 space-y-1 text-xs text-[#1D293D]">
                         <div className="flex items-center gap-2">
-                          <span className="inline-block w-3.5 text-center text-[#0D2847]">📍</span>
+                          <span className={`inline-block w-3.5 text-center ${primaryTextTone}`}>📍</span>
                           <span>{COMPANY_ADDRESS_LINE}</span>
                         </div>
                         <div className="flex items-center gap-2">
-                          <span className="inline-block w-3.5 text-center text-[#0D2847]">📞</span>
+                          <span className={`inline-block w-3.5 text-center ${primaryTextTone}`}>📞</span>
                           <span>{COMPANY_PHONE_LINE}</span>
                         </div>
-                        <div className="flex items-center gap-2">
-                          <span className="inline-block w-3.5 text-center text-[#0D2847]">🌐</span>
-                          <span className="text-[#0D2847]">{COMPANY_WEBSITE_LINE}</span>
-                        </div>
+                        {!isScrapRoute && (
+                          <div className="flex items-center gap-2">
+                            <span className={`inline-block w-3.5 text-center ${primaryTextTone}`}>🌐</span>
+                            <span className={primaryTextTone}>{COMPANY_WEBSITE_LINE}</span>
+                          </div>
+                        )}
                       </div>
                     </div>
 
-                    <div className="sm:border-l sm:border-[#0D2847] sm:pl-5 flex items-center gap-3 shrink-0 self-center">
+                    <div className={`sm:border-l ${borderTone} sm:pl-5 flex items-center gap-3 shrink-0 self-center`}>
                       <svg viewBox="0 0 36 56" className="w-7 h-11 shrink-0" aria-hidden="true">
                         <path
                           d="M18 3 C29 14, 32 34, 18 49 C4 34, 7 14, 18 3 Z"
@@ -222,22 +249,22 @@ export const CertificatePreviewModal: React.FC<CertificatePreviewModalProps> = (
                         <line x1="18" y1="48" x2="18" y2="54" stroke="#006045" strokeWidth="2.2" />
                       </svg>
                       <div className="font-serif font-bold text-sm leading-snug">
-                        <div className="text-[#0D2847]">Responsible</div>
-                        <div className="text-[#0D2847]">Recycling</div>
+                        <div className={primaryTextTone}>Responsible</div>
+                        <div className={primaryTextTone}>Recycling</div>
                         <div className="text-[#006045]">Greener India</div>
                       </div>
                     </div>
                   </div>
 
                   {/* Metadata Row */}
-                  <div className="flex flex-wrap items-center justify-between gap-2 pt-2.5 text-xs sm:text-sm font-serif font-bold text-[#0D2847]">
+                  <div className={`flex flex-wrap items-center justify-between gap-2 pt-2.5 text-xs sm:text-sm font-serif font-bold ${primaryTextTone}`}>
                     <div>Certificate No. : {certificate.certificateNumber}</div>
                     <div>Date of Issue : {formatDisplayDate(certificate.issueDate)}</div>
                   </div>
 
                   {/* Centered Title & Sustainability Banner */}
                   <div className="text-center mt-4">
-                    <h2 className="font-serif font-bold text-xl sm:text-2xl tracking-wide text-[#0D2847]">
+                    <h2 className={`font-serif font-bold text-xl sm:text-2xl tracking-wide ${primaryTextTone}`}>
                       VEHICLE SCRAPPING CERTIFICATE
                     </h2>
                     <p className="text-[10px] tracking-[0.16em] text-[#1E3A5F] uppercase mt-1">
@@ -256,45 +283,53 @@ export const CertificatePreviewModal: React.FC<CertificatePreviewModalProps> = (
                   {/* Introductory Paragraph */}
                   <p className="font-serif text-xs sm:text-[13px] leading-relaxed text-[#1D293D] mt-3.5 text-justify">
                     This is to certify that the motor vehicle mentioned below has been received by{' '}
-                    <strong className="font-bold text-[#0D2847]">PARIVAHAN SCRAPPERS</strong> (A Unit
-                    OF Scrapping Yard Ltd.) for dismantling and environmentally sound recycling, in
-                    accordance with the provisions of the Vehicle Scrappage Policy and all applicable
-                    environmental regulations.
+                    <strong className={`font-bold ${primaryTextTone}`}>{brandHeaderName}</strong>{' '}
+                    for dismantling and environmentally sound recycling, in accordance with the
+                    provisions of the Vehicle Scrappage Policy and all applicable environmental
+                    regulations.
                   </p>
 
                   {/* Section A: Owner Details */}
                   <div className="mt-3.5">
-                    <div className="bg-[#DCE8F5] border border-[#B4CBE5] px-3 py-1 font-serif font-bold text-xs text-[#143E6D]">
+                    <div className={`${sectionBgTone} border px-3 py-1 font-serif font-bold text-xs`}>
                       A. OWNER DETAILS
                     </div>
-                    <div className="border-x border-b border-[#B4CBE5] bg-white grid grid-cols-[34%_66%] text-xs">
-                      <div className="px-3 py-1.5 font-bold text-[#1D293D] border-r border-[#B4CBE5]">
+                    <div className={`border-x border-b ${tableBorderTone} bg-white grid grid-cols-[34%_66%] text-xs`}>
+                      <div className={`px-3 py-1.5 font-bold text-[#1D293D] border-r ${tableBorderTone}`}>
                         Owner Name
                       </div>
                       <div className="px-3 py-1.5 font-bold text-[#0D2847] uppercase break-words">
                         {certificate.ownerName}
                       </div>
-                      <div className="px-3 py-1.5 font-bold text-[#1D293D] border-r border-[#B4CBE5]">
-                        Address
-                      </div>
-                      <div className="px-3 py-1.5 text-[#334155] break-words">
-                        {certificate.ownerAddress || 'Not Provided'}
-                      </div>
-                      <div className="px-3 py-1.5 font-bold text-[#1D293D] border-r border-[#B4CBE5]">
-                        ID Proof Number
-                      </div>
-                      <div className="px-3 py-1.5 text-[#334155] break-words">
-                        {idProofDisplay}
-                      </div>
+                      {trimmedAddress && (
+                        <>
+                          <div className="px-3 py-1.5 font-bold text-[#1D293D] border-r border-[#B4CBE5]">
+                            Address
+                          </div>
+                          <div className="px-3 py-1.5 text-[#334155] break-words">
+                            {trimmedAddress}
+                          </div>
+                        </>
+                      )}
+                      {idProofDisplay && (
+                        <>
+                          <div className="px-3 py-1.5 font-bold text-[#1D293D] border-r border-[#B4CBE5]">
+                            ID Proof Number
+                          </div>
+                          <div className="px-3 py-1.5 text-[#334155] break-words">
+                            {idProofDisplay}
+                          </div>
+                        </>
+                      )}
                     </div>
                   </div>
 
                   {/* Section B: Vehicle Details + QR Panel */}
                   <div className="mt-3">
-                    <div className="bg-[#DCE8F5] border border-[#B4CBE5] px-3 py-1 font-serif font-bold text-xs text-[#143E6D]">
+                    <div className={`${sectionBgTone} border px-3 py-1 font-serif font-bold text-xs`}>
                       B. VEHICLE DETAILS
                     </div>
-                    <div className="mt-1 border border-[#B4CBE5] grid grid-cols-1 sm:grid-cols-[76%_24%]">
+                    <div className={`mt-1 border ${tableBorderTone} grid grid-cols-1 sm:grid-cols-[76%_24%]`}>
                       {/* Left Vehicle Info Table */}
                       <div className="sm:border-r border-[#B4CBE5] text-xs">
                         <div className="grid grid-cols-[41%_59%] border-b border-[#B4CBE5] bg-white">
@@ -387,18 +422,18 @@ export const CertificatePreviewModal: React.FC<CertificatePreviewModalProps> = (
 
                   {/* Section C: Terms & Certifications */}
                   <div className="mt-3">
-                    <div className="bg-[#DCE8F5] border border-[#B4CBE5] px-3 py-1 font-serif font-bold text-xs text-[#143E6D]">
+                    <div className={`${sectionBgTone} border px-3 py-1 font-serif font-bold text-xs`}>
                       C. TERMS &amp; CERTIFICATIONS
                     </div>
                     <ol className="mt-2 space-y-1.5 text-[11px] font-serif text-[#334155]">
                       {[
-                        'Parivahan Scrappers undertakes to dismantle the vehicle and process all recoverable metal, plastic, and fluid components through authorized channels compliant with environmental and recycling standards.',
+                        `${brandProseName} undertakes to dismantle the vehicle and process all recoverable metal, plastic, and fluid components through authorized channels compliant with environmental and recycling standards.`,
                         'Once accepted for scrapping, the vehicle, its chassis, engine, or registered component parts shall not be restored, resold, re-registered, or returned to road use in any jurisdiction.',
                         'This certificate, with the scrapping video record, constitutes complete documentary proof of the vehicle disposal furnished to the customer.',
                         "This certificate is issued as proof of handover and processing intent; statutory de-registration remains the customer's responsibility with the transport authority.",
                       ].map((statement, idx) => (
                         <li key={idx} className="flex items-start gap-2">
-                          <span className="inline-flex items-center justify-center w-4 h-4 rounded-full bg-[#0D2847] text-white font-sans font-bold text-[9px] shrink-0 mt-0.5">
+                          <span className={`inline-flex items-center justify-center w-4 h-4 rounded-full ${termBadgeBg} text-white font-sans font-bold text-[9px] shrink-0 mt-0.5`}>
                             {idx + 1}
                           </span>
                           <span className="leading-snug">{statement}</span>
@@ -410,12 +445,14 @@ export const CertificatePreviewModal: React.FC<CertificatePreviewModalProps> = (
                   {/* Signatory, Eco Badges & Green Message Panel */}
                   <div className="mt-4 grid grid-cols-1 sm:grid-cols-[38%_36%_26%] gap-4 items-center">
                     <div>
-                      <div className="font-serif font-bold text-xs text-[#0D2847]">
-                        For PARIVAHAN SCRAPPERS
+                      <div className={`font-serif font-bold text-xs ${primaryTextTone}`}>
+                        {brandHeaderName}
                       </div>
-                      <div className="font-serif text-[10px] text-[#475569]">
-                        ({COMPANY_SUBTITLE})
-                      </div>
+                      {!isScrapRoute && (
+                        <div className="font-serif font-bold text-[10px] text-[#475569]">
+                          {COMPANY_BOTTOM_SUBTITLE}
+                        </div>
+                      )}
                       <svg viewBox="0 0 120 34" className="w-28 h-8 mt-1.5" aria-hidden="true">
                         <path
                           d="M6 26 C12 10, 20 2, 23 8 C24 14, 15 24, 17 26 C21 25, 31 11, 36 11 C40 12, 37 22, 43 24 C51 25, 62 11, 70 11 C74 12, 66 23, 70 26 C77 27, 94 18, 110 15"
@@ -426,7 +463,7 @@ export const CertificatePreviewModal: React.FC<CertificatePreviewModalProps> = (
                           strokeLinejoin="round"
                         />
                       </svg>
-                      <div className="border-t border-[#0D2847] w-44 pt-1 font-serif font-bold text-xs text-[#0D2847]">
+                      <div className={`border-t ${borderTone} w-44 pt-1 font-serif font-bold text-xs ${primaryTextTone}`}>
                         Authorised Signatory
                       </div>
                     </div>

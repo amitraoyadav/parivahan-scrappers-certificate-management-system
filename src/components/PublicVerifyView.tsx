@@ -101,6 +101,16 @@ export const PublicVerifyView: React.FC<PublicVerifyViewProps> = ({
   }, [isStrictlyVerified, canonicalVerifyUrl]);
 
   const shortHash = result?.canonicalHash ? `${result.canonicalHash.slice(0, 16)}...` : '';
+  const isScrapRouteResult = Boolean(
+    result &&
+      (result.brand === 'scrap_route' ||
+        result.certificateNumber?.toUpperCase().startsWith('SR/'))
+  );
+  const issuingBrandName =
+    result?.brandDisplayName || (isScrapRouteResult ? 'SCRAP ROUTE' : 'Parivahan Scrappers');
+  const issuingBrandPossessive = isScrapRouteResult
+    ? "Scrap Route's"
+    : "Parivahan Scrappers'";
 
   return (
     <div className="min-h-screen bg-slate-50 flex flex-col">
@@ -108,11 +118,15 @@ export const PublicVerifyView: React.FC<PublicVerifyViewProps> = ({
       <header className="bg-white border-b border-slate-200 px-4 sm:px-6 py-4">
         <div className="max-w-5xl mx-auto flex items-center justify-between gap-4 sm:gap-8">
           <div className="flex items-center gap-3 whitespace-nowrap shrink-0">
-            <div className="w-9 h-9 rounded-lg bg-[#0B1F3A] text-white flex items-center justify-center font-display font-bold text-sm">
-              PS
+            <div
+              className={`w-9 h-9 rounded-lg text-white flex items-center justify-center font-display font-bold text-sm ${
+                isScrapRouteResult ? 'bg-[#065F46]' : 'bg-[#0B1F3A]'
+              }`}
+            >
+              {isScrapRouteResult ? 'SR' : 'PS'}
             </div>
             <span className="font-display font-bold text-base sm:text-lg text-[#0B1F3A]">
-              Parivahan Scrappers
+              {isScrapRouteResult ? 'SCRAP ROUTE' : 'Parivahan Scrappers'}
             </span>
           </div>
 
@@ -143,8 +157,8 @@ export const PublicVerifyView: React.FC<PublicVerifyViewProps> = ({
                 Public Certificate Verification
               </h1>
               <p className="text-sm text-slate-600 mt-1 leading-relaxed">
-                Verify authenticity and SHA-256 cryptographic integrity of any Parivahan Scrappers
-                vehicle scrapping certificate without signing in.
+                Verify authenticity and SHA-256 cryptographic integrity of any issued vehicle
+                scrapping certificate without signing in.
               </p>
             </div>
           </div>
@@ -157,7 +171,7 @@ export const PublicVerifyView: React.FC<PublicVerifyViewProps> = ({
                 required
                 value={certInput}
                 onChange={(e) => setCertInput(e.target.value.toUpperCase())}
-                placeholder="Enter Certificate Number (e.g. PS/26/R4829103)"
+                placeholder="Enter Certificate Number (e.g. PS/26/R4829103 or SR/26/R4829103)"
                 className="w-full pl-10 pr-4 py-2.5 rounded-xl border border-slate-300 font-mono text-sm focus:outline-none focus:ring-2 focus:ring-[#059669] focus:border-[#059669]"
               />
             </div>
@@ -210,16 +224,24 @@ export const PublicVerifyView: React.FC<PublicVerifyViewProps> = ({
 
                   {/* Authoritative Subtitle (No Government/RTO claim) */}
                   <p className="mt-2.5 text-sm sm:text-base text-[#065F46] max-w-xl mx-auto leading-relaxed">
-                    Certificate successfully verified against Parivahan Scrappers&apos; authorized
+                    Certificate successfully verified against {issuingBrandPossessive} authorized
                     database.
                   </p>
 
-                  {/* Certificate Number Highlight */}
-                  <div className="mt-5 inline-flex flex-wrap items-center justify-center gap-2 px-4 py-2 rounded-xl bg-white border border-emerald-200/90 shadow-2xs text-sm">
-                    <span className="text-slate-500 font-medium">Certificate No.</span>
-                    <span className="font-mono font-bold text-[#0B1F3A] tracking-wide tabular-nums">
-                      {result.certificateNumber}
-                    </span>
+                  {/* Certificate Number & Issuing Brand Highlight */}
+                  <div className="mt-5 flex flex-wrap items-center justify-center gap-2.5">
+                    <div className="inline-flex flex-wrap items-center justify-center gap-2 px-4 py-2 rounded-xl bg-white border border-emerald-200/90 shadow-2xs text-sm">
+                      <span className="text-slate-500 font-medium">Certificate No.</span>
+                      <span className="font-mono font-bold text-[#0B1F3A] tracking-wide tabular-nums">
+                        {result.certificateNumber}
+                      </span>
+                    </div>
+                    <div className="inline-flex items-center gap-2 px-4 py-2 rounded-xl bg-white border border-emerald-200/90 shadow-2xs text-sm">
+                      <span className="text-slate-500 font-medium">Issued By</span>
+                      <span className="font-bold text-[#065F46] tracking-wide">
+                        {issuingBrandName}
+                      </span>
+                    </div>
                   </div>
 
                   {/* Clickable QR Verification Card */}
@@ -294,6 +316,10 @@ export const PublicVerifyView: React.FC<PublicVerifyViewProps> = ({
                   </h3>
                   <dl className="mt-4 grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-x-8 gap-y-5 text-sm">
                     <div>
+                      <dt className="text-xs font-medium text-slate-500">Issuing Brand</dt>
+                      <dd className="font-semibold text-[#0B1F3A] mt-0.5">{issuingBrandName}</dd>
+                    </div>
+                    <div>
                       <dt className="text-xs font-medium text-slate-500">Certificate Number</dt>
                       <dd className="font-mono font-semibold text-[#0B1F3A] mt-0.5 tabular-nums">
                         {result.certificateNumber}
@@ -308,8 +334,16 @@ export const PublicVerifyView: React.FC<PublicVerifyViewProps> = ({
                     <div>
                       <dt className="text-xs font-medium text-slate-500">Record Status</dt>
                       <dd className="font-semibold text-[#059669] mt-0.5">
-                        {result.status} · Version {result.version}
+                        {result.status} · Version {result.version ?? 1}
                       </dd>
+                      {(result.version ?? 1) > 1 && (
+                        <p className="text-[11px] text-slate-500 mt-0.5">
+                          Original Version Preserved in Audit History
+                          {typeof result.versionHistoryCount === 'number'
+                            ? ` (${result.versionHistoryCount} edit(s))`
+                            : ''}
+                        </p>
+                      )}
                     </div>
                     <div>
                       <dt className="text-xs font-medium text-slate-500">Registered Owner Name</dt>
@@ -342,12 +376,6 @@ export const PublicVerifyView: React.FC<PublicVerifyViewProps> = ({
                       </dd>
                     </div>
                     <div>
-                      <dt className="text-xs font-medium text-slate-500">Issuing Facility</dt>
-                      <dd className="font-medium text-slate-900 mt-0.5">
-                        {result.facilityName}
-                      </dd>
-                    </div>
-                    <div>
                       <dt className="text-xs font-medium text-slate-500">
                         Chassis Number (Masked)
                       </dt>
@@ -371,12 +399,28 @@ export const PublicVerifyView: React.FC<PublicVerifyViewProps> = ({
                           : 'Verified by Certificate Number'}
                       </dd>
                     </div>
+                    {result.originalIssuedAt && (
+                      <div>
+                        <dt className="text-xs font-medium text-slate-500">Original Recorded At</dt>
+                        <dd className="font-mono text-xs text-slate-700 mt-1 tabular-nums">
+                          {new Date(result.originalIssuedAt).toLocaleString()}
+                        </dd>
+                      </div>
+                    )}
+                    {(result.version ?? 1) > 1 && result.lastModifiedAt && (
+                      <div>
+                        <dt className="text-xs font-medium text-slate-500">Last Verified Update</dt>
+                        <dd className="font-mono text-xs text-slate-700 mt-1 tabular-nums">
+                          {new Date(result.lastModifiedAt).toLocaleString()}
+                        </dd>
+                      </div>
+                    )}
                   </dl>
 
                   <p className="mt-6 pt-4 border-t border-slate-100 text-xs text-slate-500 leading-relaxed">
                     Privacy Protected: Full chassis numbers, engine numbers, residential addresses,
                     and personal ID proof details are masked on public verification. Verification
-                    reflects Parivahan Scrappers&apos; internal scrapping registry only.
+                    reflects {issuingBrandPossessive} internal scrapping registry only.
                   </p>
                 </div>
               </section>

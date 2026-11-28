@@ -4,13 +4,33 @@ import type {
   AuditLogEntry,
   BackupDryRunResult,
   BackupSnapshot,
+  CertificateBrand,
   CertificateRecord,
+  CertificateVersionDocument,
   DriveSyncLog,
   SystemErrorLog,
   SystemSettings,
   UserRole,
 } from '../shared/types.js';
-import { computeSha256, generateRecordId } from './crypto.js';
+import { computeSha256, generateRecordId, resolveCertificateBrand } from './crypto.js';
+
+export interface ReservedCertNumberRecord {
+  certificateNumber: string;
+  brand?: CertificateBrand;
+  status?: 'RESERVED' | 'ISSUED' | 'CANCELLED' | 'ARCHIVED';
+  reservedAt: string;
+  issuedAt?: string;
+  certificateId: string;
+}
+
+export interface ReservedRegNumberRecord {
+  scrappingRegNumber: string;
+  brand?: CertificateBrand;
+  status?: 'RESERVED' | 'ISSUED' | 'CANCELLED' | 'ARCHIVED';
+  reservedAt: string;
+  issuedAt?: string;
+  certificateId: string;
+}
 
 export interface StoredCredentials {
   makerUsername: string;
@@ -30,6 +50,8 @@ export interface StoredSession {
   sessionVersion: number;
   issuedAt: number;
   expiresAt: number;
+  rememberMe?: boolean;
+  scrapRouteAuthorizedUntil?: number;
   revoked: boolean;
   revokedAt?: string;
 }
@@ -76,6 +98,7 @@ export interface RegistryStore {
   createCredentialsIfAbsent(creds: StoredCredentials): Promise<boolean>;
   createSession(session: StoredSession): Promise<void>;
   getSession(sessionId: string): Promise<StoredSession | null>;
+  updateSessionScrapRouteAuth(sessionId: string, authorizedUntil: number | null): Promise<void>;
   revokeSession(sessionId: string): Promise<void>;
   getSettings(): Promise<SystemSettings>;
   saveSettings(settings: SystemSettings): Promise<void>;
@@ -84,16 +107,25 @@ export interface RegistryStore {
   isCertNumberReserved(certNumber: string): Promise<boolean>;
   isScrappingRegReserved(regNumber: string): Promise<boolean>;
   getReservedCounts(): Promise<{ certCount: number; regCount: number }>;
+  getAllReservedNumbers(): Promise<{
+    certNumbers: ReservedCertNumberRecord[];
+    regNumbers: ReservedRegNumberRecord[];
+  }>;
 
   // Idempotency
   getIdempotencyRecord(key: string): Promise<IdempotencyRecord | null>;
 
-  // Atomic Certificate Creation (certificate + cert reservation + reg reservation + idempotency + audit)
+  // Atomic Certificate Creation (certificate + cert reservation + reg reservation + idempotency + initial version + audit)
   createCertificateAtomic(params: {
     certificate: CertificateRecord;
     idempotencyKey: string;
     auditLog: AuditLogEntry;
+    initialVersionDoc?: CertificateVersionDocument;
   }): Promise<CertificateRecord>;
+
+  // Append-Only Certificate Version History
+  appendCertificateVersion(versionDoc: CertificateVersionDocument): Promise<void>;
+  getCertificateVersions(certificateId: string): Promise<CertificateVersionDocument[]>;
 
   // Certificate Reads & Mutations
   getCertificateById(id: string): Promise<CertificateRecord | null>;
@@ -130,7 +162,7 @@ function encodeDocKey(value: string): string {
 // ============================================================================
 // 1. STAGING / PREVIEW IN-MEMORY STORE (Starts at 0 certificates, zero disk IO)
 // ============================================================================
-class StagingMemoryStore implements RegistryStore {
+export class StagingMemoryStore implements RegistryStore {
   readonly mode = 'staging_memory' as const;
   readonly projectId = null;
   readonly databaseId = null;
@@ -139,8 +171,9 @@ class StagingMemoryStore implements RegistryStore {
   private sessions = new Map<string, StoredSession>();
   private settings: SystemSettings = { ...DEFAULT_SETTINGS };
   private certificates = new Map<string, CertificateRecord>();
-  private reservedCertNumbers = new Map<string, { certificateNumber: string; reservedAt: string; certificateId: string }>();
-  private reservedRegNumbers = new Map<string, { scrappingRegNumber: string; reservedAt: string; certificateId: string }>();
+  private certificateVersions = new Map<string, CertificateVersionDocument>();
+  private reservedCertNumbers = new Map<string, ReservedCertNumberRecord>();
+  private reservedRegNumbers = new Map<string, ReservedRegNumberRecord>();
   private idempotencyKeys = new Map<string, IdempotencyRecord>();
   private auditLogs: AuditLogEntry[] = [];
   private backups = new Map<string, StoredBackupDocument>();
@@ -189,6 +222,21 @@ class StagingMemoryStore implements RegistryStore {
     return found ? { ...found } : null;
   }
 
+  async updateSessionScrapRouteAuth(
+    sessionId: string,
+    authorizedUntil: number | null
+  ): Promise<void> {
+    const existing = this.sessions.get(sessionId);
+    if (!existing) return;
+    const next: StoredSession = { ...existing };
+    if (authorizedUntil && authorizedUntil > 0) {
+      next.scrapRouteAuthorizedUntil = authorizedUntil;
+    } else {
+      delete next.scrapRouteAuthorizedUntil;
+    }
+    this.sessions.set(sessionId, next);
+  }
+
   async revokeSession(sessionId: string): Promise<void> {
     const existing = this.sessions.get(sessionId);
     if (existing) {
@@ -196,6 +244,7 @@ class StagingMemoryStore implements RegistryStore {
         ...existing,
         revoked: true,
         revokedAt: new Date().toISOString(),
+        scrapRouteAuthorizedUntil: undefined,
       });
     }
   }
@@ -228,6 +277,16 @@ class StagingMemoryStore implements RegistryStore {
     };
   }
 
+  async getAllReservedNumbers(): Promise<{
+    certNumbers: ReservedCertNumberRecord[];
+    regNumbers: ReservedRegNumberRecord[];
+  }> {
+    return {
+      certNumbers: Array.from(this.reservedCertNumbers.values()).map((r) => ({ ...r })),
+      regNumbers: Array.from(this.reservedRegNumbers.values()).map((r) => ({ ...r })),
+    };
+  }
+
   async getIdempotencyRecord(key: string): Promise<IdempotencyRecord | null> {
     return this.idempotencyKeys.get(key) ?? null;
   }
@@ -236,6 +295,7 @@ class StagingMemoryStore implements RegistryStore {
     certificate: CertificateRecord;
     idempotencyKey: string;
     auditLog: AuditLogEntry;
+    initialVersionDoc?: CertificateVersionDocument;
   }): Promise<CertificateRecord> {
     return this.runAtomic(() => {
       const existingIdemp = this.idempotencyKeys.get(params.idempotencyKey);
@@ -246,7 +306,13 @@ class StagingMemoryStore implements RegistryStore {
 
       const certNo = params.certificate.certificateNumber.toUpperCase();
       const regNo = params.certificate.scrappingRegNumber.toUpperCase();
+      const brand = resolveCertificateBrand(params.certificate);
 
+      if (this.certificates.has(params.certificate.id)) {
+        const err = new Error(`Certificate ID already exists: ${params.certificate.id}`);
+        (err as NodeJS.ErrnoException).code = 'NUMBER_COLLISION';
+        throw err;
+      }
       if (this.reservedCertNumbers.has(certNo)) {
         const err = new Error(`Certificate number collision: ${certNo}`);
         (err as NodeJS.ErrnoException).code = 'NUMBER_COLLISION';
@@ -262,12 +328,18 @@ class StagingMemoryStore implements RegistryStore {
       this.certificates.set(stored.id, stored);
       this.reservedCertNumbers.set(certNo, {
         certificateNumber: certNo,
+        brand,
+        status: 'ISSUED',
         reservedAt: stored.createdAt,
+        issuedAt: stored.createdAt,
         certificateId: stored.id,
       });
       this.reservedRegNumbers.set(regNo, {
         scrappingRegNumber: regNo,
+        brand,
+        status: 'ISSUED',
         reservedAt: stored.createdAt,
+        issuedAt: stored.createdAt,
         certificateId: stored.id,
       });
       this.idempotencyKeys.set(params.idempotencyKey, {
@@ -276,9 +348,65 @@ class StagingMemoryStore implements RegistryStore {
         certificateNumber: certNo,
         createdAt: stored.createdAt,
       });
+      if (params.initialVersionDoc) {
+        this.certificateVersions.set(
+          params.initialVersionDoc.id,
+          structuredClone(params.initialVersionDoc)
+        );
+      }
       this.auditLogs.unshift(structuredClone(params.auditLog));
       return structuredClone(stored);
     });
+  }
+
+  async appendCertificateVersion(versionDoc: CertificateVersionDocument): Promise<void> {
+    if (this.certificateVersions.has(versionDoc.id)) {
+      throw new Error(`Immutable certificate version already exists: ${versionDoc.id}`);
+    }
+    this.certificateVersions.set(versionDoc.id, structuredClone(versionDoc));
+  }
+
+  async getCertificateVersions(certificateId: string): Promise<CertificateVersionDocument[]> {
+    return Array.from(this.certificateVersions.values())
+      .filter((v) => v.certificateId === certificateId)
+      .sort((a, b) => b.version - a.version || b.recordedAt.localeCompare(a.recordedAt))
+      .map((v) => structuredClone(v));
+  }
+
+  /**
+   * Loads a backup payload directly into this isolated staging instance for
+   * pre-recovery verification without ever touching production data.
+   */
+  importBackupIntoStaging(payloadJson: string): { restoredCount: number } {
+    const parsed = JSON.parse(payloadJson) as {
+      certificates?: CertificateRecord[];
+      reservedCertNumbers?: ReservedCertNumberRecord[];
+      reservedRegNumbers?: ReservedRegNumberRecord[];
+      certificateVersions?: CertificateVersionDocument[];
+      settings?: SystemSettings;
+    };
+    this.certificates.clear();
+    this.reservedCertNumbers.clear();
+    this.reservedRegNumbers.clear();
+    this.certificateVersions.clear();
+
+    const certs = parsed.certificates ?? [];
+    for (const cert of certs) {
+      this.certificates.set(cert.id, structuredClone(cert));
+    }
+    for (const r of parsed.reservedCertNumbers ?? []) {
+      this.reservedCertNumbers.set(r.certificateNumber.toUpperCase(), structuredClone(r));
+    }
+    for (const r of parsed.reservedRegNumbers ?? []) {
+      this.reservedRegNumbers.set(r.scrappingRegNumber.toUpperCase(), structuredClone(r));
+    }
+    for (const v of parsed.certificateVersions ?? []) {
+      this.certificateVersions.set(v.id, structuredClone(v));
+    }
+    if (parsed.settings) {
+      this.settings = structuredClone(parsed.settings);
+    }
+    return { restoredCount: certs.length };
   }
 
   async getCertificateById(id: string): Promise<CertificateRecord | null> {
@@ -337,11 +465,12 @@ class StagingMemoryStore implements RegistryStore {
   ): Promise<BackupSnapshot> {
     const certs = await this.getAllCertificates();
     const payloadObj = {
-      schemaVersion: 1,
+      schemaVersion: 2,
       exportedAt: new Date().toISOString(),
       certificates: certs,
       reservedCertNumbers: Array.from(this.reservedCertNumbers.values()),
       reservedRegNumbers: Array.from(this.reservedRegNumbers.values()),
+      certificateVersions: Array.from(this.certificateVersions.values()),
       settings: this.settings,
     };
     const payloadJson = JSON.stringify(payloadObj);
@@ -356,12 +485,20 @@ class StagingMemoryStore implements RegistryStore {
       reservedRegCount: this.reservedRegNumbers.size,
       auditLogCount: this.auditLogs.length,
       sha256Checksum,
-      verified: true,
+      verified: false,
       sizeBytes: Buffer.byteLength(payloadJson, 'utf8'),
       storageTarget: 'Staging Memory Snapshot (Configure Firestore for Production)',
       payloadJson,
     };
     this.backups.set(doc.id, doc);
+    // Read-back verification before marking snapshot verified
+    const readBack = this.backups.get(doc.id);
+    const verified = Boolean(readBack && computeSha256(readBack.payloadJson) === sha256Checksum);
+    if (!verified) {
+      this.backups.delete(doc.id);
+      throw new Error('Backup read-back SHA-256 verification failed. Previous good backups preserved.');
+    }
+    doc.verified = true;
     const { payloadJson: _omitted, ...meta } = doc;
     return meta;
   }
@@ -916,14 +1053,31 @@ export class FirestoreRestStore implements RegistryStore {
     return this.getDoc<StoredSession>('auth_sessions', encodeDocKey(sessionId));
   }
 
+  async updateSessionScrapRouteAuth(
+    sessionId: string,
+    authorizedUntil: number | null
+  ): Promise<void> {
+    const existing = await this.getSession(sessionId);
+    if (!existing) return;
+    const next: StoredSession = { ...existing };
+    if (authorizedUntil && authorizedUntil > 0) {
+      next.scrapRouteAuthorizedUntil = authorizedUntil;
+    } else {
+      delete next.scrapRouteAuthorizedUntil;
+    }
+    await this.setDoc('auth_sessions', encodeDocKey(sessionId), next);
+  }
+
   async revokeSession(sessionId: string): Promise<void> {
     const existing = await this.getSession(sessionId);
     if (!existing) return;
-    await this.setDoc('auth_sessions', encodeDocKey(sessionId), {
+    const next: StoredSession = {
       ...existing,
       revoked: true,
       revokedAt: new Date().toISOString(),
-    });
+    };
+    delete next.scrapRouteAuthorizedUntil;
+    await this.setDoc('auth_sessions', encodeDocKey(sessionId), next);
   }
 
   async getSettings(): Promise<SystemSettings> {
@@ -957,6 +1111,17 @@ export class FirestoreRestStore implements RegistryStore {
     return { certCount, regCount };
   }
 
+  async getAllReservedNumbers(): Promise<{
+    certNumbers: ReservedCertNumberRecord[];
+    regNumbers: ReservedRegNumberRecord[];
+  }> {
+    const [certNumbers, regNumbers] = await Promise.all([
+      this.listCollection<ReservedCertNumberRecord>('reserved_certificate_numbers'),
+      this.listCollection<ReservedRegNumberRecord>('reserved_scrapping_numbers'),
+    ]);
+    return { certNumbers, regNumbers };
+  }
+
   async getIdempotencyRecord(key: string): Promise<IdempotencyRecord | null> {
     return this.getDoc<IdempotencyRecord>('idempotency_keys', encodeDocKey(key));
   }
@@ -965,6 +1130,7 @@ export class FirestoreRestStore implements RegistryStore {
     certificate: CertificateRecord;
     idempotencyKey: string;
     auditLog: AuditLogEntry;
+    initialVersionDoc?: CertificateVersionDocument;
   }): Promise<CertificateRecord> {
     const existingIdemp = await this.getIdempotencyRecord(params.idempotencyKey);
     if (existingIdemp) {
@@ -975,9 +1141,10 @@ export class FirestoreRestStore implements RegistryStore {
     const certKey = encodeDocKey(params.certificate.certificateNumber.toUpperCase());
     const regKey = encodeDocKey(params.certificate.scrappingRegNumber.toUpperCase());
     const idempKey = encodeDocKey(params.idempotencyKey);
+    const brand = resolveCertificateBrand(params.certificate);
 
-    // Atomic Firestore commit with precondition exists: false on reservations + idempotency key
-    const writes = [
+    // Atomic Firestore commit with precondition exists: false on certificate, reservations, idempotency key & initial version
+    const writes: Array<Record<string, unknown>> = [
       {
         update: {
           name: `${this.docRoot}/certificates/${params.certificate.id}`,
@@ -990,7 +1157,10 @@ export class FirestoreRestStore implements RegistryStore {
           name: `${this.docRoot}/reserved_certificate_numbers/${certKey}`,
           fields: toFirestoreFields({
             certificateNumber: params.certificate.certificateNumber.toUpperCase(),
+            brand,
+            status: 'ISSUED',
             reservedAt: params.certificate.createdAt,
+            issuedAt: params.certificate.createdAt,
             certificateId: params.certificate.id,
           }),
         },
@@ -1001,7 +1171,10 @@ export class FirestoreRestStore implements RegistryStore {
           name: `${this.docRoot}/reserved_scrapping_numbers/${regKey}`,
           fields: toFirestoreFields({
             scrappingRegNumber: params.certificate.scrappingRegNumber.toUpperCase(),
+            brand,
+            status: 'ISSUED',
             reservedAt: params.certificate.createdAt,
+            issuedAt: params.certificate.createdAt,
             certificateId: params.certificate.id,
           }),
         },
@@ -1026,6 +1199,16 @@ export class FirestoreRestStore implements RegistryStore {
         },
       },
     ];
+
+    if (params.initialVersionDoc) {
+      writes.push({
+        update: {
+          name: `${this.docRoot}/certificate_versions/${encodeDocKey(params.initialVersionDoc.id)}`,
+          fields: toFirestoreFields(params.initialVersionDoc as unknown as Record<string, unknown>),
+        },
+        currentDocument: { exists: false },
+      });
+    }
 
     const res = await this.fsFetch(`${this.apiBase}:commit`, {
       method: 'POST',
@@ -1053,6 +1236,55 @@ export class FirestoreRestStore implements RegistryStore {
     }
 
     return params.certificate;
+  }
+
+  async appendCertificateVersion(versionDoc: CertificateVersionDocument): Promise<void> {
+    // Append-only write with exists: false precondition so historical versions can NEVER be overwritten
+    const writes = [
+      {
+        update: {
+          name: `${this.docRoot}/certificate_versions/${encodeDocKey(versionDoc.id)}`,
+          fields: toFirestoreFields(versionDoc as unknown as Record<string, unknown>),
+        },
+        currentDocument: { exists: false },
+      },
+    ];
+    const res = await this.fsFetch(`${this.apiBase}:commit`, {
+      method: 'POST',
+      body: JSON.stringify({ writes }),
+    });
+    if (!res.ok) {
+      throw new Error(`Firestore appendCertificateVersion failed (${res.status}): ${await res.text()}`);
+    }
+  }
+
+  async getCertificateVersions(certificateId: string): Promise<CertificateVersionDocument[]> {
+    const res = await this.fsFetch(`${this.apiBase}:runQuery`, {
+      method: 'POST',
+      body: JSON.stringify({
+        structuredQuery: {
+          from: [{ collectionId: 'certificate_versions' }],
+          where: {
+            fieldFilter: {
+              field: { fieldPath: 'certificateId' },
+              op: 'EQUAL',
+              value: { stringValue: certificateId },
+            },
+          },
+        },
+      }),
+    });
+    if (!res.ok) {
+      throw new Error(`Firestore query certificate_versions failed: ${await res.text()}`);
+    }
+    const rows = (await res.json()) as Array<{ document?: { fields?: Record<string, FirestoreValue> } }>;
+    const items: CertificateVersionDocument[] = [];
+    for (const row of rows) {
+      if (row.document) {
+        items.push(fromFirestoreDoc<CertificateVersionDocument>(row.document));
+      }
+    }
+    return items.sort((a, b) => b.version - a.version || b.recordedAt.localeCompare(a.recordedAt));
   }
 
   async getCertificateById(id: string): Promise<CertificateRecord | null> {
@@ -1128,18 +1360,14 @@ export class FirestoreRestStore implements RegistryStore {
   ): Promise<BackupSnapshot> {
     const [certs, reservedCerts, reservedRegs, settings, auditLogCount] = await Promise.all([
       this.getAllCertificates(),
-      this.listCollection<{ certificateNumber: string; reservedAt: string; certificateId: string }>(
-        'reserved_certificate_numbers'
-      ),
-      this.listCollection<{ scrappingRegNumber: string; reservedAt: string; certificateId: string }>(
-        'reserved_scrapping_numbers'
-      ),
+      this.listCollection<ReservedCertNumberRecord>('reserved_certificate_numbers'),
+      this.listCollection<ReservedRegNumberRecord>('reserved_scrapping_numbers'),
       this.getSettings(),
       this.countCollection('audit_logs'),
     ]);
 
     const payloadObj = {
-      schemaVersion: 1,
+      schemaVersion: 2,
       exportedAt: new Date().toISOString(),
       certificates: certs,
       reservedCertNumbers: reservedCerts,
@@ -1166,8 +1394,9 @@ export class FirestoreRestStore implements RegistryStore {
     // Batch up to 10 chunks per commit (~4.5 MB max request, well below Firestore's 10 MiB request limit)
     await this.commitWritesInBatches(chunkWrites, 10);
 
-    // Store lightweight metadata ONLY in database_backups so listBackups() never drains Spark egress
-    const metaDoc: FirestoreBackupMetadataDoc = {
+    // Post-write read-back verification of chunks BEFORE publishing backup metadata
+    // Ensures an incomplete/corrupted backup NEVER becomes the latest backup snapshot
+    const verifyMetaDraft: FirestoreBackupMetadataDoc = {
       id: backupId,
       createdAt: payloadObj.exportedAt,
       createdBy,
@@ -1177,7 +1406,7 @@ export class FirestoreRestStore implements RegistryStore {
       reservedRegCount: reservedRegs.length,
       auditLogCount,
       sha256Checksum,
-      verified: true,
+      verified: false,
       sizeBytes: Buffer.byteLength(payloadJson, 'utf8'),
       storageTarget: `Firestore (${this.projectId}/${this.databaseId})`,
       payloadEncoding: 'gzip-base64-chunks',
@@ -1185,6 +1414,20 @@ export class FirestoreRestStore implements RegistryStore {
       compressedBytes,
     };
 
+    const readBackPayload = await this.loadBackupPayloadJson(verifyMetaDraft);
+    const readBackHash = computeSha256(readBackPayload);
+    if (readBackHash !== sha256Checksum) {
+      throw new Error(
+        `Backup post-write SHA-256 verification failed for ${backupId}. Previous good backups remain untouched.`
+      );
+    }
+
+    const metaDoc: FirestoreBackupMetadataDoc = {
+      ...verifyMetaDraft,
+      verified: true,
+    };
+
+    // Store lightweight metadata ONLY in database_backups so listBackups() never drains Spark egress
     await this.setDoc('database_backups', metaDoc.id, metaDoc);
     return this.toPublicBackupSnapshot(metaDoc);
   }
@@ -1374,6 +1617,7 @@ class UnconfiguredProductionStore implements RegistryStore {
   async createCredentialsIfAbsent(): Promise<boolean> { this.fail(); }
   async createSession() { this.fail(); }
   async getSession() { return null; }
+  async updateSessionScrapRouteAuth() { /* no-op while unconfigured */ }
   async revokeSession() { /* no-op while unconfigured */ }
   async getSettings() {
     return {
@@ -1385,8 +1629,11 @@ class UnconfiguredProductionStore implements RegistryStore {
   async isCertNumberReserved(): Promise<boolean> { return this.fail(); }
   async isScrappingRegReserved(): Promise<boolean> { return this.fail(); }
   async getReservedCounts() { return { certCount: 0, regCount: 0 }; }
+  async getAllReservedNumbers() { return this.fail(); }
   async getIdempotencyRecord(): Promise<IdempotencyRecord | null> { return this.fail(); }
   async createCertificateAtomic(): Promise<CertificateRecord> { return this.fail(); }
+  async appendCertificateVersion() { this.fail(); }
+  async getCertificateVersions(): Promise<CertificateVersionDocument[]> { return this.fail(); }
   async getCertificateById(): Promise<CertificateRecord | null> { return this.fail(); }
   async getCertificateByNumber(): Promise<CertificateRecord | null> { return this.fail(); }
   async getRecentActiveCertificates(): Promise<CertificateRecord[]> { return this.fail(); }

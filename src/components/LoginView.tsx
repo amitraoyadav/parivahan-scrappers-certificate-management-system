@@ -33,6 +33,7 @@ export const LoginView: React.FC<LoginViewProps> = ({
   // Maker Login state
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
+  const [rememberMe, setRememberMe] = useState(true);
 
   // Main Core Admin Unlock state
   const [adminPassword, setAdminPassword] = useState('');
@@ -53,7 +54,7 @@ export const LoginView: React.FC<LoginViewProps> = ({
     setNotice(null);
     setSubmitting(true);
     try {
-      const session = await api.loginMaker(username, password);
+      const session = await api.loginMaker(username, password, rememberMe);
       onAuthenticated(session);
     } catch (err) {
       setError(err instanceof ApiError ? err.message : 'Unable to sign in. Please try again.');
@@ -166,7 +167,7 @@ export const LoginView: React.FC<LoginViewProps> = ({
                 <div>
                   <p className="font-semibold text-white">Cryptographic Uniqueness</p>
                   <p className="text-xs text-slate-300 mt-0.5 font-mono">
-                    PS/YY/R[7-Digit] · REG-C[6-Digit] · SHA-256 Digest
+                    PS/YY/R · SR/YY/R · SHA-256 Digest
                   </p>
                 </div>
                 <div>
@@ -390,6 +391,23 @@ export const LoginView: React.FC<LoginViewProps> = ({
                         className="w-full px-3.5 py-2.5 rounded-lg border border-slate-300 text-sm focus:outline-none focus:ring-2 focus:ring-[#059669] focus:border-[#059669]"
                       />
                     </div>
+
+                    <label className="flex items-start gap-2.5 pt-1 cursor-pointer select-none">
+                      <input
+                        type="checkbox"
+                        checked={rememberMe}
+                        onChange={(e) => setRememberMe(e.target.checked)}
+                        className="mt-0.5 h-4 w-4 rounded border-slate-300 text-[#059669] focus:ring-[#059669] cursor-pointer"
+                      />
+                      <span className="text-xs text-slate-600 leading-snug">
+                        <strong className="font-semibold text-slate-800">
+                          Keep me signed in on this trusted device (30 days)
+                        </strong>
+                        <span className="block text-[11px] text-slate-500 mt-0.5">
+                          Uses a persistent server-validated HttpOnly session cookie. Sign out anytime to revoke immediately.
+                        </span>
+                      </span>
+                    </label>
 
                     <button
                       type="submit"

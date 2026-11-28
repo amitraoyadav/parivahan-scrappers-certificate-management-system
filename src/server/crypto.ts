@@ -1,5 +1,5 @@
 import crypto from 'node:crypto';
-import type { CertificateRecord, SessionInfo, UserRole } from '../shared/types.js';
+import type { CertificateBrand, CertificateRecord, SessionInfo, UserRole } from '../shared/types.js';
 import { maskVehicleIdNumber } from '../shared/vehicleData.js';
 
 const SCRYPT_KEYLEN = 64;
@@ -121,6 +121,7 @@ export function signSessionToken(payload: {
   role: UserRole;
   sessionVersion: number;
   ttlSeconds?: number;
+  rememberMe?: boolean;
 }): { token: string; session: SessionInfo } {
   const nowSec = Math.floor(Date.now() / 1000);
   const defaultTtl = payload.role === 'main_admin' ? 2 * 60 * 60 : 4 * 60 * 60;
@@ -131,6 +132,7 @@ export function signSessionToken(payload: {
     sessionVersion: payload.sessionVersion,
     issuedAt: nowSec * 1000,
     expiresAt: (nowSec + (payload.ttlSeconds ?? defaultTtl)) * 1000,
+    ...(payload.rememberMe ? { rememberMe: true } : {}),
   };
 
   const bodyB64 = Buffer.from(JSON.stringify(session), 'utf8').toString('base64url');
@@ -140,6 +142,69 @@ export function signSessionToken(payload: {
     .digest('base64url');
 
   return { token: `${bodyB64}.${sig}`, session };
+}
+
+export interface ScrapRouteAuthPayload {
+  scope: 'scrap_route_issuance';
+  sid: string;
+  username: string;
+  sessionVersion: number;
+  issuedAt: number;
+  expiresAt: number;
+}
+
+export function signScrapRouteAuthToken(payload: {
+  sid: string;
+  username: string;
+  sessionVersion: number;
+  ttlSeconds?: number;
+}): { token: string; expiresAt: number } {
+  const nowSec = Math.floor(Date.now() / 1000);
+  const ttl = payload.ttlSeconds ?? 2 * 60 * 60; // 2 hours default
+  const data: ScrapRouteAuthPayload = {
+    scope: 'scrap_route_issuance',
+    sid: payload.sid,
+    username: payload.username,
+    sessionVersion: payload.sessionVersion,
+    issuedAt: nowSec * 1000,
+    expiresAt: (nowSec + ttl) * 1000,
+  };
+  const bodyB64 = Buffer.from(JSON.stringify(data), 'utf8').toString('base64url');
+  const sig = crypto
+    .createHmac('sha256', getSessionSecret())
+    .update(`sr:${bodyB64}`)
+    .digest('base64url');
+  return { token: `${bodyB64}.${sig}`, expiresAt: data.expiresAt };
+}
+
+export function verifyScrapRouteAuthToken(
+  token: string,
+  expected: { sid?: string; username: string; sessionVersion: number }
+): { ok: true; expiresAt: number } | { ok: false } {
+  if (!token || typeof token !== 'string') return { ok: false };
+  const dotIdx = token.indexOf('.');
+  if (dotIdx <= 0 || dotIdx === token.length - 1) return { ok: false };
+  const bodyB64 = token.slice(0, dotIdx);
+  const sig = token.slice(dotIdx + 1);
+  const expectedSig = crypto
+    .createHmac('sha256', getSessionSecret())
+    .update(`sr:${bodyB64}`)
+    .digest('base64url');
+  if (!timingSafeStringEqual(sig, expectedSig)) return { ok: false };
+
+  try {
+    const parsed = JSON.parse(
+      Buffer.from(bodyB64, 'base64url').toString('utf8')
+    ) as ScrapRouteAuthPayload;
+    if (parsed.scope !== 'scrap_route_issuance') return { ok: false };
+    if (typeof parsed.expiresAt !== 'number' || Date.now() >= parsed.expiresAt) return { ok: false };
+    if (parsed.sessionVersion !== expected.sessionVersion) return { ok: false };
+    if (parsed.username !== expected.username) return { ok: false };
+    if (expected.sid && parsed.sid !== expected.sid) return { ok: false };
+    return { ok: true, expiresAt: parsed.expiresAt };
+  } catch {
+    return { ok: false };
+  }
 }
 
 export type SessionTokenVerificationResult =
@@ -203,7 +268,22 @@ export function verifySessionToken(
   return res.ok ? res.session : null;
 }
 
-export function generateRandomCertificateNumber(issueDate?: string): {
+export function resolveCertificateBrand(cert: {
+  brand?: CertificateBrand;
+  certificateNumber?: string;
+}): CertificateBrand {
+  if (cert.brand === 'scrap_route') return 'scrap_route';
+  if (cert.brand === 'parivahan') return 'parivahan';
+  if (cert.certificateNumber && cert.certificateNumber.trim().toUpperCase().startsWith('SR/')) {
+    return 'scrap_route';
+  }
+  return 'parivahan';
+}
+
+export function generateRandomCertificateNumber(
+  issueDate?: string,
+  brand: CertificateBrand = 'parivahan'
+): {
   certificateNumber: string;
   issueYearShort: string;
 } {
@@ -216,23 +296,34 @@ export function generateRandomCertificateNumber(issueDate?: string): {
   }
   const yy = String(yearNum).slice(-2);
   const sevenDigits = crypto.randomInt(1000000, 10000000);
+  const prefix = brand === 'scrap_route' ? 'SR' : 'PS';
   return {
-    certificateNumber: `PS/${yy}/R${sevenDigits}`,
+    certificateNumber: `${prefix}/${yy}/R${sevenDigits}`,
     issueYearShort: yy,
   };
 }
 
-export function generateRandomScrappingRegNumber(): string {
+export function generateRandomScrappingRegNumber(brand: CertificateBrand = 'parivahan'): string {
   const sixDigits = crypto.randomInt(100000, 1000000);
-  return `REG-C${sixDigits}`;
+  return brand === 'scrap_route' ? `SR-REG-${sixDigits}` : `REG-C${sixDigits}`;
 }
 
-export function isValidCertificateNumberFormat(value: string): boolean {
-  return /^PS\/\d{2}\/R\d{7}$/.test(value);
+export function isValidCertificateNumberFormat(
+  value: string,
+  brand?: CertificateBrand
+): boolean {
+  if (brand === 'parivahan') return /^PS\/\d{2}\/R\d{7}$/.test(value);
+  if (brand === 'scrap_route') return /^SR\/\d{2}\/R\d{7}$/.test(value);
+  return /^(PS|SR)\/\d{2}\/R\d{7}$/.test(value);
 }
 
-export function isValidScrappingRegFormat(value: string): boolean {
-  return /^REG-C\d{6}$/.test(value);
+export function isValidScrappingRegFormat(
+  value: string,
+  brand?: CertificateBrand
+): boolean {
+  if (brand === 'parivahan') return /^REG-C\d{6}$/.test(value);
+  if (brand === 'scrap_route') return /^SR-REG-\d{6}$/.test(value);
+  return /^(REG-C|SR-REG-)\d{6}$/.test(value);
 }
 
 export function generateQrToken(): string {
@@ -246,6 +337,7 @@ export function generateRecordId(prefix: string): string {
 export function computeCanonicalHash(
   cert: Pick<
     CertificateRecord,
+    | 'brand'
     | 'certificateNumber'
     | 'scrappingRegNumber'
     | 'status'
@@ -264,7 +356,11 @@ export function computeCanonicalHash(
     | 'qrToken'
   >
 ): string {
+  // Preserve 100% backward compatibility with all existing Parivahan certificate hashes
+  // while cryptographically binding brand identity on Scrap Route certificates.
+  const isScrapRoute = resolveCertificateBrand(cert) === 'scrap_route';
   const canonicalPayload = {
+    ...(isScrapRoute ? { brand: 'SCRAP_ROUTE' } : {}),
     certificateNumber: cert.certificateNumber.trim().toUpperCase(),
     scrappingRegNumber: cert.scrappingRegNumber.trim().toUpperCase(),
     status: cert.status,

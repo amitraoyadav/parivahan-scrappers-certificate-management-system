@@ -4,21 +4,32 @@ import type {
   BackupDryRunResult,
   BackupSnapshot,
   CandidateNumbers,
+  CertificateBrand,
   CertificateRecord,
+  CertificateVersionDocument,
+  CertificateVersionSnapshot,
   CreateCertificateInput,
   DashboardStats,
+  DatabaseIntegrityReport,
   DriveSyncLog,
+  OriginalCertificateSnapshot,
   PublicVerificationResult,
   SessionInfo,
+  StagingRestoreVerificationResult,
   SystemErrorLog,
   SystemSettings,
 } from '../shared/types';
 
-// In-memory bearer token (never written to localStorage or sessionStorage)
+// In-memory tokens (never written to localStorage or sessionStorage)
 let memoryBearerToken: string | null = null;
+let memoryScrapRouteToken: string | null = null;
 
 export function setMemoryToken(token: string | null): void {
   memoryBearerToken = token;
+}
+
+export function setMemoryScrapRouteToken(token: string | null): void {
+  memoryScrapRouteToken = token;
 }
 
 export class ApiError extends Error {
@@ -32,8 +43,17 @@ export class ApiError extends Error {
 }
 
 const DEFAULT_API_TIMEOUT_MS = 20_000;
+const RETRY_DELAYS_MS = [350, 800];
 
-async function apiRequest<T>(
+function isRetryableStatus(status: number): boolean {
+  return status === 0 || status === 408 || status === 502 || status === 503 || status === 504;
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function apiRequestOnce<T>(
   path: string,
   options: RequestInit & { idempotencyKey?: string; timeoutMs?: number } = {}
 ): Promise<T> {
@@ -44,6 +64,9 @@ async function apiRequest<T>(
   }
   if (memoryBearerToken) {
     headers.set('Authorization', `Bearer ${memoryBearerToken}`);
+  }
+  if (memoryScrapRouteToken) {
+    headers.set('X-Scrap-Route-Auth', memoryScrapRouteToken);
   }
   if (options.idempotencyKey) {
     headers.set('Idempotency-Key', options.idempotencyKey);
@@ -92,6 +115,30 @@ async function apiRequest<T>(
   return parsed as T;
 }
 
+async function apiRequest<T>(
+  path: string,
+  options: RequestInit & { idempotencyKey?: string; timeoutMs?: number } = {}
+): Promise<T> {
+  const method = (options.method || 'GET').toUpperCase();
+  const canRetry = method === 'GET' || (method === 'POST' && Boolean(options.idempotencyKey));
+  const maxAttempts = canRetry ? RETRY_DELAYS_MS.length + 1 : 1;
+
+  let lastError: unknown;
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    try {
+      return await apiRequestOnce<T>(path, options);
+    } catch (err) {
+      lastError = err;
+      const retryable = err instanceof ApiError && isRetryableStatus(err.status);
+      if (!canRetry || !retryable || attempt >= maxAttempts - 1) {
+        throw err;
+      }
+      await delay(RETRY_DELAYS_MS[attempt] ?? 800);
+    }
+  }
+  throw lastError;
+}
+
 export const api = {
   // Public & Auth
   getAuthStatus(): Promise<AuthStatusResponse> {
@@ -110,10 +157,14 @@ export const api = {
     });
   },
 
-  async loginMaker(username: string, password: string): Promise<SessionInfo> {
+  async loginMaker(
+    username: string,
+    password: string,
+    rememberMe = false
+  ): Promise<SessionInfo> {
     const data = await apiRequest<{ session: SessionInfo; token: string }>('/api/auth/login', {
       method: 'POST',
-      body: JSON.stringify({ username, password }),
+      body: JSON.stringify({ username, password, rememberMe }),
     });
     setMemoryToken(data.token);
     return data.session;
@@ -133,6 +184,34 @@ export const api = {
       await apiRequest('/api/auth/logout', { method: 'POST' });
     } finally {
       setMemoryToken(null);
+      setMemoryScrapRouteToken(null);
+    }
+  },
+
+  async verifyScrapRoutePin(
+    pin: string
+  ): Promise<{ authorized: boolean; expiresAt: number }> {
+    const data = await apiRequest<{
+      authorized: boolean;
+      expiresAt: number;
+      scrapRouteToken?: string;
+    }>('/api/auth/scrap-route/verify-pin', {
+      method: 'POST',
+      body: JSON.stringify({ pin }),
+    });
+    if (data.scrapRouteToken) {
+      setMemoryScrapRouteToken(data.scrapRouteToken);
+    }
+    return { authorized: data.authorized, expiresAt: data.expiresAt };
+  },
+
+  async lockScrapRoute(): Promise<{ authorized: boolean }> {
+    try {
+      return await apiRequest<{ authorized: boolean }>('/api/auth/scrap-route/lock', {
+        method: 'POST',
+      });
+    } finally {
+      setMemoryScrapRouteToken(null);
     }
   },
 
@@ -150,9 +229,15 @@ export const api = {
   },
 
   // Maker & Issuance
-  getCandidateNumbers(issueDate?: string): Promise<CandidateNumbers> {
-    const qs = issueDate ? `?issueDate=${encodeURIComponent(issueDate)}` : '';
-    return apiRequest<CandidateNumbers>(`/api/certificates/next-numbers${qs}`);
+  getCandidateNumbers(
+    issueDate?: string,
+    brand: CertificateBrand = 'parivahan'
+  ): Promise<CandidateNumbers> {
+    const qs = new URLSearchParams();
+    if (issueDate) qs.set('issueDate', issueDate);
+    if (brand !== 'parivahan') qs.set('brand', brand);
+    const suffix = qs.toString() ? `?${qs.toString()}` : '';
+    return apiRequest<CandidateNumbers>(`/api/certificates/next-numbers${suffix}`);
   },
 
   reportPdfFailure(certificateId: string, reason: string): Promise<{ logged: boolean }> {
@@ -173,6 +258,7 @@ export const api = {
     certificate: CertificateRecord;
     idempotentReplay: boolean;
     persistenceMs: number;
+    verifiedReadBack?: boolean;
   }> {
     return apiRequest('/api/certificates', {
       method: 'POST',
@@ -251,6 +337,8 @@ export const api = {
     id: string,
     payload: {
       deletePassword: string;
+      mainAdminPassword?: string;
+      confirmCertificateNumber?: string;
       reason: string;
       permanent?: boolean;
       confirmPhrase?: string;
@@ -318,6 +406,12 @@ export const api = {
     });
   },
 
+  verifyBackupInStaging(id: string): Promise<{ stagingResult: StagingRestoreVerificationResult }> {
+    return apiRequest(`/api/admin/backups/${encodeURIComponent(id)}/staging-verify`, {
+      method: 'POST',
+    });
+  },
+
   restoreBackup(
     id: string,
     payload: { protectedPassword: string; confirmPhrase: string }
@@ -326,6 +420,50 @@ export const api = {
       method: 'POST',
       body: JSON.stringify(payload),
     });
+  },
+
+  getIntegrityMonitor(): Promise<{ report: DatabaseIntegrityReport }> {
+    return apiRequest('/api/admin/integrity-monitor');
+  },
+
+  getCertificateHistory(id: string): Promise<{
+    certificate: CertificateRecord;
+    originalRecord: OriginalCertificateSnapshot;
+    versionHistory: CertificateVersionSnapshot[];
+    appendOnlyVersions: CertificateVersionDocument[];
+  }> {
+    return apiRequest(`/api/admin/certificates/${encodeURIComponent(id)}/history`);
+  },
+
+  async exportFullRegistryJson(): Promise<void> {
+    const headers = new Headers({ 'X-Requested-With': 'XMLHttpRequest' });
+    if (memoryBearerToken) {
+      headers.set('Authorization', `Bearer ${memoryBearerToken}`);
+    }
+    const res = await fetch('/api/admin/export', {
+      credentials: 'include',
+      headers,
+    });
+    if (!res.ok) {
+      let message = 'Unable to export verified registry snapshot.';
+      try {
+        const parsed = (await res.json()) as { error?: string };
+        if (parsed.error) message = parsed.error;
+      } catch {
+        // use default message
+      }
+      throw new ApiError(message, res.status);
+    }
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+    a.download = `parivahan_full_registry_export_${stamp}.json`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
   },
 
   getSettings(): Promise<{
